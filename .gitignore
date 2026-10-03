@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+.DS_Store
+# Private working notes and test findings
+plans/
+# Local test and benchmark scripts
+scripts/ab-round.sh
+scripts/flow-control-test.sh

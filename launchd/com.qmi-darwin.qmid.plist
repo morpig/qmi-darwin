@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Production: shipped in the host app's Contents/Library/LaunchDaemons and registered with
+     SMAppService (PLAN.md §8.2). BundleProgram is relative to the app bundle. For development
+     use scripts/dev-daemon.sh, which points launchd at the debug build instead.
+     Logs go to the unified log (subsystem com.qmi-darwin.qmid), not a file. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qmi-darwin.qmid</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/qmid</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.qmi-darwin.qmid</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
