@@ -1,5 +1,7 @@
 # qmi-darwin
 
+<img width="640" height="311" alt="Screenshot 2026-10-03 at 16 48 05" src="https://github.com/user-attachments/assets/f9e03be8-7b85-4df3-ac5e-39dd0916b97e" />
+
 A QMI connection manager for Quectel 4G/5G modems (RM551E-GL, RM520N) on macOS. No kext, no
 DriverKit, no modem-side NAT.
 
