@@ -46,8 +46,11 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Transport.** qmid finds the modem by its Quectel vendor ID and opens only the QMI
-   interface. The AT ports stay free for other tools. QMI messages go over the USB control
+1. **Transport.** qmid looks at USB devices from a built-in list of modem vendors (Quectel,
+   Sierra, Telit, Fibocom, SIMCom, ZTE, Foxconn, Qualcomm), plus any added in the config.
+   It picks the QMI port from the USB descriptors alone: vendor-specific class
+   **ff/ff/ff** with three endpoints. The AT ports also have three endpoints but report
+   ff/00/00. It opens only that port, so the AT ports stay free for other tools. QMI messages go over the USB control
    endpoint, and the interrupt endpoint signals when a response is waiting.
 2. **Bring-up.** CTL hands out client IDs and WDA sets the data format (raw IP, QMAP
    aggregation). NAS and UIM report SIM state, registration and operator names.
@@ -76,7 +79,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 ## Requirements
 
 - macOS 13 or later; Swift 5.9+ (Xcode command line tools).
-- A Quectel modem with QMI firmware, e.g. RM551E-GL or RM520N, connected over USB.
+- A modem with QMI firmware connected over USB. Tested with Quectel (RM551E-GL, RM520N);
+  other Qualcomm-based modems from the listed vendors should be found, but are untested.
 - An Apple Development or Developer ID signing identity in your keychain, to build the app.
 
 ## Install
@@ -129,7 +133,9 @@ write `/Library/Application Support/qmi-darwin/qmid.json`:
 ```
 
 Then run `qmictl reload`, or `qmictl config set FILE`, which validates the file and applies
-it. `carriers` sets the attach APN for each SIM, matched by MCC/MNC or ICCID prefix. All keys
+it. `carriers` sets the attach APN for each SIM, matched by MCC/MNC or ICCID prefix. If the modem isn't
+found, add its USB vendor ID with `"vendorIDs": ["1234"]`. If its QMI port isn't
+ff/ff/ff, also set `"interface": N`. All keys
 are documented in [docs/API.md](docs/API.md) and `Sources/QMIHost/Config.swift`.
 
 ### 4. Check

@@ -363,6 +363,26 @@ places an emergency call, for example). qmid then never dials it on its own:
   "redial": false, "maxUptime": 300 }
 ```
 
+### Modem selection (`vendorIDs`, `interface`)
+
+qmid opens the first modem from a known modem vendor (Quectel, Qualcomm, Sierra Wireless,
+Telit, Fibocom, SIMCom, ZTE, Foxconn) and finds its QMI port from the USB descriptors:
+vendor-specific class with subclass/protocol ff/ff and three endpoints (interrupt IN, bulk
+IN, bulk OUT), or a vendor-specific interface named "RmNet" or "QMI". AT/serial ports
+(ff/00/00) are never opened. Both keys are optional, top level:
+
+| Key | Meaning |
+|---|---|
+| `vendorIDs` | extra USB vendor IDs, 4 hex digits (`["1234"]`), tried before the built-in ones |
+| `interface` | the QMI port's USB interface number, for a modem whose descriptors don't identify it |
+
+```json
+{ "vendorIDs": ["1234"], "interface": 4, "pdns": [ … ] }
+```
+
+Only Quectel modems are tested. `qmictl probe --vendor 1234 --iface 4` tries the same with
+qmid stopped.
+
 ### Per-SIM default bearer (`carriers`)
 
 `carriers` (optional, top level) sets the **attach PDN's** APN per SIM, i.e. the default
@@ -423,13 +443,14 @@ Suggested UI: when `carriers` is set, label the attach PDN's APN field "Fallback
 without a carrier entry)" and suggest leaving it empty. For a SIM on the fallback, offer "add
 a carrier entry" with its `mccmnc` (and the network's `attachAPN`, when
 `attachAPNFromNetwork`) rather than editing the fallback. Double-check MCC/MNC values against
-the carrier: neighbours in the same country are easy to mix up (510-10 and 510-11 are
-different operators).
+the carrier: neighbours in the same country are easy to mix up (MNC 10 and MNC 11 of the same MCC
+are different operators).
 
 qmid validates before writing and rejects bad configs with a message, e.g.
 `config: x needs profile or apn`, `config: only one PDN can be the attach PDN`,
 `config: internet bad policy fast`, `config: two PDNs pin the same profile`,
-`config: carrier Example: mccmnc 0010 is not 5 or 6 digits`. At most 8 PDNs.
+`config: carrier Example: mccmnc 0010 is not 5 or 6 digits`,
+`config: vendorID 2c7 is not 4 hex digits`. At most 8 PDNs.
 
 Changing the attach APN makes the modem re-attach to LTE: all PDNs drop for a few seconds.
 qmid skips the re-attach when the default bearer already uses the new APN, and re-attaches at

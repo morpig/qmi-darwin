@@ -195,7 +195,7 @@ public final class Manager {
         deviceState = "opening"
         var opened: QMIDevice?
         do {
-            let dev = try QMIDevice.open(interface: config.interface)
+            let dev = try QMIDevice.open(interface: config.interface, vendorIDs: vendorIDs)
             opened = dev
             dev.modem.terminationHandler = { [weak self] in self?.queue.async { self?.deviceLost() } }
             dev.trace = { [weak self] in self?.logSink(.debug, $0) }
@@ -932,6 +932,9 @@ public final class Manager {
 
     // MARK: - Device arrival (IOKit)
 
+    // USB vendors whose devices qmid opens and whose arrivals it reacts to.
+    private var vendorIDs: [UInt16] { QMIDevice.vendorIDs(extra: config.usbVendorIDs) }
+
     private func watchArrivals() {
         guard arrivalPort == nil, let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
         IONotificationPortSetDispatchQueue(port, queue)
@@ -945,7 +948,7 @@ public final class Manager {
             var n = 0
             while case let s = IOIteratorNext(iterator), s != 0 {
                 if let v = IORegistryEntryCreateCFProperty(s, "idVendor" as CFString, kCFAllocatorDefault, 0)?
-                    .takeRetainedValue() as? NSNumber, v.intValue == Int(QMIDevice.quectelVendorID) {
+                    .takeRetainedValue() as? NSNumber, me.vendorIDs.contains(v.uint16Value) {
                     n += 1
                 }
                 IOObjectRelease(s)

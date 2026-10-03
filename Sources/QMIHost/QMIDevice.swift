@@ -27,7 +27,25 @@ public enum QMIHostError: Error, CustomStringConvertible {
 // and indication dispatch. Requests are synchronous; call them off the main thread if a UI
 // is involved.
 public final class QMIDevice {
-    public static let quectelVendorID: UInt16 = 0x2C7C
+    // USB vendor IDs of modem makers whose modems speak QMI. qmid looks only at their
+    // devices; config "vendorIDs" adds more (tried first). Only Quectel is tested.
+    public static let knownVendorIDs: [UInt16] = [
+        0x2C7C,     // Quectel
+        0x05C6,     // Qualcomm (reference designs, modules in some firmware modes)
+        0x1199,     // Sierra Wireless
+        0x1BC7,     // Telit
+        0x2CB7,     // Fibocom
+        0x1E0E,     // SIMCom
+        0x19D2,     // ZTE
+        0x0489,     // Foxconn
+        0x105B,     // Foxconn
+    ]
+
+    // The configured vendor IDs first, then the known ones.
+    public static func vendorIDs(extra: [UInt16]? = nil) -> [UInt16] {
+        var seen = Set<UInt16>()
+        return ((extra ?? []) + knownVendorIDs).filter { seen.insert($0).inserted }
+    }
 
     public let modem: QDModem
     public var onIndication: ((QMIMessage) -> Void)?
@@ -58,9 +76,10 @@ public final class QMIDevice {
         }
     }
 
-    public static func open(interface: Int? = nil) throws -> QMIDevice {
+    public static func open(interface: Int? = nil, vendorIDs: [UInt16] = QMIDevice.vendorIDs()) throws -> QMIDevice {
         do {
-            let modem = try QDModem.open(withVendorID: quectelVendorID, interfaceNumber: interface ?? -1)
+            let modem = try QDModem.open(withVendorIDs: vendorIDs.map { NSNumber(value: $0) },
+                                         interfaceNumber: interface ?? -1)
             return try QMIDevice(modem: modem)
         } catch let e as QMIHostError {
             throw e

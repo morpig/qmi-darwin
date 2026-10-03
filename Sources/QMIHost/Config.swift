@@ -36,6 +36,10 @@ import QMIKit
 //           PDN starts the time again.
 // Mux IDs are assigned in order: 0x81, 0x82, ...
 //
+// Modem (top level, both optional): "vendorIDs": ["1234"] adds USB vendor IDs to the known
+// modem makers (QMIDevice.knownVendorIDs); "interface": 4 picks the QMI interface by number
+// when its descriptor doesn't identify it (QDModem.m, isQMIInterface).
+//
 // carriers (optional): per-SIM settings for the attach PDN (the default internet bearer) only;
 // every other PDN (IMS included) stays as configured on every SIM.
 //
@@ -84,7 +88,10 @@ public struct QMIDConfig: Codable, Equatable {
         }
     }
 
-    public var interface: Int?              // QMI USB interface; default: first ff/ff/ff
+    public var interface: Int?              // QMI USB interface number; default: found by its descriptor
+    // USB vendor IDs (4 hex digits, "2c7c") to look for besides the known modem makers, tried
+    // first (QMIDevice.knownVendorIDs).
+    public var vendorIDs: [String]? = nil
     // Batched utun I/O (private sendmsg_x/recvmsg_x), default on. false forces one system
     // call per packet, e.g. if a macOS update breaks batching in a way qmid can't detect.
     public var utunBatch: Bool? = nil
@@ -181,7 +188,15 @@ public struct QMIDConfig: Codable, Equatable {
         return c
     }
 
+    // vendorIDs as numbers; nil entries are rejected by validate().
+    public var usbVendorIDs: [UInt16] {
+        (vendorIDs ?? []).compactMap { $0.count == 4 ? UInt16($0, radix: 16) : nil }
+    }
+
     public func validate() throws {
+        for v in vendorIDs ?? [] where v.count != 4 || UInt16(v, radix: 16) == nil {
+            throw QMIHostError.transport("config: vendorID \(v) is not 4 hex digits")
+        }
         var names = Set<String>()
         for p in pdns {
             guard !p.name.isEmpty, names.insert(p.name).inserted else { throw QMIHostError.transport("config: duplicate or empty PDN name \(p.name)") }

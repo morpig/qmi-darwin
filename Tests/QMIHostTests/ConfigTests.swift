@@ -163,6 +163,18 @@ final class ServiceEntityTests: XCTestCase {
         XCTAssertEqual(try decode(#"{ "utunBatch": false, "pdns": [] }"#).utunBatch, false)
     }
 
+    func testVendorIDs() throws {
+        func decode(_ json: String) throws -> QMIDConfig { try JSONDecoder().decode(QMIDConfig.self, from: Data(json.utf8)) }
+        XCTAssertEqual(QMIDevice.vendorIDs().first, 0x2C7C)
+        let c = try decode(#"{ "vendorIDs": ["1234", "1199"], "pdns": [] }"#)
+        XCTAssertNoThrow(try c.validate())
+        let ids = QMIDevice.vendorIDs(extra: c.usbVendorIDs)
+        XCTAssertEqual(Array(ids.prefix(3)), [0x1234, 0x1199, 0x2C7C])     // configured first
+        XCTAssertEqual(ids.filter { $0 == 0x1199 }.count, 1)               // no duplicates
+        XCTAssertThrowsError(try decode(#"{ "vendorIDs": ["2c7"], "pdns": [] }"#).validate())
+        XCTAssertThrowsError(try decode(#"{ "vendorIDs": ["0x2c7c"], "pdns": [] }"#).validate())
+    }
+
 }
 
 final class CarrierConfigTests: XCTestCase {
@@ -258,7 +270,7 @@ final class CarrierConfigTests: XCTestCase {
         invalid(#"{ "name": "", "mccmnc": ["51011"] }"#)                     // no name
         invalid(#"{ "name": "a" }"#)                                          // no match
         invalid(#"{ "name": "a", "mccmnc": ["5101"] }"#)                      // too short
-        invalid(#"{ "name": "a", "mccmnc": ["510-11"] }"#)                    // not digits
+        invalid(#"{ "name": "a", "mccmnc": ["001-01"] }"#)                    // not digits
         invalid(#"{ "name": "a", "iccid": ["89F"] }"#)                        // not digits
         invalid(#"{ "name": "a", "mccmnc": ["51011"], "auth": "md5" }"#)      // bad auth
         invalid(#"{ "name": "a", "mccmnc": ["51011"] }"#,

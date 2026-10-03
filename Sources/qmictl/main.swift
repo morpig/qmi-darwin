@@ -21,7 +21,7 @@ usage (through qmid):
   qmictl sync                               APN sync report: PDN ↔ modem profile, autoconnect, attach
 
 usage (direct to the modem; stop qmid first):
-  qmictl probe        [--iface N] [-v]
+  qmictl probe        [--iface N] [--vendor HEX]... [-v]
   qmictl modem-status [--iface N] [-v]
   qmictl profiles     [--iface N] [-v]     modem profiles, autoconnect, LTE attach PDN list
   qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
@@ -37,6 +37,8 @@ usage (direct to the modem; stop qmid first):
   FAMILIES  4, 6 or 46 (default 46)
   POLICY    prefer-wifi | prefer-cellular | last-resort | never
             (default: never for a PDN named ims, prefer-wifi otherwise)
+  --iface   QMI USB interface number (default: found by its descriptor)
+  --vendor  extra USB vendor ID to look for, e.g. 1234 (known modem makers are built in)
   --publish publish each PDN as a network service in SCDynamicStore
   --route   host route via the first PDN's utun (removed on exit)
   --scoped  scoped default routes via each utun (for IP_BOUND_IF / curl --interface)
@@ -52,6 +54,7 @@ usage (direct to the modem; stop qmid first):
 struct Options {
     var command = ""
     var iface: Int?
+    var vendors: [UInt16] = []
     var verbose = false
     var pdns: [PDNConfig] = []
     var routes: [String] = []
@@ -101,6 +104,10 @@ func parseOptions() -> Options {
         }
         switch a {
         case "--iface": o.iface = Int(value())
+        case "--vendor":
+            let v = value()
+            guard v.count == 4, let id = UInt16(v, radix: 16) else { fail("bad vendor ID \(v) (4 hex digits)") }
+            o.vendors.append(id)
         case "-v", "--verbose": o.verbose = true
         case "--pdn":
             let spec = value()
@@ -131,7 +138,7 @@ func parseOptions() -> Options {
 
 func openDevice(_ o: Options) -> QMIDevice {
     let dev: QMIDevice
-    do { dev = try QMIDevice.open(interface: o.iface) } catch { fail("\(error)") }
+    do { dev = try QMIDevice.open(interface: o.iface, vendorIDs: QMIDevice.vendorIDs(extra: o.vendors)) } catch { fail("\(error)") }
     if o.verbose { dev.trace = { print("  \($0)") } }
     let m = dev.modem
     print(String(format: "modem %04x:%04x, QMI interface %d, bulk in 0x%02x/%d out 0x%02x/%d, interrupt 0x%02x",

@@ -54,10 +54,12 @@ extern NSErrorDomain const QDErrorDomain;
 
 @interface QDModem : NSObject
 
-// Opens the first interface of vendorID with class ff/ff/ff, or exactly interfaceNumber if >= 0.
-+ (nullable instancetype)openWithVendorID:(uint16_t)vendorID
-                          interfaceNumber:(NSInteger)interfaceNumber
-                                    error:(NSError **)error;
+// Opens the QMI interface of the first modem of one of vendorIDs (in list order, then by USB
+// location): exactly interfaceNumber if >= 0, else its first QMI-looking interface (see
+// +isQMIInterface: in QDModem.m).
++ (nullable instancetype)openWithVendorIDs:(NSArray<NSNumber *> *)vendorIDs
+                           interfaceNumber:(NSInteger)interfaceNumber
+                                     error:(NSError **)error;
 
 @property (readonly) uint8_t interfaceNumber;
 @property (readonly) uint16_t vendorID;

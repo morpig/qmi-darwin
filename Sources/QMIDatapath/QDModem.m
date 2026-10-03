@@ -203,7 +203,27 @@ static NSNumber *regNumber(io_service_t s, CFStringRef key) {
     qd_ul_stage *_stage[256];
 }
 
-+ (instancetype)openWithVendorID:(uint16_t)vendorID interfaceNumber:(NSInteger)interfaceNumber error:(NSError **)error {
+// The QMI port of a Qualcomm-based modem is vendor-specific: class ff, and three endpoints
+// (interrupt IN for RESPONSE_AVAILABLE, bulk IN and OUT for QMAP). The AT/serial ports look
+// the same apart from subclass/protocol (ff/00/00), so those decide: ff/ff/ff is the RmNet
+// (QMI) port; another subclass/protocol counts only when the interface names itself "RmNet"
+// or "QMI". Diag (ff/ff/30) and adb (ff/42/01) have two endpoints. Nothing is sent to the
+// interface to find out: opening an AT port would take it from whoever is using it.
+static BOOL isQMIInterface(io_service_t s) {
+    NSNumber *cls = regNumber(s, CFSTR("bInterfaceClass"));
+    NSNumber *sub = regNumber(s, CFSTR("bInterfaceSubClass"));
+    NSNumber *proto = regNumber(s, CFSTR("bInterfaceProtocol"));
+    NSNumber *eps = regNumber(s, CFSTR("bNumEndpoints"));
+    if (cls.intValue != 0xff || (eps && eps.intValue != 3)) return NO;
+    if (sub.intValue == 0xff && proto.intValue == 0xff) return YES;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("kUSBString"), kCFAllocatorDefault, 0);
+    NSString *name = v ? CFBridgingRelease(v) : nil;
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    return [name rangeOfString:@"rmnet" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [name rangeOfString:@"qmi" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
++ (instancetype)openWithVendorIDs:(NSArray<NSNumber *> *)vendorIDs interfaceNumber:(NSInteger)interfaceNumber error:(NSError **)error {
     CFMutableDictionaryRef match = IOServiceMatching("IOUSBHostInterface");
     io_iterator_t it = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, match, &it);
@@ -211,22 +231,35 @@ static NSNumber *regNumber(io_service_t s, CFStringRef key) {
         if (error) *error = QDIOReturnError(kr, @"IOServiceGetMatchingServices");
         return nil;
     }
+    // Best candidate: earliest vendor in the list, then lowest USB location, then lowest
+    // interface number (a modem may expose several QMI ports; any one works).
     io_service_t found = IO_OBJECT_NULL, s;
+    NSUInteger bestRank = NSNotFound;
+    uint64_t bestLocation = 0, bestNumber = 0;
     while ((s = IOIteratorNext(it))) {
-        NSNumber *vid = regNumber(s, CFSTR("idVendor"));
+        NSUInteger rank = [vendorIDs indexOfObject:regNumber(s, CFSTR("idVendor")) ?: @(-1)];
         NSNumber *num = regNumber(s, CFSTR("bInterfaceNumber"));
-        NSNumber *cls = regNumber(s, CFSTR("bInterfaceClass"));
-        NSNumber *sub = regNumber(s, CFSTR("bInterfaceSubClass"));
-        NSNumber *proto = regNumber(s, CFSTR("bInterfaceProtocol"));
-        BOOL ok = vid.unsignedIntValue == vendorID &&
-            (interfaceNumber >= 0 ? num.integerValue == interfaceNumber
-                                  : (cls.intValue == 0xff && sub.intValue == 0xff && proto.intValue == 0xff));
-        if (ok) { found = s; break; }
-        IOObjectRelease(s);
+        uint64_t location = regNumber(s, CFSTR("locationID")).unsignedLongLongValue;
+        BOOL ok = rank != NSNotFound &&
+            (interfaceNumber >= 0 ? num.integerValue == interfaceNumber : isQMIInterface(s));
+        BOOL better = ok && (found == IO_OBJECT_NULL || rank < bestRank ||
+            (rank == bestRank && (location < bestLocation ||
+                                  (location == bestLocation && num.unsignedLongLongValue < bestNumber))));
+        if (better) {
+            if (found) IOObjectRelease(found);
+            found = s;
+            bestRank = rank;
+            bestLocation = location;
+            bestNumber = num.unsignedLongLongValue;
+        } else {
+            IOObjectRelease(s);
+        }
     }
     IOObjectRelease(it);
     if (!found) {
-        if (error) *error = QDError(1, @"QMI interface not found (is the modem in usbnet=0 mode?)");
+        if (error) *error = QDError(1, interfaceNumber >= 0
+            ? [NSString stringWithFormat:@"no USB interface %ld on a modem of a known vendor", (long)interfaceNumber]
+            : @"no QMI interface found (is the modem connected and in QMI mode, and is its vendor ID listed?)");
         return nil;
     }
     // A freshly re-enumerated interface may still be configuring; opening it then fails (and
