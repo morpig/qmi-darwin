@@ -59,11 +59,11 @@ qmid.onAvailabilityChange = { up in      // false when qmid isn't running or res
 qmid.onEvent = { event in
     switch event {
     case .modem(let state, let network, let error):
-        // state: "absent" | "opening" | "ready"; network e.g. "registered, ps attached, lte"
+        // state: QMIDModemState raw value, "absent" | "opening" | "ready"; network e.g. "registered, ps attached, lte"
     case .pdn(let pdn):
         // full state of one PDN; replace what you had for pdn.name
     case .config:
-        // config changed (setConfig or reload); PDNs will redial, re-read getConfig if shown
+        // config changed (setConfig or reload); changed PDNs will redial, re-read getConfig if shown
     case .unknown:
         break                            // newer qmid; ignore
     }
@@ -91,7 +91,7 @@ qmid.subscribe()                         // current state arrives immediately as
 let s = try await qmid.status()
 try await qmid.connect(pdn: "internet")
 try await qmid.disconnect(pdn: "internet")
-try await qmid.setPolicy(pdn: "internet", policy: "prefer-cellular")
+try await qmid.setPolicy(pdn: "internet", policy: .preferCellular)   // QMIDPolicy, or its raw string
 ```
 
 Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
@@ -101,13 +101,15 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 
 | Call | Effect | Persists? |
 |---|---|---|
-| `status` | modem + PDN state | – |
-| `connect(pdn:)` | dials now, clears backoff/blocked state; completes when the attempt has ended (see below) | until qmid restarts or reload |
-| `disconnect(pdn:)` | hangs up and stops redialing | until qmid restarts or reload |
-| `setPolicy(pdn:policy:)` | changes routing priority, no reconnect | until qmid restarts or reload |
-| `reload` | re-reads qmid.json, redials everything | – |
+| `status` | modem + PDN state; while qmid is busy with a slow modem (more than 2 s), the state as last built | – |
+| `connect(pdn:)` | dials now, clears backoff/blocked state; completes when the attempt has ended (see below) | until qmid restarts or the PDN's config changes |
+| `disconnect(pdn:)` | hangs up and stops redialing | until qmid restarts or the PDN's config changes |
+| `setPolicy(pdn:policy:)` | changes routing priority, no reconnect | until qmid restarts or the PDN's config changes |
+| `reload` | re-reads qmid.json; redials only PDNs whose settings changed (see below) | – |
 | `getConfig` | qmid.json as JSON `Data` | – |
 | `setConfig(_:)` | validates, writes qmid.json, reloads | yes |
+| `prepareSIM(iccid:mccmnc:)` | before a SIM switch: attach profile for that card, no re-attach (see "Switching SIMs") | until the card is in, `cancelSIM`, the connection closes, or 10 s |
+| `cancelSIM(iccid:)` | the switch failed: attach profile back to the current card | – |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -129,8 +131,12 @@ Dials of different PDNs run in parallel: a `connect` never waits for another PDN
 PDNs").
 
 To make a policy or on/off choice permanent, change `policy` / `autoconnect` in the config
-with `setConfig`. `setConfig` and `reload` briefly drop **all** PDNs while they redial
-(a few seconds); runtime calls don't.
+with `setConfig`. `setConfig` and `reload` leave a PDN whose settings are unchanged alone: its
+call stays up and a `connect` / `disconnect` / `setPolicy` made at runtime still applies (its
+`blocked` families are cleared and it is redialed if it was down). A PDN whose `policy` alone
+changed takes the new policy without a redial. A PDN with any other change, a new one, and the
+PDNs whose modem profile had to be rewritten are redialed (a few seconds); a changed attach
+APN re-attaches, which drops every PDN briefly.
 
 ## PDN fields (`QMIDPDN`)
 
@@ -138,7 +144,7 @@ with `setConfig`. `setConfig` and `reload` briefly drop **all** PDNs while they 
 |---|---|
 | `name` | config name, e.g. `internet`, `ims` |
 | `state` | `idle`, `waiting` (for the modem/network), `dialing`, `connected`, `backoff` (retry scheduled), `blocked` (network rejected with a permanent cause); `stateName` has the raw string if unknown |
-| `policy` | `prefer-wifi`, `prefer-cellular`, `last-resort`, `never` |
+| `policy` | `prefer-wifi`, `prefer-cellular`, `last-resort`, `never` (`QMIDPolicy` raw values; `policyKind` has it typed) |
 | `role` | `internet`, `ims`, `other` |
 | `interface` | `utunN` while connected |
 | `ipv4`, `ipv6` | addresses; `ipv6` is `addr/prefix`, `ipv6Address` strips the prefix |
@@ -153,11 +159,20 @@ with `setConfig`. `setConfig` and `reload` briefly drop **all** PDNs while they 
 | `qci` | QoS class of the PDN's default bearer while connected, e.g. `6` for internet, `5` for IMS |
 | `ambr` | APN-AMBR while connected (`QMIDAMBR`, `uplink` / `downlink` in bits per second), when the modem reports it. The network can change it on a live connection (e.g. following the radio: 500 Mbps on 5G NSA, 100 Mbps on LTE only); each change is a `.pdn` event |
 | `bearers` | the PDN's dedicated bearers (`[QMIDBearer]`); only in `status()`, `nil` in `.pdn` events (see "Dedicated bearers and QoS") |
+| `linkHeld` | `true` while it redials right after a drop with its `interface` kept (below); `false` otherwise and from an older qmid |
 
 Suggested UI mapping: `connected` → up (show interface and addresses); `dialing` /
 `waiting` / `backoff` → connecting (show `error` for backoff); `blocked` → error with the
 cause and a "Retry" that calls `connect`; `idle` with `wanted == false` → off (with `error`
 when it went down by itself).
+
+A PDN that was connected for at least a minute and then drops (many networks end sessions on a
+timer, every few hours) is redialed at once. While it redials it keeps its `interface`, the
+system network service and the stand-in interface, with `linkHeld == true` (state `dialing`,
+or `waiting` / `backoff` when it can't dial right away), and normally comes back `connected`
+on the same `utunN`, possibly with new addresses. The interface goes, and the PDN retries as
+usual, as soon as the redial fails or after 10 s, whichever comes first. Open TCP connections
+don't survive either way. Show a held PDN as connecting, not as down.
 
 ## SIM and default bearer (`QMIDSIM`)
 
@@ -175,6 +190,7 @@ followed by the internet PDN reconnecting.
 | `matchedBy` | why it matched: `"iccid 8900"` (ICCID prefix) or `"mccmnc 00101"` |
 | `attachAPN` | APN of the default bearer as the modem attached (`nil` until attached) |
 | `attachAPNFromNetwork` | `true` when the network chose `attachAPN` (the attach profile had an empty APN) |
+| `pendingSIM` | `"…1234"` while a `prepareSIM` card isn't in yet; `nil` otherwise |
 
 Suggested UI: show the carrier name (or the MCC/MNC when `carrier` is `nil`) and the
 `attachAPN`. When `carrier` is `nil` and `attachAPNFromNetwork` is `true`, the SIM runs on the
@@ -182,6 +198,44 @@ network's default APN; offering "save as carrier" with `mccmnc` and `attachAPN` 
 action (add an entry to `carriers` with `setConfig`).
 
 Without `onSIM` (older client code), the same event reaches `onEvent` as `.unknown(type: "sim")`.
+
+### Switching SIMs (`prepareSIM`)
+
+On its own, qmid learns of a new SIM only after the modem has attached with it, using the
+attach APN of the SIM before. When the two need different APNs (`carriers`), that first attach
+is rejected or lands on the wrong APN, and qmid re-attaches: all PDNs drop for a few seconds,
+or up to ~15 s after a rejection.
+
+A client that makes the switch itself (an eSIM profile switch) avoids that by telling qmid
+first:
+
+```swift
+// Before the switch, with the target card's ICCID and, if known, its home MCC/MNC.
+let prepared = try? await qmid.prepareSIM(iccid: target.iccid, mccmnc: target.mccmnc)
+// prepared?.apn / .carrier: what the new card will attach with (nil: qmid couldn't; switch anyway)
+let ok = await performSwitch()
+if !ok { try? await qmid.cancelSIM(iccid: target.iccid) }
+```
+
+- `prepareSIM` writes the attach profile with the new card's `carriers` settings and replies.
+  It doesn't re-attach: the current card stays attached and its PDNs stay up (its default bearer
+  keeps its APN). The new card's first attach then uses the right APN.
+- `mccmnc` lets a card that a `carriers` entry matches by MCC/MNC resolve before the modem can
+  read it (for an eSIM profile: the profile owner's MCC/MNC). A card that nothing matches, or
+  sent without `mccmnc` and matched by no `iccid` entry, gets the fallback APN (reply without
+  `carrier`). If it turns out to match an `mccmnc` entry once qmid reads its MCC/MNC, qmid
+  switches to that entry's APN then (one re-attach, as without `prepareSIM`).
+- **Errors** (no `carriers` in the config, modem not ready, bad ICCID, profile write failed):
+  switch anyway; it costs the extra attach, as without `prepareSIM`. An older qmid
+  doesn't answer the call: wait at most ~3 s.
+- **The prepare ends** when qmid reads the new card (it checks every 2 s), on `cancelSIM`, when
+  the client's connection closes, or after 10 s. In the last three cases qmid first reads the
+  SIM; if the new card is in after all, it keeps its settings, otherwise the attach profile goes
+  back to the current card, again without a re-attach.
+- One prepare at a time: a new `prepareSIM` replaces the pending one, and `cancelSIM` with
+  another card's ICCID is ignored, so a late cancel can't undo a newer prepare. `prepareSIM` for
+  the card already in the modem ends a pending prepare.
+- A physical SIM swap can't be announced and works as before.
 
 ## Registered network and operator name (`QMIDPLMN`)
 
@@ -418,7 +472,8 @@ internet bearer. Every other PDN, IMS included, stays as configured on every SIM
 - **Without `carriers`** qmid behaves as before: the attach PDN's settings apply to every SIM.
 - A SIM change costs one LTE re-attach when the new SIM needs a different attach APN (the
   modem attaches with the old one before qmid can rewrite it): all PDNs drop for a few seconds.
-  The same SIM after a restart needs none.
+  A switch announced with `prepareSIM` needs none (see "Switching SIMs"). The same SIM after a
+  restart needs none.
 
 #### Fallback APN (SIMs no entry matches)
 
@@ -513,6 +568,9 @@ Added in qmid 0.9 (API still 1): `reason` / `causes` in PDNs (`QMIDReason`, `QMI
 the attempt has ended and dials run in parallel; `QMIDPLMN.emergencyBearers` and
 `emergencyAccessBarred`.
 
+Added in qmid 0.11 (API still 1): `prepareSIM` / `cancelSIM` (`QMIDPreparedSIM`) and
+`QMIDSIM.pendingSIM`. Against an older qmid the calls get no reply; time them out.
+
 ## Testing from the command line
 
 `qmictl` uses the same client:
@@ -525,4 +583,6 @@ qmictl log [--level debug]          # qmid's log over XPC: recent lines, then li
 qmictl connect ims | disconnect ims
 qmictl policy internet prefer-cellular
 qmictl config get > qmid.json && qmictl config set qmid.json
+qmictl prepare-sim 8901234567890123456 00101   # held until Ctrl-C; switch meanwhile
+qmictl cancel-sim 8901234567890123456
 ```

@@ -61,7 +61,7 @@ public struct QMIDConfig: Codable, Equatable {
         public var profile: Int?
         public var apn: String?
         public var family: String?          // ipv4, ipv6, ipv4v6 (default)
-        public var policy: String?          // ServicePublisher.Policy raw value
+        public var policy: String?          // QMIDPolicy raw value
         public var autoconnect: Bool?
         public var role: String?
         public var attach: Bool?
@@ -137,12 +137,14 @@ public struct QMIDConfig: Codable, Equatable {
 
     // The PDNs as they apply to this SIM: the attach PDN takes the matching carrier's settings
     // (see "carriers" above); a SIM not (fully) identified leaves the attach profile untouched.
-    public func resolvedPDNs(for sim: SIMIdentity?) -> [PDN] {
+    // prepared: a card announced with prepareSIM; no match means the fallback even without its
+    // MCC/MNC, since the alternative is the previous card's APN.
+    public func resolvedPDNs(for sim: SIMIdentity?, prepared: Bool = false) -> [PDN] {
         guard carriers != nil else { return pdns }
         return pdns.map { p in
             guard p.isAttach else { return p }
             var q = p
-            guard let sim, identifies(sim) else {
+            guard let sim, prepared || identifies(sim) else {
                 q.apn = nil; q.username = nil; q.password = nil; q.auth = nil
                 return q
             }
@@ -202,7 +204,7 @@ public struct QMIDConfig: Codable, Equatable {
             guard !p.name.isEmpty, names.insert(p.name).inserted else { throw QMIHostError.transport("config: duplicate or empty PDN name \(p.name)") }
             guard p.profile != nil || p.apn != nil else { throw QMIHostError.transport("config: \(p.name) needs profile or apn") }
             if let pr = p.profile, !(1...255).contains(pr) { throw QMIHostError.transport("config: \(p.name) profile out of range") }
-            if let pol = p.policy, ServicePublisher.Policy(rawValue: pol) == nil { throw QMIHostError.transport("config: \(p.name) bad policy \(pol)") }
+            if let pol = p.policy, QMIDPolicy(rawValue: pol) == nil { throw QMIHostError.transport("config: \(p.name) bad policy \(pol)") }
             if let a = p.auth, WDS.Authentication(name: a) == nil { throw QMIHostError.transport("config: \(p.name) bad auth \(a)") }
             if let t = p.apnType, WDS.APNTypeMask(names: t) == nil {
                 throw QMIHostError.transport("config: \(p.name) bad apnType \(t.joined(separator: ", "))")
@@ -253,6 +255,13 @@ public struct SIMIdentity: Equatable {
     public func merged(over last: SIMIdentity?) -> SIMIdentity {
         guard let last, iccid == nil || iccid == last.iccid else { return self }
         return SIMIdentity(mccmnc: mccmnc ?? last.mccmnc, iccid: iccid ?? last.iccid)
+    }
+
+    // This read is the card a client prepared for (prepareSIM): the read, with the prepared
+    // MCC/MNC while Get Home Network doesn't answer yet. nil when it is another card.
+    public func arrival(of prepared: SIMIdentity) -> SIMIdentity? {
+        guard let iccid, iccid == prepared.iccid else { return nil }
+        return SIMIdentity(mccmnc: mccmnc ?? prepared.mccmnc, iccid: iccid)
     }
 
     // Last 4 digits: enough to tell SIMs apart in status and logs.

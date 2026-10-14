@@ -153,7 +153,7 @@ final class Control: NSObject, QMIDControl {
 
     func apiVersion(reply: @escaping (Int) -> Void) { reply(qmidAPIVersion) }
     func status(reply: @escaping (NSDictionary) -> Void) {
-        manager.queue.async { reply(self.manager.status()) }
+        manager.status(within: 2, reply: reply)
     }
     func connect(_ pdn: String, reply: @escaping (String?) -> Void) {
         manager.queue.async { self.manager.connect(pdn, reply: reply) }
@@ -199,6 +199,16 @@ final class Control: NSObject, QMIDControl {
         if let c = connection { logHub.remove(c) }
         reply()
     }
+    func prepareSIM(_ iccid: String, mccmnc: String?, reply: @escaping (NSDictionary?, String?) -> Void) {
+        let owner = connection.map { AnyHashable(ObjectIdentifier($0)) }
+        manager.queue.async {
+            let (d, err) = self.manager.prepareSIM(iccid: iccid, mccmnc: mccmnc, owner: owner)
+            reply(d, err)
+        }
+    }
+    func cancelSIM(_ iccid: String, reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.cancelSIM(iccid: iccid)) }
+    }
 }
 
 final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
@@ -213,8 +223,17 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
         c.exportedInterface = NSXPCInterface(with: QMIDControl.self)
         c.exportedObject = Control(manager: manager, connection: c)
         c.remoteObjectInterface = NSXPCInterface(with: QMIDEvents.self)
-        c.invalidationHandler = { [weak c] in if let c { subscribers.remove(c); logHub.remove(c) } }
-        c.interruptionHandler = { [weak c] in if let c { subscribers.remove(c); logHub.remove(c) } }
+        // A prepareSIM ends with the connection that made it.
+        let owner = AnyHashable(ObjectIdentifier(c))
+        let manager = self.manager
+        c.invalidationHandler = { [weak c] in
+            if let c { subscribers.remove(c); logHub.remove(c) }
+            manager.queue.async { manager.clientGone(owner) }
+        }
+        c.interruptionHandler = { [weak c] in
+            if let c { subscribers.remove(c); logHub.remove(c) }
+            manager.queue.async { manager.clientGone(owner) }
+        }
         c.resume()
         return true
     }

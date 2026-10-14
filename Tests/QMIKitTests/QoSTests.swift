@@ -17,25 +17,25 @@ final class QoSTests: XCTestCase {
     // A network creating a CDN bearer: QCI 4 GBR, one IPv4 /27 filter each way,
     // network-initiated, bearer ID 0x37.
     private let reportCreated = """
-    0x10=[10 06 00 3d 0c 00 00 01 01 14 1c 00 10 19 00 23 02 00 00 01 22 02 00 bf 00 12 08 00 c0 c0 90 39 e0 ff ff ff 11 01 00 04 13 1c 00 10 19 00 23 02 00 00 01 22 02 00 bf \
-     00 13 08 00 c0 c0 90 39 e0 ff ff ff 11 01 00 04 12 29 00 10 26 00 11 01 00 01 12 08 00 00 20 a1 07 00 10 27 00 20 10 00 00 20 a1 07 00 00 00 00 00 10 27 00 00 00 00 00 1 \
-    f 01 00 04 11 29 00 10 26 00 11 01 00 01 12 08 00 00 90 d0 03 00 10 27 00 20 10 00 00 90 d0 03 00 00 00 00 00 10 27 00 00 00 00 00 1f 01 00 04 15 01 00 01 16 01 00 37]
+    0x10=[10 06 00 3d 0c 00 00 01 01 14 1c 00 10 19 00 23 02 00 00 01 22 02 00 bf 00 12 08 00 c0 c0 12 c6 e0 ff ff ff 11 01 00 04 13 1c 00 10 19 00 23 02 00 00 01 22 02 00 bf \
+    00 13 08 00 c0 c0 12 c6 e0 ff ff ff 11 01 00 04 12 29 00 10 26 00 11 01 00 01 12 08 00 00 20 a1 07 00 10 27 00 20 10 00 00 20 a1 07 00 00 00 00 00 10 27 00 00 00 00 00 1f \
+    01 00 04 11 29 00 10 26 00 11 01 00 01 12 08 00 00 90 d0 03 00 10 27 00 20 10 00 00 90 d0 03 00 00 00 00 00 10 27 00 00 00 00 00 1f 01 00 04 15 01 00 01 16 01 00 37]
     """
 
     // A modification of the same kind of bearer (IPv4 + IPv6 prefixes, TCP 5-tuples).
     private let reportModified = """
-    0x10=[10 06 00 ef 08 00 00 00 02 14 1e 01 10 22 00 23 02 00 08 01 22 02 00 b8 00 16 11 00 2a 03 28 80 f3 60 00 c0 00 00 00 00 00 00 00 00 3b 11 01 00 06 10 2b 00 23 02 00 \
-     01 01 22 02 00 01 00 1c 04 00 85 eb 00 00 1b 04 00 bb 01 00 00 14 01 00 06 12 08 00 e5 8c 9f a2 ff ff ff ff 11 01 00 04 10 19 00 23 02 00 0b 01 22 02 00 bc 00 12 08 00 c \
-    0 18 90 39 e0 ff ff ff 11 01 00 04 10 22 00 23 02 00 0e 01 22 02 00 ba 00 16 11 00 24 04 00 c0 5c 00 00 05 fa ce b0 0c 33 33 0a 3f 80 11 01 00 06 10 34 00 23 02 00 07 01  \
-    22 02 00 04 00 1c 04 00 9b ea 00 00 1b 04 00 bb 01 00 00 14 01 00 06 16 11 00 24 04 68 00 40 03 0c 04 00 00 00 00 00 00 00 84 80 11 01 00 06 10 19 00 23 02 00 05 01 22 02 \
-     00 bd 00 12 08 00 80 c0 90 39 c0 ff ff ff 11 01 00 04 10 34 00 23 02 00 03 01 22 02 00 03 00 1c 04 00 44 ea 00 00 1b 04 00 bb 01 00 00 14 01 00 06 16 11 00 2a 03 28 80 f \
-    3 0a 01 20 fa ce b0 0c 00 00 01 67 80 11 01 00 06 13 1e 01 10 19 00 23 02 00 05 01 22 02 00 bd 00 13 08 00 80 c0 90 39 c0 ff ff ff 11 01 00 04 10 19 00 23 02 00 0b 01 22  \
-    02 00 bc 00 13 08 00 c0 18 90 39 e0 ff ff ff 11 01 00 04 10 22 00 23 02 00 0e 01 22 02 00 ba 00 17 11 00 24 04 00 c0 5c 00 00 05 fa ce b0 0c 33 33 0a 3f 80 11 01 00 06 10 \
-     22 00 23 02 00 08 01 22 02 00 b8 00 17 11 00 2a 03 28 80 f3 60 00 c0 00 00 00 00 00 00 00 00 3b 11 01 00 06 10 34 00 23 02 00 07 01 22 02 00 04 00 1c 04 00 bb 01 00 00 1 \
-    b 04 00 9b ea 00 00 14 01 00 06 17 11 00 24 04 68 00 40 03 0c 04 00 00 00 00 00 00 00 84 80 11 01 00 06 10 34 00 23 02 00 03 01 22 02 00 03 00 1c 04 00 bb 01 00 00 1b 04  \
-    00 44 ea 00 00 14 01 00 06 17 11 00 2a 03 28 80 f3 0a 01 20 fa ce b0 0c 00 00 01 67 80 11 01 00 06 10 2b 00 23 02 00 01 01 22 02 00 01 00 1c 04 00 bb 01 00 00 1b 04 00 85 \
-     eb 00 00 14 01 00 06 13 08 00 e5 8c 9f a2 ff ff ff ff 11 01 00 04 12 29 00 10 26 00 11 01 00 01 12 08 00 00 20 a1 07 00 10 27 00 20 10 00 00 20 a1 07 00 00 00 00 00 10 2 \
-    7 00 00 00 00 00 1f 01 00 04 11 25 00 10 22 00 12 08 00 00 90 d0 03 00 10 27 00 20 10 00 00 90 d0 03 00 00 00 00 00 10 27 00 00 00 00 00 1f 01 00 04]
+    0x10=[10 06 00 ef 08 00 00 00 02 14 1e 01 10 22 00 23 02 00 08 01 22 02 00 b8 00 16 11 00 20 01 0d b8 f3 60 00 c0 00 00 00 00 00 00 00 00 3b 11 01 00 06 10 2b 00 23 02 00 \
+    01 01 22 02 00 01 00 1c 04 00 85 eb 00 00 1b 04 00 bb 01 00 00 14 01 00 06 12 08 00 e5 64 33 c6 ff ff ff ff 11 01 00 04 10 19 00 23 02 00 0b 01 22 02 00 bc 00 12 08 00 c0 \
+    18 12 c6 e0 ff ff ff 11 01 00 04 10 22 00 23 02 00 0e 01 22 02 00 ba 00 16 11 00 20 01 0d b8 5c 00 00 05 00 00 00 00 33 33 0a 3f 80 11 01 00 06 10 34 00 23 02 00 07 01 22 \
+    02 00 04 00 1c 04 00 9b ea 00 00 1b 04 00 bb 01 00 00 14 01 00 06 16 11 00 20 01 0d b8 40 03 0c 04 00 00 00 00 00 00 00 84 80 11 01 00 06 10 19 00 23 02 00 05 01 22 02 00 \
+    bd 00 12 08 00 80 c0 12 c6 c0 ff ff ff 11 01 00 04 10 34 00 23 02 00 03 01 22 02 00 03 00 1c 04 00 44 ea 00 00 1b 04 00 bb 01 00 00 14 01 00 06 16 11 00 20 01 0d b8 f3 0a \
+    01 20 00 00 00 00 00 00 01 67 80 11 01 00 06 13 1e 01 10 19 00 23 02 00 05 01 22 02 00 bd 00 13 08 00 80 c0 12 c6 c0 ff ff ff 11 01 00 04 10 19 00 23 02 00 0b 01 22 02 00 \
+    bc 00 13 08 00 c0 18 12 c6 e0 ff ff ff 11 01 00 04 10 22 00 23 02 00 0e 01 22 02 00 ba 00 17 11 00 20 01 0d b8 5c 00 00 05 00 00 00 00 33 33 0a 3f 80 11 01 00 06 10 22 00 \
+    23 02 00 08 01 22 02 00 b8 00 17 11 00 20 01 0d b8 f3 60 00 c0 00 00 00 00 00 00 00 00 3b 11 01 00 06 10 34 00 23 02 00 07 01 22 02 00 04 00 1c 04 00 bb 01 00 00 1b 04 00 \
+    9b ea 00 00 14 01 00 06 17 11 00 20 01 0d b8 40 03 0c 04 00 00 00 00 00 00 00 84 80 11 01 00 06 10 34 00 23 02 00 03 01 22 02 00 03 00 1c 04 00 bb 01 00 00 1b 04 00 44 ea \
+    00 00 14 01 00 06 17 11 00 20 01 0d b8 f3 0a 01 20 00 00 00 00 00 00 01 67 80 11 01 00 06 10 2b 00 23 02 00 01 01 22 02 00 01 00 1c 04 00 bb 01 00 00 1b 04 00 85 eb 00 00 \
+    14 01 00 06 13 08 00 e5 64 33 c6 ff ff ff ff 11 01 00 04 12 29 00 10 26 00 11 01 00 01 12 08 00 00 20 a1 07 00 10 27 00 20 10 00 00 20 a1 07 00 00 00 00 00 10 27 00 00 00 \
+    00 00 1f 01 00 04 11 25 00 10 22 00 12 08 00 00 90 d0 03 00 10 27 00 20 10 00 00 90 d0 03 00 00 00 00 00 10 27 00 00 00 00 00 1f 01 00 04]
     """
 
     // Get Granted QoS of a dedicated bearer: QCI 4, 64/128 Mbps max, 2.56 Mbps guaranteed.
@@ -63,8 +63,8 @@ final class QoSTests: XCTestCase {
         XCTAssertEqual(b.downlink.rates, QoS.Bitrates(max: 128_000_000, guaranteed: 2_560_000))
         XCTAssertEqual(b.networkInitiated, true)
         XCTAssertEqual(b.bearerID, 0x37)
-        XCTAssertEqual(b.uplinkFilters.map { $0.destination?.description }, ["57.144.192.192/27"])
-        XCTAssertEqual(b.downlinkFilters.map { $0.source?.description }, ["57.144.192.192/27"])
+        XCTAssertEqual(b.uplinkFilters.map { $0.destination?.description }, ["198.18.192.192/27"])
+        XCTAssertEqual(b.downlinkFilters.map { $0.source?.description }, ["198.18.192.192/27"])
         XCTAssertEqual(b.downlinkFilters.first?.id, 0)
         XCTAssertEqual(b.downlinkFilters.first?.precedence, 191)
     }
@@ -79,17 +79,17 @@ final class QoSTests: XCTestCase {
         XCTAssertEqual(b.uplinkFilters.map(\.precedence), b.uplinkFilters.map(\.precedence).sorted())
         let tcp = try XCTUnwrap(b.downlinkFilters.first { $0.id == 1 })
         XCTAssertEqual(tcp.ipVersion, 4)
-        XCTAssertEqual(tcp.source?.description, "162.159.140.229/32")
+        XCTAssertEqual(tcp.source?.description, "198.51.100.229/32")
         XCTAssertEqual(tcp.ipProtocol, 6)
         XCTAssertEqual(tcp.sourcePorts, 443...443)
         XCTAssertEqual(tcp.destinationPorts, 60293...60293)
         let upTCP = try XCTUnwrap(b.uplinkFilters.first { $0.id == 1 })
-        XCTAssertEqual(upTCP.destination?.description, "162.159.140.229/32")
+        XCTAssertEqual(upTCP.destination?.description, "198.51.100.229/32")
         XCTAssertEqual(upTCP.sourcePorts, 60293...60293)
         XCTAssertEqual(upTCP.destinationPorts, 443...443)
         let v6 = try XCTUnwrap(b.downlinkFilters.first { $0.id == 8 })
         XCTAssertEqual(v6.ipVersion, 6)
-        XCTAssertEqual(v6.source?.description, "2a03:2880:f360:c0::/59")
+        XCTAssertEqual(v6.source?.description, "2001:db8:f360:c0::/59")
         XCTAssertEqual(v6.precedence, 0xb8)
     }
 

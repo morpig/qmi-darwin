@@ -217,7 +217,7 @@ State:/Network/Service/<uuid>/IPv4
 State:/Network/Service/<uuid>/IPv6
     Addresses      = [ <prefix>::<iid> ]
     PrefixLength   = [ 64 ]
-    Router         = <WDS v6 gateway>
+    Router         = fe80::     # the WDS v6 gateway has no route on a p2p utun
     InterfaceName  = utunN
 State:/Network/Service/<uuid>/DNS
     ServerAddresses = [ v4 and v6 DNS from WDS ]
@@ -263,6 +263,10 @@ Answered in M5 (configd `Plugins/IPMonitor/ip_plugin.c` + tests on macOS 27.0):
   With the WDS gateway as Router on the point-to-point utun, IPMonitor installs
   `default 10.x.x.x UGScIg utun9` (scoped) and, when primary, the global default.
 - `Never` still gets a scoped default route and a scoped resolver (IMS on utun10).
+- IPv6 `Router` is `fe80::`, as other utun services publish. The WDS v6 gateway (a global
+  address in our /64) has no route on the point-to-point utun: the first default route via it
+  goes in, but when IPMonitor re-adds it (a VPN such as a Tailscale exit node taking primary
+  and handing it back) the kernel refuses it and the PDN is left without an IPv6 default.
 - The interface `Link` entity is only read for the expensive flag; utun needs none.
 - `ServiceIndex` in the service entity places an unordered service after the ordered ones
   (not used yet).
@@ -361,7 +365,9 @@ One-shot PDNs (`redial: false`, 0.9): `idle → dialing → connected → idle`,
 `blocked`), and `maxUptime` hangs them up. Dials run off the manager queue, one per PDN in
 parallel, and `connect` answers when the attempt has ended.
 
-Already in place (M5/M7 part 1): redial with 2 s → 5 min backoff on a dropped call; device
+Already in place (M5/M7 part 1): redial with 2 s → 5 min backoff on a dropped call; a call
+that was up ≥ 60 s (networks end sessions on a timer) is redialed at once with its utun, service
+and stand-in interface kept for up to 10 s, so the system sees a stall, not the link going; device
 termination → teardown and reopen; stale-indication filtering after reload; APN sync at start,
 reload and every 30 s.
 

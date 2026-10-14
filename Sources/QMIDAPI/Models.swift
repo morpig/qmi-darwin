@@ -1,7 +1,22 @@
 import Foundation
 
 // Typed views of qmid's dictionaries. Unknown keys are ignored and missing optional keys
-// stay nil, so newer or older qmid versions decode fine.
+// stay nil, so newer or older qmid versions decode fine. qmid builds its dictionaries from the
+// same types (`dictionary`), so both sides share one definition of every key.
+
+// The modem as qmid sees it (QMIDKey.modem).
+public enum QMIDModemState: String {
+    case absent, opening, ready
+}
+
+// How the system ranks a PDN's network service against Wi-Fi and Ethernet (QMIDKey.policy,
+// setPolicy, the config's "policy").
+public enum QMIDPolicy: String, CaseIterable {
+    case preferWifi = "prefer-wifi"
+    case preferCellular = "prefer-cellular"
+    case lastResort = "last-resort"
+    case never = "never"
+}
 
 public struct QMIDPDN: Equatable {
     public enum State: String {
@@ -11,7 +26,7 @@ public struct QMIDPDN: Equatable {
     public var name: String
     public var state: State?
     public var stateName: String
-    public var policy: String?
+    public var policy: String?            // QMIDPolicy raw value; see policyKind
     public var role: String?
     public var interface: String?
     public var ipv4: String?
@@ -33,11 +48,27 @@ public struct QMIDPDN: Equatable {
     public var ambr: QMIDAMBR?            // APN-AMBR, while connected (when the modem reports it)
     // Dedicated bearers: only in status() (nil in "pdn" events; those come through onBearers).
     public var bearers: [QMIDBearer]?
+    // Redialing right after a drop with its interface, network service and stand-in interface
+    // kept (state dialing/backoff/waiting, `interface` set): a stall, not the link going away.
+    public var linkHeld: Bool
 
     public var isConnected: Bool { state == .connected }
+    public var policyKind: QMIDPolicy? { policy.flatMap(QMIDPolicy.init(rawValue:)) }
 
     // IPv6 address without the prefix length, for binding sockets.
     public var ipv6Address: String? { ipv6.map { String($0.split(separator: "/").first ?? Substring($0)) } }
+
+    public init(name: String, state: State) {
+        self.name = name
+        self.state = state
+        stateName = state.rawValue
+        dns = []
+        pcscf = []
+        wanted = true
+        blocked = []
+        causes = []
+        linkHeld = false
+    }
 
     public init?(_ d: NSDictionary) {
         guard let name = d[QMIDKey.name] as? String else { return nil }
@@ -65,6 +96,33 @@ public struct QMIDPDN: Equatable {
         qci = d[QMIDKey.qci] as? Int
         ambr = QMIDAMBR(d[QMIDKey.ambr] as? NSDictionary)
         bearers = (d[QMIDKey.bearers] as? [NSDictionary]).map { $0.compactMap(QMIDBearer.init) }
+        linkHeld = d[QMIDKey.linkHeld] as? Bool ?? false
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.name: name, QMIDKey.state: state?.rawValue ?? stateName,
+                                QMIDKey.wanted: wanted, QMIDKey.linkHeld: linkHeld]
+        d[QMIDKey.policy] = policy
+        d[QMIDKey.role] = role
+        d[QMIDKey.interface] = interface
+        d[QMIDKey.ipv4] = ipv4
+        d[QMIDKey.ipv6] = ipv6
+        if !dns.isEmpty { d[QMIDKey.dns] = dns }
+        if !pcscf.isEmpty { d[QMIDKey.pcscf] = pcscf }
+        d[QMIDKey.mtu] = mtu
+        d[QMIDKey.profile] = profile
+        d[QMIDKey.apn] = apn
+        d[QMIDKey.serviceID] = serviceID
+        d[QMIDKey.mux] = mux
+        d[QMIDKey.uptime] = uptime
+        d[QMIDKey.error] = error
+        if !blocked.isEmpty { d[QMIDKey.blocked] = blocked }
+        d[QMIDKey.reason] = reason?.rawValue
+        if !causes.isEmpty { d[QMIDKey.causes] = causes.map(\.dictionary) }
+        d[QMIDKey.qci] = qci
+        d[QMIDKey.ambr] = ambr?.dictionary
+        d[QMIDKey.bearers] = bearers?.map(\.dictionary)
+        return d as NSDictionary
     }
 }
 
@@ -88,12 +146,27 @@ public struct QMIDCause: Equatable {
 
     public var is3GPP: Bool { type == "3GPP" }
 
+    public init(type: String, family: Int? = nil, code: Int? = nil, name: String? = nil) {
+        self.type = type
+        self.family = family
+        self.code = code
+        self.name = name
+    }
+
     public init?(_ d: NSDictionary) {
         guard let type = d[QMIDKey.type] as? String else { return nil }
         self.type = type
         family = d[QMIDKey.family] as? Int
         code = d[QMIDKey.code] as? Int
         name = d[QMIDKey.name] as? String
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.type: type]
+        d[QMIDKey.family] = family
+        d[QMIDKey.code] = code
+        d[QMIDKey.name] = name
+        return d as NSDictionary
     }
 }
 
@@ -111,6 +184,10 @@ public struct QMIDAMBR: Equatable {
         uplink = ul
         downlink = dl
     }
+
+    public var dictionary: NSDictionary {
+        [QMIDKey.uplink: NSNumber(value: uplink), QMIDKey.downlink: NSNumber(value: downlink)]
+    }
 }
 
 // One direction of a bearer, bits per second; nil where the network set no value
@@ -125,6 +202,13 @@ public struct QMIDBitrates: Equatable {
         max = u64(d?[QMIDKey.max])
         guaranteed = u64(d?[QMIDKey.guaranteed])
     }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [:]
+        d[QMIDKey.max] = max.map { NSNumber(value: $0) }
+        d[QMIDKey.guaranteed] = guaranteed.map { NSNumber(value: $0) }
+        return d as NSDictionary
+    }
 }
 
 // One packet filter of a bearer's TFT. Unset fields match anything.
@@ -137,6 +221,12 @@ public struct QMIDPacketFilter: Equatable {
     public var ipProtocol: Int?           // 6 TCP, 17 UDP, …
     public var sourcePorts: ClosedRange<Int>?
     public var destinationPorts: ClosedRange<Int>?
+
+    public init(id: Int, precedence: Int, ipVersion: Int) {
+        self.id = id
+        self.precedence = precedence
+        self.ipVersion = ipVersion
+    }
 
     public init?(_ d: NSDictionary) {
         guard let id = d[QMIDKey.id] as? Int, let p = d[QMIDKey.precedence] as? Int,
@@ -154,6 +244,16 @@ public struct QMIDPacketFilter: Equatable {
         sourcePorts = range(QMIDKey.sourcePorts)
         destinationPorts = range(QMIDKey.destinationPorts)
     }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.id: id, QMIDKey.precedence: precedence, QMIDKey.ipVersion: ipVersion]
+        d[QMIDKey.source] = source
+        d[QMIDKey.destination] = destination
+        d[QMIDKey.ipProtocol] = ipProtocol
+        d[QMIDKey.sourcePorts] = sourcePorts.map { [$0.lowerBound, $0.upperBound] }
+        d[QMIDKey.destinationPorts] = destinationPorts.map { [$0.lowerBound, $0.upperBound] }
+        return d as NSDictionary
+    }
 }
 
 // A dedicated EPS bearer of a PDN, as the network set it up.
@@ -168,6 +268,18 @@ public struct QMIDBearer: Equatable {
 
     public var isGBR: Bool { uplink.guaranteed != nil || downlink.guaranteed != nil }
 
+    public init(id: Int, qci: Int? = nil, networkInitiated: Bool? = nil, uplink: QMIDBitrates = .init(),
+                downlink: QMIDBitrates = .init(), uplinkFilters: [QMIDPacketFilter] = [],
+                downlinkFilters: [QMIDPacketFilter] = []) {
+        self.id = id
+        self.qci = qci
+        self.networkInitiated = networkInitiated
+        self.uplink = uplink
+        self.downlink = downlink
+        self.uplinkFilters = uplinkFilters
+        self.downlinkFilters = downlinkFilters
+    }
+
     public init?(_ d: NSDictionary) {
         guard let id = d[QMIDKey.id] as? Int else { return nil }
         self.id = id
@@ -177,6 +289,16 @@ public struct QMIDBearer: Equatable {
         downlink = QMIDBitrates(d[QMIDKey.downlink] as? NSDictionary)
         uplinkFilters = (d[QMIDKey.uplinkFilters] as? [NSDictionary] ?? []).compactMap(QMIDPacketFilter.init)
         downlinkFilters = (d[QMIDKey.downlinkFilters] as? [NSDictionary] ?? []).compactMap(QMIDPacketFilter.init)
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [
+            QMIDKey.id: id, QMIDKey.uplink: uplink.dictionary, QMIDKey.downlink: downlink.dictionary,
+            QMIDKey.uplinkFilters: uplinkFilters.map(\.dictionary), QMIDKey.downlinkFilters: downlinkFilters.map(\.dictionary),
+        ]
+        d[QMIDKey.qci] = qci
+        d[QMIDKey.networkInitiated] = networkInitiated
+        return d as NSDictionary
     }
 }
 
@@ -188,6 +310,13 @@ public struct QMIDSIM: Equatable {
     public var matchedBy: String?         // "iccid 8900" | "mccmnc 00101"
     public var attachAPN: String?         // APN of the default bearer as attached
     public var attachAPNFromNetwork: Bool // the network chose attachAPN (empty APN in the attach profile)
+    public var pendingSIM: String?        // "…1234": a prepareSIM card not in yet
+
+    public init(mccmnc: String? = nil, iccidSuffix: String? = nil) {
+        self.mccmnc = mccmnc
+        self.iccidSuffix = iccidSuffix
+        attachAPNFromNetwork = false
+    }
 
     public init?(_ d: NSDictionary?) {
         guard let d, d[QMIDKey.mccmnc] != nil || d[QMIDKey.iccidSuffix] != nil else { return nil }
@@ -197,6 +326,45 @@ public struct QMIDSIM: Equatable {
         matchedBy = d[QMIDKey.matchedBy] as? String
         attachAPN = d[QMIDKey.attachAPN] as? String
         attachAPNFromNetwork = d[QMIDKey.attachAPNFromNetwork] as? Bool ?? false
+        pendingSIM = d[QMIDKey.pendingSIM] as? String
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [:]
+        d[QMIDKey.mccmnc] = mccmnc
+        d[QMIDKey.iccidSuffix] = iccidSuffix
+        d[QMIDKey.carrier] = carrier
+        d[QMIDKey.matchedBy] = matchedBy
+        d[QMIDKey.attachAPN] = attachAPN
+        if attachAPN != nil { d[QMIDKey.attachAPNFromNetwork] = attachAPNFromNetwork }
+        d[QMIDKey.pendingSIM] = pendingSIM
+        return d as NSDictionary
+    }
+}
+
+// prepareSIM's reply: what the prepared card's first attach will use.
+public struct QMIDPreparedSIM: Equatable {
+    public var apn: String                // attach APN; "" = the network's choice
+    public var carrier: String?           // matching "carriers" entry
+    public var matchedBy: String?         // "iccid 8900" | "mccmnc 00101"
+
+    public init(apn: String, carrier: String? = nil, matchedBy: String? = nil) {
+        self.apn = apn
+        self.carrier = carrier
+        self.matchedBy = matchedBy
+    }
+
+    public init(_ d: NSDictionary) {
+        apn = d[QMIDKey.apn] as? String ?? ""
+        carrier = d[QMIDKey.carrier] as? String
+        matchedBy = d[QMIDKey.matchedBy] as? String
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.apn: apn]
+        d[QMIDKey.carrier] = carrier
+        d[QMIDKey.matchedBy] = matchedBy
+        return d as NSDictionary
     }
 }
 
@@ -217,6 +385,13 @@ public struct QMIDPLMN: Equatable {
     // Long name, else short name; nil when there is neither (don't show the MCC/MNC instead).
     public var displayName: String? { longName ?? shortName }
 
+    public init(mccmnc: String, longName: String? = nil, shortName: String? = nil, nameFromNetwork: Bool = false) {
+        self.mccmnc = mccmnc
+        self.longName = longName
+        self.shortName = shortName
+        self.nameFromNetwork = nameFromNetwork
+    }
+
     public init?(_ d: NSDictionary?) {
         guard let d, let m = d[QMIDKey.mccmnc] as? String else { return nil }
         mccmnc = m
@@ -226,19 +401,29 @@ public struct QMIDPLMN: Equatable {
         emergencyBearers = d[QMIDKey.emergencyBearers] as? Bool
         emergencyAccessBarred = d[QMIDKey.emergencyAccessBarred] as? Bool
     }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.mccmnc: mccmnc, QMIDKey.nameFromNetwork: nameFromNetwork]
+        d[QMIDKey.longName] = longName
+        d[QMIDKey.shortName] = shortName
+        d[QMIDKey.emergencyBearers] = emergencyBearers
+        d[QMIDKey.emergencyAccessBarred] = emergencyAccessBarred
+        return d as NSDictionary
+    }
 }
 
 public struct QMIDStatus: Equatable {
     public var apiVersion: Int?
     public var version: String?
-    public var modem: String              // absent | opening | ready
+    public var modem: String              // QMIDModemState raw value; see modemState
     public var modemError: String?
     public var network: String?
     public var pdns: [QMIDPDN]
     public var sim: QMIDSIM?
     public var plmn: QMIDPLMN?
 
-    public var isModemReady: Bool { modem == "ready" }
+    public var modemState: QMIDModemState? { QMIDModemState(rawValue: modem) }
+    public var isModemReady: Bool { modemState == .ready }
     public func pdn(_ name: String) -> QMIDPDN? { pdns.first { $0.name == name } }
 
     public init(_ d: NSDictionary) {

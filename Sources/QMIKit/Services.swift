@@ -677,6 +677,14 @@ public enum DMS {
     public static let getIDs: UInt16 = 0x0025
     public static let getRevision: UInt16 = 0x0023
     public static let uimGetICCID: UInt16 = 0x003C
+    public static let setOperatingMode: UInt16 = 0x002E
+
+    public enum OperatingMode: UInt8 {
+        case online = 0
+        case lowPower = 1
+    }
+
+    public static func operatingModeRequest(_ mode: OperatingMode) -> [TLV] { [.u8(0x01, mode.rawValue)] }
 
     // ICCID as ASCII digits.
     public static func parseICCID(_ m: QMIMessage) -> String? {

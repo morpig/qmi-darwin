@@ -37,6 +37,17 @@ public let qmidAPIVersion = 1
     func restart(reply: @escaping (String?) -> Void)
     func subscribeLogs(_ level: Int, since: Double, reply: @escaping (Bool) -> Void)
     func unsubscribeLogs(reply: @escaping () -> Void)
+    // Before switching SIMs (e.g. an eSIM profile switch): qmid writes the attach profile for
+    // the card with this ICCID ("carriers"), without a re-attach, so its first attach uses the
+    // right APN. mccmnc: the card's home network, for carriers matched by it. Reply: a
+    // dictionary with apn (the attach APN, "" = the network's choice), carrier and matchedBy
+    // when one matched; or an error, after which the switch works as before (one extra
+    // attach). Call it, wait for the reply, then switch; the prepare ends when qmid reads that
+    // card, on cancelSIM, when this connection closes, or after 10 s.
+    func prepareSIM(_ iccid: String, mccmnc: String?, reply: @escaping (NSDictionary?, String?) -> Void)
+    // The switch failed or was cancelled: back to the card in the modem (no re-attach). Ignored
+    // unless iccid is the pending card's.
+    func cancelSIM(_ iccid: String, reply: @escaping (String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -48,7 +59,7 @@ public enum QMIDKey {
     // status()
     public static let apiVersion = "apiVersion"
     public static let version = "version"             // qmid build, "0.2.0 (20260930120000)"
-    public static let modem = "modem"                 // "absent" | "opening" | "ready"
+    public static let modem = "modem"                 // QMIDModemState: "absent" | "opening" | "ready"
     public static let modemError = "modemError"
     public static let network = "network"             // e.g. "registered, ps attached, lte"
     public static let pdns = "pdns"                   // [PDN dictionary]
@@ -63,6 +74,7 @@ public enum QMIDKey {
     public static let matchedBy = "matchedBy"         // "iccid 8900" | "mccmnc 00101"
     public static let attachAPN = "attachAPN"         // APN of the default bearer as attached
     public static let attachAPNFromNetwork = "attachAPNFromNetwork" // Bool: the network chose it
+    public static let pendingSIM = "pendingSIM"       // "…1234": prepareSIM card, until it is in or the prepare ends
 
     // PLMN dictionary (status() "plmn" and "plmn" events): the registered network
     // mccmnc                                         // registered PLMN, "00101"
@@ -75,7 +87,7 @@ public enum QMIDKey {
     // PDN dictionary (status() entries and "pdn" events)
     public static let name = "name"
     public static let state = "state"                 // idle | waiting | dialing | connected | backoff | blocked
-    public static let policy = "policy"               // prefer-wifi | prefer-cellular | last-resort | never
+    public static let policy = "policy"               // QMIDPolicy: prefer-wifi | prefer-cellular | last-resort | never
     public static let role = "role"                   // internet | ims | other
     public static let interface = "interface"         // utunN while connected
     public static let ipv4 = "ipv4"
@@ -97,6 +109,7 @@ public enum QMIDKey {
     public static let qci = "qci"                     // default bearer's QCI (Int)
     public static let ambr = "ambr"                   // APN-AMBR: {uplink, downlink} in bps
     public static let bearers = "bearers"             // [bearer dictionary]: in status() and "bearers" events
+    public static let linkHeld = "linkHeld"           // Bool: redialing with the interface kept after a drop
 
     // bearer dictionary (dedicated EPS bearers of a PDN)
     public static let id = "id"                       // bearer: opaque, stable while the bearer lives; filter: 3GPP ID 0–15

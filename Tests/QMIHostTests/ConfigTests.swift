@@ -1,4 +1,5 @@
 @testable import QMIHost
+import QMIDAPI
 import QMIKit
 import XCTest
 
@@ -133,13 +134,13 @@ final class ServiceEntityTests: XCTestCase {
         XCTAssertEqual(v4["InterfaceName"] as? String, "utun9")
         let v6 = try XCTUnwrap(e[ServicePublisher.serviceKey(id, "IPv6")])
         XCTAssertEqual(v6["PrefixLength"] as? [Int], [64])
-        XCTAssertEqual(v6["Router"] as? String, "2001:db8::2")
+        XCTAssertEqual(v6["Router"] as? String, "fe80::")         // not the WDS gateway: no route to it on a p2p utun
         let dns = try XCTUnwrap(e[ServicePublisher.serviceKey(id, "DNS")])
         XCTAssertEqual(dns["ServerAddresses"] as? [String], ["192.0.2.53"])
     }
 
     func testPolicyRanks() throws {
-        func rank(_ p: ServicePublisher.Policy) -> String? {
+        func rank(_ p: QMIDPolicy) -> String? {
             let e = ServicePublisher.entities(pdnName: "x", interface: "utun9", settings: settings, policy: p)
             return e[ServicePublisher.serviceKey(ServicePublisher.serviceID(for: "x"))]?["PrimaryRank"] as? String
         }
@@ -261,19 +262,43 @@ final class CarrierConfigTests: XCTestCase {
         XCTAssertEqual(known.merged(over: SIMIdentity(iccid: known.iccid)), known)
     }
 
+    func testPreparedSIMArrival() throws {
+        let prepared = SIMIdentity(mccmnc: "00102", iccid: "8900210000000001245")
+        // Right after the switch Get Home Network fails: the prepared MCC/MNC stands in.
+        XCTAssertEqual(SIMIdentity(iccid: prepared.iccid).arrival(of: prepared), prepared)
+        // A read MCC/MNC wins over the prepared one.
+        XCTAssertEqual(SIMIdentity(mccmnc: "00103", iccid: prepared.iccid).arrival(of: prepared),
+                       SIMIdentity(mccmnc: "00103", iccid: prepared.iccid))
+        // Still the old card, or its ICCID unreadable: not the prepared one.
+        XCTAssertNil(SIMIdentity(mccmnc: "00101", iccid: "8900110000000000000").arrival(of: prepared))
+        XCTAssertNil(SIMIdentity(mccmnc: "00102").arrival(of: prepared))
+        // A prepared card matched by MCC/MNC only resolves before it is read.
+        let c = try carriersConfig()
+        let byMCCMNC = SIMIdentity(mccmnc: "00102", iccid: "8999000000000000000")
+        XCTAssertTrue(c.identifies(byMCCMNC))
+        XCTAssertFalse(c.identifies(SIMIdentity(iccid: byMCCMNC.iccid)))
+        // Prepared with neither a match nor an MCC/MNC: the fallback, not "left as is".
+        var f = c
+        f.pdns[0].apn = "fallback"
+        let unknown = SIMIdentity(iccid: byMCCMNC.iccid)
+        XCTAssertNil(f.resolvedPDNs(for: unknown)[0].apn)
+        XCTAssertEqual(f.resolvedPDNs(for: unknown, prepared: true)[0].apn, "fallback")
+        XCTAssertEqual(c.resolvedPDNs(for: unknown, prepared: true)[0].apn, "")   // empty fallback: the network's choice
+    }
+
     func testCarrierValidation() throws {
         func invalid(_ carriers: String, _ pdns: String = #"{ "name": "internet", "profile": 1 }"#,
                      file: StaticString = #filePath, line: UInt = #line) {
             XCTAssertThrowsError(try QMIDConfig.decode(Data("{ \"pdns\": [\(pdns)], \"carriers\": [\(carriers)] }".utf8)),
                                  file: file, line: line)
         }
-        invalid(#"{ "name": "", "mccmnc": ["51011"] }"#)                     // no name
+        invalid(#"{ "name": "", "mccmnc": ["00101"] }"#)                     // no name
         invalid(#"{ "name": "a" }"#)                                          // no match
-        invalid(#"{ "name": "a", "mccmnc": ["5101"] }"#)                      // too short
+        invalid(#"{ "name": "a", "mccmnc": ["0010"] }"#)                      // too short
         invalid(#"{ "name": "a", "mccmnc": ["001-01"] }"#)                    // not digits
         invalid(#"{ "name": "a", "iccid": ["89F"] }"#)                        // not digits
-        invalid(#"{ "name": "a", "mccmnc": ["51011"], "auth": "md5" }"#)      // bad auth
-        invalid(#"{ "name": "a", "mccmnc": ["51011"] }"#,
+        invalid(#"{ "name": "a", "mccmnc": ["00101"], "auth": "md5" }"#)      // bad auth
+        invalid(#"{ "name": "a", "mccmnc": ["00101"] }"#,
                 #"{ "name": "x", "role": "other", "profile": 1 }"#)          // no attach PDN
         XCTAssertNoThrow(try QMIDConfig.decode(Data(#"{ "pdns": [{ "name": "internet", "profile": 1 }], "carriers": [] }"#.utf8)))
     }
@@ -285,5 +310,19 @@ final class CarrierConfigTests: XCTestCase {
                        "3GPP #33: Requested service option not subscribed")
         XCTAssertEqual(PDNSession.summary([6: "b", 4: "a"]), "ipv4: a; ipv6: b")
         XCTAssertEqual(PDNSession.summary([4: "a"]), "ipv4: a")
+    }
+}
+
+extension ConfigTests {
+    // reload keeps a PDN's call when only its policy changed; anything else redials it.
+    func testReloadKeepsPDNWhenOnlyPolicyChanged() {
+        let a = pdn("internet", apn: "internet", role: "internet", policy: "prefer-wifi")
+        XCTAssertTrue(Manager.sameExceptPolicy(a, a))
+        XCTAssertTrue(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: "internet", policy: "never")))
+        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet2", role: "internet", policy: "prefer-wifi")))
+        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: "internet", auth: "chap", policy: "prefer-wifi")))
+        var b = a
+        b.autoconnect = false
+        XCTAssertFalse(Manager.sameExceptPolicy(a, b))
     }
 }

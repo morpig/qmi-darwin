@@ -219,6 +219,10 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.setPolicy(pdn, policy: policy) { self.finish($0, completion) }
     }
 
+    public func setPolicy(pdn: String, policy: QMIDPolicy, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        setPolicy(pdn: pdn, policy: policy.rawValue, completion)
+    }
+
     public func reload(_ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         proxy { completion(.failure($0)) }?.reload { self.finish($0, completion) }
     }
@@ -239,6 +243,21 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.setConfig(json) { self.finish($0, completion) }
     }
 
+    // Call before switching SIMs and wait for the result (see QMIDControl.prepareSIM); on
+    // failure, switch anyway. The prepare lasts while this client's connection does.
+    public func prepareSIM(iccid: String, mccmnc: String?, _ completion: @escaping (Result<QMIDPreparedSIM, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.prepareSIM(iccid, mccmnc: mccmnc) { d, err in
+            self.queue.async {
+                if let d { completion(.success(QMIDPreparedSIM(d))) } else { completion(.failure(QMIDError(err ?? "prepareSIM failed"))) }
+            }
+        }
+    }
+
+    // The switch failed or was cancelled.
+    public func cancelSIM(iccid: String, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.cancelSIM(iccid) { self.finish($0, completion) }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -251,10 +270,13 @@ public extension QMIDClient {
     func connect(pdn: String) async throws { try await bridge { self.connect(pdn: pdn, $0) } }
     func disconnect(pdn: String) async throws { try await bridge { self.disconnect(pdn: pdn, $0) } }
     func setPolicy(pdn: String, policy: String) async throws { try await bridge { self.setPolicy(pdn: pdn, policy: policy, $0) } }
+    func setPolicy(pdn: String, policy: QMIDPolicy) async throws { try await setPolicy(pdn: pdn, policy: policy.rawValue) }
     func reload() async throws { try await bridge { self.reload($0) } }
     func restart() async throws { try await bridge { self.restart($0) } }
     func getConfig() async throws -> Data { try await bridge { self.getConfig($0) } }
     func setConfig(_ json: Data) async throws { try await bridge { self.setConfig(json, $0) } }
+    func prepareSIM(iccid: String, mccmnc: String?) async throws -> QMIDPreparedSIM { try await bridge { self.prepareSIM(iccid: iccid, mccmnc: mccmnc, $0) } }
+    func cancelSIM(iccid: String) async throws { try await bridge { self.cancelSIM(iccid: iccid, $0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

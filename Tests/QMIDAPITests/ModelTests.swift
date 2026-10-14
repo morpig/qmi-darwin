@@ -24,7 +24,7 @@ final class ModelTests: XCTestCase {
     }
 
     func testDecodesQCIAndAMBR() throws {
-        // XL ims: IPv6 only, QCI 5, APN-AMBR 10.2 Mbps; pdn events carry no bearers.
+        // An IMS PDN: IPv6 only, QCI 5, APN-AMBR 10.2 Mbps; pdn events carry no bearers.
         let d = imsPDN.mutableCopy() as! NSMutableDictionary
         d[QMIDKey.qci] = 5
         d[QMIDKey.ambr] = [QMIDKey.uplink: NSNumber(value: UInt64(10_200_000)), QMIDKey.downlink: NSNumber(value: UInt64(10_200_000))]
@@ -35,7 +35,7 @@ final class ModelTests: XCTestCase {
         let plain = try XCTUnwrap(QMIDPDN(imsPDN))
         XCTAssertNil(plain.qci)
         XCTAssertNil(plain.ambr)
-        // 2 Gbps (XL internet) fits; a half-present AMBR is dropped.
+        // 2 Gbps (a fast internet PDN) fits; a half-present AMBR is dropped.
         d[QMIDKey.ambr] = [QMIDKey.uplink: NSNumber(value: UInt64(2_000_000_000)), QMIDKey.downlink: NSNumber(value: UInt64(2_000_000_000))]
         XCTAssertEqual(QMIDPDN(d)?.ambr?.downlink, 2_000_000_000)
         d[QMIDKey.ambr] = [QMIDKey.uplink: 1]
@@ -160,13 +160,13 @@ final class ModelTests: XCTestCase {
     func testDecodesSIM() throws {
         let s = QMIDStatus([
             QMIDKey.modem: "ready",
-            QMIDKey.sim: [QMIDKey.mccmnc: "51011", QMIDKey.iccidSuffix: "…1234", QMIDKey.carrier: "XL",
-                          QMIDKey.matchedBy: "mccmnc 51011", QMIDKey.attachAPN: "internet",
+            QMIDKey.sim: [QMIDKey.mccmnc: "00101", QMIDKey.iccidSuffix: "…1234", QMIDKey.carrier: "Example",
+                          QMIDKey.matchedBy: "mccmnc 00101", QMIDKey.attachAPN: "internet",
                           QMIDKey.attachAPNFromNetwork: false, "futureKey": 1] as NSDictionary,
         ])
         let sim = try XCTUnwrap(s.sim)
-        XCTAssertEqual(sim.mccmnc, "51011")
-        XCTAssertEqual(sim.carrier, "XL")
+        XCTAssertEqual(sim.mccmnc, "00101")
+        XCTAssertEqual(sim.carrier, "Example")
         XCTAssertEqual(sim.attachAPN, "internet")
         XCTAssertFalse(sim.attachAPNFromNetwork)
         XCTAssertNil(QMIDStatus([QMIDKey.modem: "absent"]).sim)
@@ -193,11 +193,80 @@ final class ModelTests: XCTestCase {
         XCTAssertFalse(bare.nameFromNetwork)
         XCTAssertNil(bare.emergencyBearers)
         XCTAssertNil(bare.emergencyAccessBarred)
-        let emc = try XCTUnwrap(QMIDPLMN([QMIDKey.mccmnc: "51010", QMIDKey.emergencyBearers: false,
+        let emc = try XCTUnwrap(QMIDPLMN([QMIDKey.mccmnc: "00102", QMIDKey.emergencyBearers: false,
                                           QMIDKey.emergencyAccessBarred: false]))
         XCTAssertEqual(emc.emergencyBearers, false)
         XCTAssertEqual(emc.emergencyAccessBarred, false)
         XCTAssertNil(QMIDPLMN(nil))
         XCTAssertNil(QMIDStatus([QMIDKey.modem: "ready"]).plmn)
+    }
+
+    // qmid builds its dictionaries from these types: what it encodes, clients decode unchanged.
+    func testPDNRoundTrip() throws {
+        var p = QMIDPDN(name: "internet", state: .backoff)
+        p.policy = QMIDPolicy.preferCellular.rawValue
+        p.role = "internet"
+        p.interface = "utun9"
+        p.ipv4 = "10.0.0.2"
+        p.ipv6 = "2001:db8::1/64"
+        p.dns = ["10.0.0.1"]
+        p.mtu = 1500
+        p.profile = 1
+        p.apn = "internet"
+        p.serviceID = "ID"
+        p.mux = 0x81
+        p.wanted = true
+        p.uptime = 5
+        p.error = "dropped: regular deactivation"
+        p.reason = .dropped
+        p.causes = [QMIDCause(type: "3GPP", family: 4, code: 36, name: "regular deactivation")]
+        p.blocked = ["ipv4: x"]
+        p.qci = 9
+        p.ambr = QMIDAMBR(uplink: 1, downlink: 2)
+        p.bearers = [QMIDBearer(id: 3, qci: 1, uplink: QMIDBitrates(max: 128_000, guaranteed: 128_000))]
+        p.linkHeld = true
+        let back = try XCTUnwrap(QMIDPDN(p.dictionary))
+        XCTAssertEqual(back, p)
+        XCTAssertEqual(back.policyKind, .preferCellular)
+        XCTAssertTrue(back.linkHeld)
+
+        let minimal = QMIDPDN(name: "ims", state: .idle)
+        XCTAssertEqual(QMIDPDN(minimal.dictionary), minimal)
+        XCTAssertNil(minimal.dictionary[QMIDKey.dns])          // empty lists are left out
+        XCTAssertFalse(try XCTUnwrap(QMIDPDN(imsPDN)).linkHeld) // older qmid: no key
+    }
+
+    func testFilterRoundTrip() throws {
+        var f = QMIDPacketFilter(id: 1, precedence: 10, ipVersion: 6)
+        f.destination = "2001:db8::a/128"
+        f.ipProtocol = 17
+        f.sourcePorts = 5060...5060
+        f.destinationPorts = 1024...65535
+        XCTAssertEqual(QMIDPacketFilter(f.dictionary), f)
+    }
+
+    func testSIMPLMNPreparedRoundTrip() throws {
+        var s = QMIDSIM(mccmnc: "00101", iccidSuffix: "…1234")
+        s.carrier = "Example"
+        s.matchedBy = "mccmnc 00101"
+        s.attachAPN = "internet"
+        s.attachAPNFromNetwork = true
+        s.pendingSIM = "…5678"
+        XCTAssertEqual(QMIDSIM(s.dictionary), s)
+        XCTAssertNil(QMIDSIM(mccmnc: "00101").dictionary[QMIDKey.attachAPNFromNetwork])   // only with an APN
+
+        var n = QMIDPLMN(mccmnc: "00101", longName: "Example Mobile", shortName: nil, nameFromNetwork: true)
+        n.emergencyBearers = false
+        XCTAssertEqual(QMIDPLMN(n.dictionary), n)
+
+        let r = QMIDPreparedSIM(apn: "", carrier: "Example", matchedBy: "iccid 8900")
+        XCTAssertEqual(QMIDPreparedSIM(r.dictionary), r)
+    }
+
+    func testModemStateAndPolicy() {
+        XCTAssertEqual(QMIDStatus([QMIDKey.modem: "ready"]).modemState, .ready)
+        XCTAssertTrue(QMIDStatus([QMIDKey.modem: "ready"]).isModemReady)
+        XCTAssertNil(QMIDStatus([QMIDKey.modem: "rebooting"]).modemState)   // a newer qmid's state
+        XCTAssertEqual(QMIDPolicy.allCases.map(\.rawValue), ["prefer-wifi", "prefer-cellular", "last-resort", "never"])
     }
 }

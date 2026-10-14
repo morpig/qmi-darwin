@@ -257,7 +257,7 @@ static BOOL isQMIInterface(io_service_t s) {
     }
     IOObjectRelease(it);
     if (!found) {
-        if (error) *error = QDError(1, interfaceNumber >= 0
+        if (error) *error = QDError(QDErrorNotFound, interfaceNumber >= 0
             ? [NSString stringWithFormat:@"no USB interface %ld on a modem of a known vendor", (long)interfaceNumber]
             : @"no QMI interface found (is the modem connected and in QMI mode, and is its vendor ID listed?)");
         return nil;
@@ -298,9 +298,9 @@ static BOOL isQMIInterface(io_service_t s) {
                                               interestHandler:^(IOUSBHostObject *obj, uint32_t type, void *arg) {
             if (type == kIOMessageServiceIsTerminated) [weakSelf handleTermination];
         }];
-        if (!_iface && error) *error = e ?: QDError(5, @"could not open the QMI interface");
+        if (!_iface && error) *error = e ?: QDError(QDErrorOpenInterface, @"could not open the QMI interface");
     } @catch (NSException *ex) {
-        if (error) *error = QDError(5, [NSString stringWithFormat:@"could not open the QMI interface (%@)", ex.name]);
+        if (error) *error = QDError(QDErrorOpenInterface, [NSString stringWithFormat:@"could not open the QMI interface (%@)", ex.name]);
         _iface = nil;
     }
     if (!_iface) {
@@ -322,7 +322,7 @@ static BOOL isQMIInterface(io_service_t s) {
         else if (type == 3 && (addr & 0x80)) { _interruptAddress = addr; _intMaxPacket = mps; }
     }
     if (!_bulkInAddress || !_bulkOutAddress || !_interruptAddress) {
-        if (error) *error = QDError(2, @"QMI interface is missing a bulk or interrupt endpoint");
+        if (error) *error = QDError(QDErrorNoEndpoint, @"QMI interface is missing a bulk or interrupt endpoint");
         qd_destroy(_iface);
         return nil;
     }
@@ -333,7 +333,7 @@ static BOOL isQMIInterface(io_service_t s) {
     } @catch (NSException *ex) {
         _inPipe = _outPipe = _intPipe = nil;
     }
-    if ((!_inPipe || !_outPipe || !_intPipe) && error) *error = QDError(6, @"could not open the QMI interface's pipes");
+    if ((!_inPipe || !_outPipe || !_intPipe) && error) *error = QDError(QDErrorOpenPipes, @"could not open the QMI interface's pipes");
     if (!_inPipe || !_outPipe || !_intPipe) {
         qd_destroy(_iface);
         return nil;
@@ -370,11 +370,11 @@ static BOOL isQMIInterface(io_service_t s) {
         NSError *e = nil;
         BOOL ok = [_iface sendDeviceRequest:req data:data bytesTransferred:done completionTimeout:5.0
                                       error:(error ? &e : NULL)];
-        if (!ok && error) *error = e ?: QDError(4, @"device request failed");
+        if (!ok && error) *error = e ?: QDError(QDErrorDeviceRequest, @"device request failed");
         return ok;
     } @catch (NSException *ex) {
         QDLOG("device request 0x%02x/0x%02x raised %s", req.bmRequestType, req.bRequest, ex.reason.UTF8String);
-        if (error) *error = QDError(4, [NSString stringWithFormat:@"device request failed (%@)", ex.name]);
+        if (error) *error = QDError(QDErrorDeviceRequest, [NSString stringWithFormat:@"device request failed (%@)", ex.name]);
         return NO;
     }
 }
@@ -510,7 +510,7 @@ static BOOL isQMIInterface(io_service_t s) {
             NSError *e = nil;
             NSMutableData *b = [self->_iface ioDataWithCapacity:self->_dlSize error:&e];
             if (!b) b = [NSMutableData dataWithLength:self->_dlSize];
-            if (![self submitIn:b]) { ok = NO; err = QDError(3, @"could not queue bulk IN reads"); }
+            if (![self submitIn:b]) { ok = NO; err = QDError(QDErrorQueueReads, @"could not queue bulk IN reads"); }
         }
         self->_g.in_posted_min = self->_inPosted;
         for (int m = 0; m < 256; m++) [self updateSource:(uint8_t)m];

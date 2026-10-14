@@ -52,6 +52,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 extern NSErrorDomain const QDErrorDomain;
 
+typedef NS_ERROR_ENUM(QDErrorDomain, QDErrorCode) {
+    QDErrorNotFound = 1,            // no matching modem interface (the modem is away)
+    QDErrorNoEndpoint = 2,
+    QDErrorQueueReads = 3,
+    QDErrorDeviceRequest = 4,
+    QDErrorOpenInterface = 5,
+    QDErrorOpenPipes = 6,
+};
+
 @interface QDModem : NSObject
 
 // Opens the QMI interface of the first modem of one of vendorIDs (in list order, then by USB

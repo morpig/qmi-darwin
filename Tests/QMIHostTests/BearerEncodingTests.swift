@@ -32,7 +32,7 @@ final class BearerEncodingTests: XCTestCase {
         b.networkInitiated = true
         b.bearerID = 0x37
 
-        let d = Manager.bearerInfo(b)
+        let d = Manager.bearerInfo(b).dictionary
         XCTAssertNil(d["bearerID"])                         // not exposed
         let c = try XCTUnwrap(QMIDBearer(d))
         XCTAssertEqual(c.id, 0xc3d)
@@ -58,12 +58,30 @@ final class BearerEncodingTests: XCTestCase {
     func testSparseBearer() throws {
         var b = QoS.Bearer(qosID: 7)
         b.uplink = QoS.Flow(qci: 8)
-        let c = try XCTUnwrap(QMIDBearer(Manager.bearerInfo(b)))
+        let c = try XCTUnwrap(QMIDBearer(Manager.bearerInfo(b).dictionary))
         XCTAssertEqual(c.qci, 8)
         XCTAssertNil(c.networkInitiated)
         XCTAssertFalse(c.isGBR)
         XCTAssertEqual(c.uplink, QMIDBitrates())
         XCTAssertEqual(c.uplinkFilters, [])
+    }
+
+    // A call that was up a while keeps its link while it redials; a young one, an unwanted one,
+    // or one not connected goes through backoff without it.
+    func testHoldsLink() {
+        XCTAssertTrue(Manager.holdsLink(wanted: true, hasLink: true, state: .connected, upFor: 7200))
+        XCTAssertTrue(Manager.holdsLink(wanted: true, hasLink: true, state: .connected, upFor: 60))
+        XCTAssertFalse(Manager.holdsLink(wanted: true, hasLink: true, state: .connected, upFor: 59))
+        XCTAssertFalse(Manager.holdsLink(wanted: true, hasLink: true, state: .connected, upFor: nil))
+        XCTAssertFalse(Manager.holdsLink(wanted: false, hasLink: true, state: .connected, upFor: 7200))
+        XCTAssertFalse(Manager.holdsLink(wanted: true, hasLink: false, state: .connected, upFor: 7200))
+        XCTAssertFalse(Manager.holdsLink(wanted: true, hasLink: true, state: .dialing, upFor: 7200))
+    }
+
+    func testMCCMNCString() {
+        XCTAssertEqual(Manager.mccmncString((mcc: 999, mnc: 99)), "99999")
+        XCTAssertEqual(Manager.mccmncString((mcc: 1, mnc: 1)), "00101")
+        XCTAssertEqual(Manager.mccmncString((mcc: 310, mnc: 260)), "310260")
     }
 
     func testAMBRDescription() {

@@ -10,6 +10,7 @@ public final class Utun {
     public private(set) var fd: Int32
     public private(set) var maxPendingResult: Int32 = 0
     private var routes: [[String]] = []
+    private var ipv4: IPv4?                // the WDS address configured, removed when WDS no longer reports one
     private var ipv6: IPv6Prefix?          // the WDS address configured, replaced when WDS reports another
 
     public init() throws {
@@ -45,7 +46,11 @@ public final class Utun {
             // Point-to-point: the peer is the WDS gateway, or our own address if none.
             let peer = s.ipv4Gateway ?? a
             try Self.run("/sbin/ifconfig", [name, "inet", "\(a)", "\(peer)", "netmask", "255.255.255.255", "up"])
+        } else if let old = ipv4 {
+            // A utun kept across a redial whose new call has no IPv4.
+            try Self.run("/sbin/ifconfig", [name, "inet", "\(old)", "delete"])
         }
+        ipv4 = s.ipv4Address
         for args in Self.ipv6Commands(name, old: ipv6, new: s.ipv6Address) {
             try Self.run("/sbin/ifconfig", args)
         }

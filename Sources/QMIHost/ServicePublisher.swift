@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import QMIDAPI
 import QMIKit
 import SystemConfiguration
 
@@ -16,22 +17,6 @@ import SystemConfiguration
 // - IPv4 needs Router (or DestAddresses); without one the service is demoted to Last.
 // - The interface's Link entity is only consulted for the expensive flag; utun needs none.
 public final class ServicePublisher {
-    public enum Policy: String, CaseIterable {
-        case preferWifi = "prefer-wifi"
-        case preferCellular = "prefer-cellular"
-        case lastResort = "last-resort"
-        case never = "never"
-
-        var primaryRank: String? {
-            switch self {
-            case .preferWifi: return nil
-            case .preferCellular: return "First"
-            case .lastResort: return "Last"
-            case .never: return "Never"
-            }
-        }
-    }
-
     private let store: SCDynamicStore
     private var published: Set<String> = []
 
@@ -57,7 +42,7 @@ public final class ServicePublisher {
 
     // Builds the service's entities from WDS runtime settings.
     public static func entities(pdnName: String, interface: String, settings s: WDS.RuntimeSettings,
-                                policy: Policy) -> [String: [String: Any]] {
+                                policy: QMIDPolicy) -> [String: [String: Any]] {
         let id = serviceID(for: pdnName)
         var out: [String: [String: Any]] = [:]
 
@@ -76,13 +61,16 @@ public final class ServicePublisher {
             ]
         }
         if let p = s.ipv6Address {
-            var v6: [String: Any] = [
+            // Router fe80::, not the WDS gateway: the gateway is a global address in our /64,
+            // which has no route on a point-to-point utun, so the kernel refuses the default
+            // route when IPMonitor re-adds it (after a VPN hands primary back). fe80:: always
+            // resolves through the utun's fe80::/64; the next hop doesn't matter on a utun.
+            out[serviceKey(id, "IPv6")] = [
                 "Addresses": [p.address.description],
                 "PrefixLength": [Int(p.length)],
+                "Router": "fe80::",
                 "InterfaceName": interface,
             ]
-            if let gw = s.ipv6Gateway { v6["Router"] = gw.address.description }
-            out[serviceKey(id, "IPv6")] = v6
         }
         let dns = s.ipv4DNS.map(\.description) + s.ipv6DNS.map(\.description)
         if !dns.isEmpty {
@@ -144,7 +132,7 @@ public final class ServicePublisher {
     public static func pdnKey(_ name: String) -> String { "State:/Network/QMI/PDN/\(name)" }
 
     public static func pdnStatus(name: String, interface: String, muxID: UInt8, config: PDNConfig,
-                                 settings s: WDS.RuntimeSettings, policy: Policy) -> [String: Any] {
+                                 settings s: WDS.RuntimeSettings, policy: QMIDPolicy) -> [String: Any] {
         var d: [String: Any] = [
             "ServiceID": serviceID(for: name),
             "InterfaceName": interface,
@@ -160,5 +148,17 @@ public final class ServicePublisher {
         if !s.pcscfIPv4.isEmpty { d["PCSCFv4"] = s.pcscfIPv4.map(\.description) }
         if !s.pcscfIPv6.isEmpty { d["PCSCFv6"] = s.pcscfIPv6.map(\.description) }
         return d
+    }
+}
+
+extension QMIDPolicy {
+    // The service's PrimaryRank for IPMonitor; none ranks it after Wi-Fi/Ethernet.
+    var primaryRank: String? {
+        switch self {
+        case .preferWifi: return nil
+        case .preferCellular: return "First"
+        case .lastResort: return "Last"
+        case .never: return "Never"
+        }
     }
 }

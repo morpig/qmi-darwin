@@ -19,12 +19,17 @@ usage (through qmid):
   qmictl log [--level L] [--no-history]     qmid's log: recent lines, then live (L: debug = QMI trace)
   qmictl config get | config set FILE       read / replace qmid.json (validated, applied)
   qmictl sync                               APN sync report: PDN ↔ modem profile, autoconnect, attach
+  qmictl prepare-sim ICCID [MCCMNC] [--hold SECONDS]
+                                            write the attach profile for that card before a SIM
+                                            switch; held until Ctrl-C (or SECONDS), which ends it
+  qmictl cancel-sim ICCID                   end a prepare-sim: attach profile back to the current SIM
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
   qmictl modem-status [--iface N] [-v]
   qmictl profiles     [--iface N] [-v]     modem profiles, autoconnect, LTE attach PDN list
   qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
+  qmictl reattach     [--iface N] [-v]     low power, then online: attach again with the attach profile
   qmictl profile-write INDEX|new KEY=VALUE...   create/modify a profile; keys: apn, pdp
                       (ipv4|ipv6|ipv4v6), user, pass, auth (none|pap|chap|pap-chap),
                       pcscf-pco, pcscf-dhcp, imcn, disabled (0|1), type (default,ims,...)
@@ -66,7 +71,7 @@ struct Options {
     var fcTest: Double = 0
     var stallTest: Double = 0
     var flowControl = false
-    var policies: [String: ServicePublisher.Policy] = [:]
+    var policies: [String: QMIDPolicy] = [:]
 }
 
 func fail(_ message: String) -> Never {
@@ -115,7 +120,7 @@ func parseOptions() -> Options {
             o.pdns.append(pdn)
             let parts = spec.split(separator: ":", omittingEmptySubsequences: false)
             if parts.count > 4 {
-                guard let p = ServicePublisher.Policy(rawValue: String(parts[4])) else { fail("bad policy in \(spec)") }
+                guard let p = QMIDPolicy(rawValue: String(parts[4])) else { fail("bad policy in \(spec)") }
                 o.policies[pdn.name] = p
             } else {
                 o.policies[pdn.name] = pdn.name == "ims" ? .never : .preferWifi
@@ -199,6 +204,32 @@ func status(_ o: Options) {
             print("network:  \(s.registrationName), ps \(s.psAttached ? "attached" : "detached"), rat \(rats.isEmpty ? "none" : rats), plmn \(plmn) \(s.operatorName ?? "")")
         }
         nas.release()
+    }
+    if let wds = section("wds", { try dev.allocateClient(.wds) }) {
+        if let r = section("lte attach parameters", { try wds.request(WDS.getLTEAttachParameters, timeout: 5) }) {
+            print("bearer:   default bearer apn \"\(WDS.parseAttachParameters(r).apn ?? "")\"")
+        }
+        wds.release()
+    }
+}
+
+// MARK: - reattach
+
+// DMS Set Operating Mode low power, then online: the modem detaches and attaches again with the
+// current LTE attach profile (what qmid's reattachLTE does).
+func reattach(_ o: Options) {
+    let dev = openDevice(o)
+    defer { dev.close() }
+    do {
+        let dms = try dev.allocateClient(.dms)
+        defer { dms.release() }
+        try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.lowPower), timeout: 20)
+        print("low power")
+        Thread.sleep(forTimeInterval: 2)
+        try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.online), timeout: 20, accept: [.noEffect])
+        print("online")
+    } catch {
+        fail("\(error)")
     }
 }
 
@@ -620,6 +651,7 @@ func describe(_ s: QMIDSIM) -> String {
     var line = [s.mccmnc, s.iccidSuffix].compactMap { $0 }.joined(separator: " ")
     if let c = s.carrier { line += ", carrier \(c)\(s.matchedBy.map { " by \($0)" } ?? "")" }
     if let a = s.attachAPN { line += ", default bearer apn \(a)\(s.attachAPNFromNetwork ? " (chosen by the network)" : "")" }
+    if let p = s.pendingSIM { line += ", prepared for SIM \(p)" }
     return line
 }
 
@@ -749,7 +781,7 @@ func daemonCommand(_ args: [String]) -> Bool {
             d.profiles { list in
                 for case let e as NSDictionary in list {
                     if let s = e["sim"] {
-                        print("sim: \(s)\(e["carrier"].map { ", carrier \($0)" } ?? "")\(e["attachAPN"].map { ", default bearer apn \($0)" } ?? "")")
+                        print("sim: \(s)\(e["carrier"].map { ", carrier \($0)" } ?? "")\(e["attachAPN"].map { ", default bearer apn \($0)" } ?? "")\(e["pending"].map { ", prepared for SIM \($0)" } ?? "")")
                     } else if let l = e["learned"] as? [String] {
                         print("default bearer apns seen (home mccmnc: apn):"); l.forEach { print("  \($0)") }
                     } else if let pdn = e["pdn"] {
@@ -764,10 +796,37 @@ func daemonCommand(_ args: [String]) -> Bool {
                 done()
             }
         }
+    case "prepare-sim" where args.count >= 2:
+        prepareSIM(Array(args.dropFirst()))
+    case "cancel-sim" where args.count == 2:
+        withDaemon { d, done in d.cancelSIM(args[1]) { reportResult($0); done() } }
     default:
         return false
     }
     return true
+}
+
+// The prepare lasts while this connection does, so qmictl stays until Ctrl-C or --hold runs out.
+func prepareSIM(_ args: [String]) -> Never {
+    var rest = args
+    var hold: Double?
+    if let i = rest.firstIndex(of: "--hold"), i + 1 < rest.count {
+        hold = Double(rest[i + 1])
+        rest.removeSubrange(i...(i + 1))
+    }
+    guard let iccid = rest.first, rest.count <= 2 else { fail("prepare-sim ICCID [MCCMNC] [--hold SECONDS]") }
+    let c = NSXPCConnection(machServiceName: qmidMachService, options: .privileged)
+    c.remoteObjectInterface = NSXPCInterface(with: QMIDControl.self)
+    c.resume()
+    let proxy = c.remoteObjectProxyWithErrorHandler { fail(QMIDError(xpc: $0).message) } as! QMIDControl
+    proxy.prepareSIM(iccid, mccmnc: rest.count == 2 ? rest[1] : nil) { d, err in
+        guard let d else { fail(err ?? "prepareSIM failed") }
+        let p = QMIDPreparedSIM(d)
+        print("prepared: attach apn \"\(p.apn)\"\(p.carrier.map { ", carrier \($0)" } ?? "")\(p.matchedBy.map { " by \($0)" } ?? "")")
+        print(hold.map { "holding \(Int($0)) s" } ?? "switch SIMs now; Ctrl-C ends the prepare")
+        if let hold { DispatchQueue.main.asyncAfter(deadline: .now() + hold) { c.invalidate(); exit(0) } }
+    }
+    withExtendedLifetime(c) { dispatchMain() }
 }
 
 if daemonCommand(Array(CommandLine.arguments.dropFirst())) { exit(0) }
@@ -782,6 +841,7 @@ case "probe": probe(options)
 case "modem-status": status(options)
 case "profiles": profiles(options)
 case "plmn-name": plmnName(options)
+case "reattach": reattach(options)
 case "run": connect(options)
 default: print(usage); exit(2)
 }

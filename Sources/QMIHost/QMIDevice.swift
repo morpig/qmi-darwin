@@ -4,13 +4,14 @@ import QMIKit
 
 public enum QMIHostError: Error, CustomStringConvertible {
     case open(String)
+    case notFound(String)                   // no modem interface to open: the modem is away
     case transport(String)
     case timeout(QMIService, UInt16)
     case protocolError(QMIProtocolError, QMIMessage)
 
     public var description: String {
         switch self {
-        case .open(let s): return "open: \(s)"
+        case .open(let s), .notFound(let s): return "open: \(s)"
         case .transport(let s): return "transport: \(s)"
         case .timeout(let svc, let msg): return "timeout waiting for \(svc) 0x\(String(format: "%04x", msg))"
         case .protocolError(let e, let m): return "\(m.service) 0x\(String(format: "%04x", m.messageID)): \(e)"
@@ -20,6 +21,12 @@ public enum QMIHostError: Error, CustomStringConvertible {
     public var protocolError: QMIProtocolError? {
         if case .protocolError(let e, _) = self { return e }
         return nil
+    }
+
+    // The modem isn't there to open (unplugged, or re-enumerating).
+    public var isModemAway: Bool {
+        if case .notFound = self { return true }
+        return false
     }
 }
 
@@ -83,6 +90,8 @@ public final class QMIDevice {
             return try QMIDevice(modem: modem)
         } catch let e as QMIHostError {
             throw e
+        } catch let e as QDError where e.code == .notFound {
+            throw QMIHostError.notFound(e.localizedDescription)
         } catch {
             throw QMIHostError.open(error.localizedDescription)
         }

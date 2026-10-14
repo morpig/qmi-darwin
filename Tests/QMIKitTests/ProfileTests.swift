@@ -133,7 +133,7 @@ final class CallEndTests: XCTestCase {
     }
 
     func testPermanentCauses() {
-        XCTAssertTrue(end(6, 51).isPermanent)     // 3GPP: PDN type IPv6 only allowed (XL IMS over IPv4)
+        XCTAssertTrue(end(6, 51).isPermanent)     // 3GPP: PDN type IPv6 only allowed (IPv4 on an IPv6-only IMS APN)
         XCTAssertTrue(end(6, 33).isPermanent)     // not subscribed
         XCTAssertTrue(end(6, 27).isPermanent)     // unknown APN
         XCTAssertTrue(end(6, 30).isPermanent)     // rejected by the gateway (RM520N IMS)
