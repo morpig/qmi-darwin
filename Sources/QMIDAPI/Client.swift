@@ -285,6 +285,15 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.resetBandPreference(persistent: persistent) { self.finish($0, completion) }
     }
 
+    // ["lte"]: LTE only. Names as QMIDBandPreference.modes / supportedModes.
+    public func setModePreference(_ modes: [String], persistent: Bool = false, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.setModePreference(modes, persistent: persistent) { self.finish($0, completion) }
+    }
+
+    public func resetModePreference(persistent: Bool = false, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.resetModePreference(persistent: persistent) { self.finish($0, completion) }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -318,6 +327,10 @@ public extension QMIDClient {
         try await bridge { self.setBandPreference(lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent, $0) }
     }
     func resetBandPreference(persistent: Bool = false) async throws { try await bridge { self.resetBandPreference(persistent: persistent, $0) } }
+    func setModePreference(_ modes: [String], persistent: Bool = false) async throws {
+        try await bridge { self.setModePreference(modes, persistent: persistent, $0) }
+    }
+    func resetModePreference(persistent: Bool = false) async throws { try await bridge { self.resetModePreference(persistent: persistent, $0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

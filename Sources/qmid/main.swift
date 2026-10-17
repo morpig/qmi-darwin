@@ -227,6 +227,12 @@ final class Control: NSObject, QMIDControl {
     func resetBandPreference(persistent: Bool, reply: @escaping (String?) -> Void) {
         manager.queue.async { reply(self.manager.resetBandPreference(persistent: persistent)) }
     }
+    func setModePreference(_ modes: [String], persistent: Bool, reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.setModePreference(modes, persistent: persistent)) }
+    }
+    func resetModePreference(persistent: Bool, reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.resetModePreference(persistent: persistent)) }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

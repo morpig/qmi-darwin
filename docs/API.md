@@ -116,6 +116,8 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `bandPreference` | the allowed technologies and LTE / NR bands (`QMIDBandPreference`), read now | – |
 | `setBandPreference(lte:nrNSA:nrSA:persistent:)` | restricts the bands (see "Band preference") | until the modem restarts, unless `persistent` |
 | `resetBandPreference(persistent:)` | back to the setting before qmid's first change | as above |
+| `setModePreference(_:persistent:)` | restricts the technologies, e.g. `["lte"]` for LTE only (see "Band preference") | as above |
+| `resetModePreference(persistent:)` | back to the modes before qmid's first change | as above |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -384,7 +386,7 @@ try await qmid.restartModem()            // the modem resets: modem "absent", th
 `bandPreference()` reads what the modem may use: `modes` (`"lte"`, `"nr"`, …), `lteBands`,
 `nrNSABands` (NR bands for EN-DC) and `nrSABands`, as band numbers. It is the same setting
 as Quectel's `AT+QNWPREFCFG`; `supportedLTEBands` / `supportedNRBands` are what the modem can
-use at all.
+use at all, and `supportedModes` the technologies it has.
 
 ```swift
 try await qmid.setBandPreference(lte: [1, 3], nrNSA: [41])   // SA left as it is; until restart
@@ -399,6 +401,20 @@ try await qmid.resetBandPreference()                        // back to the setti
 - `resetBandPreference` writes back the setting qmid read before its first change (kept
   across qmid restarts), as it was: the modem's own default may include bands it doesn't
   report as supported. With no saved setting, it allows every supported band.
+
+The technologies are set the same way, apart from the bands (which stay as they are):
+
+```swift
+try await qmid.setModePreference(["lte"])                   // LTE only; until restart
+try await qmid.resetModePreference()                        // back to the modes before
+```
+
+- Names as in `modes`; each must be in `supportedModes`. Persistence and the saved original
+  work as for the bands (the modem's default may list technologies it doesn't have, e.g.
+  `cdma1x`, and is written back as it was).
+- Narrowing to LTE only drops the NR leg without a detach on the RM551E. Widening it again
+  makes the modem detach for about a second: PDNs drop and redial, with their interfaces
+  kept (`linkHeld`).
 
 ## Dedicated bearers and QoS
 
@@ -687,6 +703,9 @@ Added in qmid 0.15 (API still 1): `setAirplaneMode`, `restartModem`, `bandPrefer
 Added in qmid 0.16 (API still 1): `setBandPreference`, `resetBandPreference`,
 `QMIDBandPreference.supportedLTEBands` / `supportedNRBands`.
 
+Added in qmid 0.17 (API still 1): `setModePreference`, `resetModePreference`,
+`QMIDBandPreference.supportedModes`.
+
 ## Testing from the command line
 
 `qmictl` uses the same client:
@@ -707,4 +726,6 @@ qmictl restart-modem                # reset the modem
 qmictl bands                        # allowed technologies and bands
 qmictl bands set lte 1,3 nsa 41     # restrict (until the modem restarts; --persistent to store)
 qmictl bands reset                  # back to the setting before
+qmictl modes set lte                # LTE only (bands unchanged; --persistent to store)
+qmictl modes reset                  # back to the modes before
 ```

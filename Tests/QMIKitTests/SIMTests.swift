@@ -176,6 +176,17 @@ final class SIMTests: XCTestCase {
         XCTAssertFalse(DMS.isLowPower(0))
     }
 
+    func testModePreference() throws {
+        // LTE only, until restart: mask 0x0010; the band TLVs are left out.
+        XCTAssertEqual(NAS.modePreferenceRequest(["lte"], persistent: false), [.u16(0x11, 0x0010), .u8(0x17, 0)])
+        XCTAssertEqual(NAS.modePreferenceRequest(["lte", "nr"], persistent: true), [.u16(0x11, 0x0050), .u8(0x17, 1)])
+        XCTAssertNil(NAS.modePreferenceRequest(["5g"], persistent: false))
+        // DMS Get Capabilities: rates, data/SIM capability, radio interfaces 5 (UMTS), 8 (LTE), 10 (NR).
+        let caps = try response(.dms, DMS.getCapabilities,
+                                [TLV(0x01, [UInt8](hex: "00 00 00 00 00 00 00 00 03 01 03 05 08 0a")!)])
+        XCTAssertEqual(DMS.parseModeCapabilities(caps), ["umts", "lte", "nr"])
+    }
+
     func testBandPreferenceRequest() throws {
         let t = Dictionary(uniqueKeysWithValues: NAS.bandPreferenceRequest(lte: [1, 3], nrNSA: [40, 41], nrSA: nil, persistent: false)
             .map { ($0.type, $0.value) })

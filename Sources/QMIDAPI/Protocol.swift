@@ -68,6 +68,13 @@ public let qmidAPIVersion = 1
     // Back to the setting qmid found before its first setBandPreference (kept across qmid
     // restarts); every supported band when qmid has changed nothing.
     func resetBandPreference(persistent: Bool, reply: @escaping (String?) -> Void)
+    // Restricts the technologies the modem may use (QMIDBandPreference.modes names: "lte",
+    // "nr", "umts", "gsm", …; ["lte"] = LTE only). Each must be one the modem has
+    // (supportedModes). The bands stay as they are. Persistence as setBandPreference.
+    func setModePreference(_ modes: [String], persistent: Bool, reply: @escaping (String?) -> Void)
+    // Back to the modes qmid found before its first setModePreference (kept across qmid
+    // restarts); every mode the modem has when qmid has changed nothing.
+    func resetModePreference(persistent: Bool, reply: @escaping (String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -194,6 +201,7 @@ public enum QMIDKey {
     public static let nrSABands = "nrSABands"         // [Int]: NR bands for SA
     public static let supportedLTEBands = "supportedLTEBands" // [Int]: what the modem can use
     public static let supportedNRBands = "supportedNRBands"   // [Int]
+    public static let supportedModes = "supportedModes"       // [String]: the technologies the modem has
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

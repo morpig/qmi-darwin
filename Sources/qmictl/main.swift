@@ -33,6 +33,9 @@ usage (through qmid):
                                             restarts unless --persistent
   qmictl bands reset [--persistent]         back to the setting before qmid changed it (else
                                             every supported band)
+  qmictl modes set lte[,nr,...] [--persistent]
+                                            allowed technologies (bands unchanged); lte = LTE only
+  qmictl modes reset [--persistent]         back to the modes before qmid changed them
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -927,6 +930,11 @@ func daemonCommand(_ args: [String]) -> Bool {
                 done()
             }
         }
+    case "modes" where args.count >= 3 && args[1] == "set":
+        let modes = args[2].split(separator: ",").map(String.init)
+        withDaemon { d, done in d.setModePreference(modes, persistent: args.contains("--persistent")) { reportResult($0); done() } }
+    case "modes" where args.count >= 2 && args[1] == "reset":
+        withDaemon { d, done in d.resetModePreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
     case "cancel-sim" where args.count == 2:
         withDaemon { d, done in d.cancelSIM(args[1]) { reportResult($0); done() } }
     default:
@@ -941,6 +949,7 @@ func printBands(_ b: QMIDBandPreference) {
     print("allowed lte:    \(list(b.lteBands, "B"))")
     print("allowed nr nsa: \(list(b.nrNSABands, "n"))")
     print("allowed nr sa:  \(list(b.nrSABands, "n"))")
+    if !b.supportedModes.isEmpty { print("supported modes: \(b.supportedModes.joined(separator: " "))") }
     if !b.supportedLTEBands.isEmpty { print("supported lte:  \(list(b.supportedLTEBands, "B"))") }
     if !b.supportedNRBands.isEmpty { print("supported nr:   \(list(b.supportedNRBands, "n"))") }
 }

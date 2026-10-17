@@ -204,6 +204,7 @@ public final class Manager {
     // The band preference as qmid found it before its first change ("lte", "nsa", "sa"), kept
     // in the state file: resetBandPreference writes it back. nil when qmid changed nothing.
     private var bandsBefore: [String: [Int]]?
+    private var modesBefore: [String]?       // the same for the mode preference (resetModePreference)
     private var statePath: String {
         (configPath as NSString).deletingLastPathComponent + "/state.json"
     }
@@ -220,12 +221,14 @@ public final class Manager {
             savedProfiles = j["profiles"] as? [String: Int] ?? [:]
             learned = j["learned"] as? [String: [String: String]] ?? [:]
             bandsBefore = j["bandsBefore"] as? [String: [Int]]
+            modesBefore = j["modesBefore"] as? [String]
         }
     }
 
     private func saveState() {
         var j: [String: Any] = ["profiles": savedProfiles, "learned": learned]
         j["bandsBefore"] = bandsBefore
+        j["modesBefore"] = modesBefore
         if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: URL(fileURLWithPath: statePath))
         }
@@ -2021,7 +2024,8 @@ public final class Manager {
             let p = NAS.parseBandPreference(try n.request(NAS.getSystemSelectionPreference, timeout: 5))
             let caps = bandCapabilities()
             return (QMIDBandPreference(modes: p.modes, lteBands: p.lte, nrNSABands: p.nrNSA, nrSABands: p.nrSA,
-                                       supportedLTEBands: caps.lte, supportedNRBands: caps.nr).dictionary, nil)
+                                       supportedLTEBands: caps.lte, supportedNRBands: caps.nr,
+                                       supportedModes: modeCapabilities()).dictionary, nil)
         } catch {
             return (nil, "\(error)")
         }
@@ -2089,6 +2093,59 @@ public final class Manager {
         guard !caps.lte.isEmpty || !caps.nr.isEmpty else { return "the modem didn't report its supported bands" }
         let nr = caps.nr.isEmpty ? nil : caps.nr
         return writeBands(n, lte: caps.lte.isEmpty ? nil : caps.lte, nrNSA: nr, nrSA: nr, persistent: persistent)
+    }
+
+    // The technologies this modem has (DMS Get Capabilities), as mode names; [] when unknown.
+    private func modeCapabilities() -> [String] {
+        guard let dev = device, let dms = try? dev.allocateClient(.dms) else { return [] }
+        defer { dms.release() }
+        return (try? dms.request(DMS.getCapabilities, timeout: 5)).map(DMS.parseModeCapabilities) ?? []
+    }
+
+    // Restricts the technologies (QMIDBandPreference.modes names; e.g. ["lte"] for LTE only).
+    // Refused: an empty list, an unknown name, or one the modem doesn't have. The bands stay.
+    public func setModePreference(_ modes: [String], persistent: Bool) -> String? {
+        guard let n = nas else { return "modem not ready" }
+        guard !modes.isEmpty else { return "at least one mode is needed" }
+        let known = NAS.modeBits.map(\.name)
+        if let bad = modes.first(where: { !known.contains($0) }) {
+            return "unknown mode \(bad) (\(known.joined(separator: ", ")))"
+        }
+        let supported = modeCapabilities()
+        let missing = modes.filter { !supported.isEmpty && !supported.contains($0) }
+        if !missing.isEmpty { return "not supported by this modem: \(missing.joined(separator: ", "))" }
+        // The setting before qmid's first change, for resetModePreference.
+        if modesBefore == nil {
+            guard let r = try? n.request(NAS.getSystemSelectionPreference, timeout: 5) else {
+                return "couldn't read the current mode preference (needed to reset it later)"
+            }
+            modesBefore = NAS.parseBandPreference(r).modes
+            saveState()
+        }
+        return writeModes(n, modes, persistent: persistent)
+    }
+
+    private func writeModes(_ n: QMIClient, _ modes: [String], persistent: Bool) -> String? {
+        guard let tlvs = NAS.modePreferenceRequest(modes, persistent: persistent) else { return "unknown mode" }
+        do { try n.request(NAS.setSystemSelectionPreference, tlvs, timeout: 10) } catch { return "\(error)" }
+        log("mode preference set (\(persistent ? "persistent" : "until restart")): \(modes.joined(separator: ", "))", level: .notice)
+        return nil
+    }
+
+    // Back to the modes qmid found before its first change; without them, every mode the modem
+    // has (not through setModePreference, which would save the current setting to reset to).
+    public func resetModePreference(persistent: Bool) -> String? {
+        guard let n = nas else { return "modem not ready" }
+        if let m = modesBefore, !m.isEmpty {
+            if let err = writeModes(n, m, persistent: persistent) { return err }
+            modesBefore = nil
+            saveState()
+            log("mode preference back to the setting before qmid changed it", level: .notice)
+            return nil
+        }
+        let supported = modeCapabilities()
+        guard !supported.isEmpty else { return "the modem didn't report its technologies" }
+        return writeModes(n, supported, persistent: persistent)
     }
 
     static func cellInfo(_ c: NAS.Cell) -> QMIDCell {

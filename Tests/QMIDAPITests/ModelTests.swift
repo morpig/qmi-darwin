@@ -308,7 +308,8 @@ final class ModelTests: XCTestCase {
     }
 
     func testBandPreferenceAndAirplane() {
-        let b = QMIDBandPreference(modes: ["lte", "nr"], lteBands: [1, 3], nrNSABands: [41], nrSABands: [])
+        let b = QMIDBandPreference(modes: ["lte", "nr"], lteBands: [1, 3], nrNSABands: [41], nrSABands: [],
+                                   supportedLTEBands: [1, 3, 40], supportedNRBands: [40, 41], supportedModes: ["umts", "lte", "nr"])
         XCTAssertEqual(QMIDBandPreference(b.dictionary), b)
         XCTAssertTrue(QMIDStatus([QMIDKey.airplaneMode: true]).airplaneMode)
         XCTAssertFalse(QMIDStatus([:]).airplaneMode)

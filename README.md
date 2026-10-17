@@ -21,8 +21,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 - Reports the radio: PCell, LTE SCells (active or configured), the NR PSCell with its
   bandwidth, LTE neighbours and signal (`qmictl radio`).
 - SIM and modem details: card and PIN state, ICCID, IMSI, MSISDN, IMEI and roaming.
-- Modem control: airplane mode, modem restart, and the allowed LTE / NR bands (read,
-  restrict, reset).
+- Modem control: airplane mode, modem restart, and the allowed technologies (e.g. LTE only)
+  and LTE / NR bands (read, restrict, reset).
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works
@@ -176,6 +176,8 @@ qmictl bands                                allowed and supported LTE / NR bands
 qmictl bands set lte 1,3 nsa 41 sa 41       restrict bands (until the modem restarts;
                                             --persistent to store); others unchanged
 qmictl bands reset                          back to the setting before qmid changed it
+qmictl modes set lte                        allowed technologies, here LTE only (bands
+                                            unchanged); modes reset: back to before
 qmictl connect NAME | disconnect NAME
 qmictl policy NAME prefer-wifi|prefer-cellular|last-resort|never
 qmictl events                               stream qmid's events
@@ -189,7 +191,7 @@ With qmid stopped, `qmictl probe | modem-status | profiles | plmn-name | nas-sur
 talk to the modem directly, for development. Run `qmictl --help` to see all options.
 
 Client apps use the `QMIDAPI` library (XPC: status, events, connect/disconnect, policy,
-config, logs, radio, airplane mode, restart, bands). Apps that only need to read state can watch the SCDynamicStore keys instead.
+config, logs, radio, airplane mode, restart, bands, modes). Apps that only need to read state can watch the SCDynamicStore keys instead.
 Both are described in [docs/API.md](docs/API.md).
 
 ## Development

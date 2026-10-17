@@ -685,6 +685,23 @@ public enum NAS {
     // the next power cycle, 1 permanent). A nil list is left out, so the modem keeps it.
     public static let setSystemSelectionPreference: UInt16 = 0x0033
 
+    // Mode preference (TLV 0x11 in Get and Set): the technologies the modem may use.
+    public static let modeBits: [(bit: UInt16, name: String)] = [
+        (1 << 0, "cdma1x"), (1 << 1, "evdo"), (1 << 2, "gsm"), (1 << 3, "umts"), (1 << 4, "lte"),
+        (1 << 5, "td-scdma"), (1 << 6, "nr"),
+    ]
+
+    // Set System Selection Preference with only the mode (TLV 0x11) and the duration; the bands
+    // stay as they are. nil when a name isn't one of modeBits'.
+    public static func modePreferenceRequest(_ modes: [String], persistent: Bool) -> [TLV]? {
+        var mask: UInt16 = 0
+        for m in modes {
+            guard let b = modeBits.first(where: { $0.name == m })?.bit else { return nil }
+            mask |= b
+        }
+        return [.u16(0x11, mask), .u8(0x17, persistent ? 1 : 0)]
+    }
+
     public static func bandPreferenceRequest(lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> [TLV] {
         // Band N = bit N - 1 of a little-endian bit field.
         func field(_ bands: [Int], bytes: Int) -> [UInt8] {
@@ -708,9 +725,7 @@ public enum NAS {
         }
         if let v = m[tlv: 0x11], v.count >= 2 {
             let mask = UInt16(v[0]) | UInt16(v[1]) << 8
-            let names: [(UInt16, String)] = [(1 << 0, "cdma1x"), (1 << 1, "evdo"), (1 << 2, "gsm"), (1 << 3, "umts"),
-                                             (1 << 4, "lte"), (1 << 5, "td-scdma"), (1 << 6, "nr")]
-            p.modes = names.filter { mask & $0.0 != 0 }.map(\.1)
+            p.modes = modeBits.filter { mask & $0.bit != 0 }.map(\.name)
         }
         if let v = m[tlv: 0x23], v.count == 32 { p.lte = bands(v) } else if let v = m[tlv: 0x15], v.count == 8 { p.lte = bands(v) }
         if let v = m[tlv: 0x2D], v.count == 64 { p.nrNSA = bands(v) }
@@ -1041,6 +1056,19 @@ public enum DMS {
     // Get Band Capabilities: TLV 0x12 the LTE bands, 0x13 the NR bands this modem supports,
     // each a count (2 bytes) then band numbers (2 bytes each).
     public static let getBandCapabilities: UInt16 = 0x0045
+
+    // Get Capabilities TLV 0x01: max TX and RX rate (4 bytes each), data service and SIM
+    // capability (1 byte each), then the radio interfaces (count, 1 byte each), as mode names.
+    public static let getCapabilities: UInt16 = 0x0020
+
+    public static func parseModeCapabilities(_ m: QMIMessage) -> [String] {
+        guard let v = m[tlv: 0x01] else { return [] }
+        var r = ByteReader(v)
+        guard (try? r.take(10)) != nil, let n = try? r.u8() else { return [] }
+        let names: [UInt8: String] = [1: "cdma1x", 2: "evdo", 4: "gsm", 5: "umts", 8: "lte", 9: "td-scdma", 10: "nr"]
+        let have = Set((0..<n).compactMap { _ in (try? r.u8()).flatMap { names[$0] } })
+        return NAS.modeBits.map(\.name).filter(have.contains)       // in modeBits' order
+    }
 
     public static func parseBandCapabilities(_ m: QMIMessage) -> (lte: [Int], nr: [Int]) {
         func list(_ t: UInt8) -> [Int] {
