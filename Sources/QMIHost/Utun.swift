@@ -2,8 +2,8 @@ import Foundation
 import QMIDatapath
 import QMIKit
 
-// One utun per PDN. Addresses are set with ifconfig for now (M3/M4 "set by hand");
-// NetConfig moves to ioctls (PLAN.md §5.6) in M5.
+// One utun per PDN. Addresses and routes are set with ifconfig and route (not the ioctls of
+// PLAN.md §5.6).
 public final class Utun {
     public let name: String
     // -1 once closed: the number may already belong to another descriptor by then.

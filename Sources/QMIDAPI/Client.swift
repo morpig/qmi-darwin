@@ -232,11 +232,7 @@ public final class QMIDClient: NSObject, QMIDEvents {
     }
 
     public func getConfig(_ completion: @escaping (Result<Data, QMIDError>) -> Void) {
-        proxy { completion(.failure($0)) }?.getConfig { data, err in
-            self.queue.async {
-                if let data { completion(.success(data)) } else { completion(.failure(QMIDError(err ?? "no config"))) }
-            }
-        }
+        proxy { completion(.failure($0)) }?.getConfig { self.finish($0, $1, "no config", { $0 }, completion) }
     }
 
     public func setConfig(_ json: Data, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
@@ -246,10 +242,8 @@ public final class QMIDClient: NSObject, QMIDEvents {
     // Call before switching SIMs and wait for the result (see QMIDControl.prepareSIM); on
     // failure, switch anyway. The prepare lasts while this client's connection does.
     public func prepareSIM(iccid: String, mccmnc: String?, _ completion: @escaping (Result<QMIDPreparedSIM, QMIDError>) -> Void) {
-        proxy { completion(.failure($0)) }?.prepareSIM(iccid, mccmnc: mccmnc) { d, err in
-            self.queue.async {
-                if let d { completion(.success(QMIDPreparedSIM(d))) } else { completion(.failure(QMIDError(err ?? "prepareSIM failed"))) }
-            }
+        proxy { completion(.failure($0)) }?.prepareSIM(iccid, mccmnc: mccmnc) {
+            self.finish($0, $1, "prepareSIM failed", QMIDPreparedSIM.init, completion)
         }
     }
 
@@ -260,11 +254,7 @@ public final class QMIDClient: NSObject, QMIDEvents {
 
     // The serving and neighbour cells, read now. raw: also the modem's TLVs (diagnostics).
     public func radio(raw: Bool = false, _ completion: @escaping (Result<QMIDRadio, QMIDError>) -> Void) {
-        proxy { completion(.failure($0)) }?.radio(raw) { d, err in
-            self.queue.async {
-                if let d { completion(.success(QMIDRadio(d))) } else { completion(.failure(QMIDError(err ?? "radio failed"))) }
-            }
-        }
+        proxy { completion(.failure($0)) }?.radio(raw) { self.finish($0, $1, "radio failed", QMIDRadio.init, completion) }
     }
 
     public func setAirplaneMode(_ on: Bool, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
@@ -276,10 +266,8 @@ public final class QMIDClient: NSObject, QMIDEvents {
     }
 
     public func bandPreference(_ completion: @escaping (Result<QMIDBandPreference, QMIDError>) -> Void) {
-        proxy { completion(.failure($0)) }?.bandPreference { d, err in
-            self.queue.async {
-                if let d { completion(.success(QMIDBandPreference(d))) } else { completion(.failure(QMIDError(err ?? "bandPreference failed"))) }
-            }
+        proxy { completion(.failure($0)) }?.bandPreference {
+            self.finish($0, $1, "bandPreference failed", QMIDBandPreference.init, completion)
         }
     }
 
@@ -299,6 +287,12 @@ public final class QMIDClient: NSObject, QMIDEvents {
 
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
+    }
+
+    // A reply with a value or an error message.
+    private func finish<R, T>(_ value: R?, _ err: String?, _ fallback: String, _ make: @escaping (R) -> T,
+                              _ completion: @escaping (Result<T, QMIDError>) -> Void) {
+        queue.async { completion(value.map { .success(make($0)) } ?? .failure(QMIDError(err ?? fallback))) }
     }
 }
 

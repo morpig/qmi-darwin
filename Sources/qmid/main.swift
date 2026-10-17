@@ -133,8 +133,6 @@ final class Subscribers {
         lock.lock(); let all = Array(proxies.values); lock.unlock()
         all.forEach { $0.qmidEvent(event) }
     }
-
-    var count: Int { lock.lock(); defer { lock.unlock() }; return proxies.count }
 }
 
 let subscribers = Subscribers()
@@ -252,14 +250,12 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
         // A prepareSIM ends with the connection that made it.
         let owner = AnyHashable(ObjectIdentifier(c))
         let manager = self.manager
-        c.invalidationHandler = { [weak c] in
+        let gone = { [weak c] in
             if let c { subscribers.remove(c); logHub.remove(c) }
             manager.queue.async { manager.clientGone(owner) }
         }
-        c.interruptionHandler = { [weak c] in
-            if let c { subscribers.remove(c); logHub.remove(c) }
-            manager.queue.async { manager.clientGone(owner) }
-        }
+        c.invalidationHandler = gone
+        c.interruptionHandler = gone
         c.resume()
         return true
     }

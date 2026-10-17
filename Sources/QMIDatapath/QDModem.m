@@ -16,7 +16,7 @@
 
 NSErrorDomain const QDErrorDomain = @"QDErrorDomain";
 
-// Datapath sizing (PLAN.md §6: start with 16 reads in flight).
+// Datapath sizing (PLAN.md §6).
 enum {
     kInFlightIn = 32,           // x downlink size = how long a datapath stall can last before
                                 // the modem has nowhere to put data
@@ -46,7 +46,7 @@ typedef struct {
     uint64_t stale_frames;      // arrived before any mux was attached: queued in the modem by an
                                 // earlier process (e.g. IPv6 RAs on calls nobody was reading)
     uint64_t usb_in_bytes, usb_out_bytes;
-    uint64_t in_full;           // IN transfers within one max packet of the buffer size
+    uint64_t in_full;           // IN transfers within 1600 bytes (about one packet) of the buffer size
     // Window values, reset each time statistics are read:
     int in_posted_min;          // fewest bulk IN reads still posted, as seen when qmid handles a
                                 // completion (reads that finished during a stall aren't subtracted
@@ -333,8 +333,8 @@ static BOOL isQMIInterface(io_service_t s) {
     } @catch (NSException *ex) {
         _inPipe = _outPipe = _intPipe = nil;
     }
-    if ((!_inPipe || !_outPipe || !_intPipe) && error) *error = QDError(QDErrorOpenPipes, @"could not open the QMI interface's pipes");
     if (!_inPipe || !_outPipe || !_intPipe) {
+        if (error) *error = QDError(QDErrorOpenPipes, @"could not open the QMI interface's pipes");
         qd_destroy(_iface);
         return nil;
     }
@@ -526,8 +526,9 @@ static BOOL isQMIInterface(io_service_t s) {
         if (self->_inPosted < self->_g.in_posted_min) self->_g.in_posted_min = self->_inPosted;
         [self inCompleted:buf status:status length:n];
     });
-    if (ok) _inPosted++;
-    if (!ok) {
+    if (ok) {
+        _inPosted++;
+    } else {
         _g.usb_in_errors++;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), _ioQueue, ^{ [self submitIn:buf]; });
     }
@@ -547,7 +548,7 @@ static BOOL isQMIInterface(io_service_t s) {
     _g.usb_in_transfers++;
     _g.usb_in_bytes += n;
     if (n + 1600 >= _dlSize) _g.in_full++;
-    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t t0 = now_ns();
     uint64_t frames = 0;
 
     const uint8_t *p = buf.bytes;
@@ -589,7 +590,7 @@ static BOOL isQMIInterface(io_service_t s) {
     }
     [self flushDownlink];
     if (frames > _g.in_frames_max) _g.in_frames_max = frames;
-    uint64_t took = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    uint64_t took = now_ns() - t0;
     if (took > _g.in_proc_max_ns) _g.in_proc_max_ns = took;
     [self submitIn:buf];
 }
@@ -933,11 +934,11 @@ static BOOL isQMIInterface(io_service_t s) {
     }
 
     NSMutableData *d = [NSMutableData dataWithBytesNoCopy:base length:len freeWhenDone:NO];
-    _outSince[slot] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    _outSince[slot] = now_ns();
     if ((uint64_t)_curCount > _g.out_frames_max) _g.out_frames_max = (uint64_t)_curCount;
     BOOL ok = qd_enqueue(_outPipe, d, ^(IOReturn status, NSUInteger n) {
         (void)d;
-        uint64_t waited = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - self->_outSince[slot];
+        uint64_t waited = now_ns() - self->_outSince[slot];
         if (waited > self->_g.out_wait_max_ns) self->_g.out_wait_max_ns = waited;
         self->_outSince[slot] = 0;
         self->_outInflight -= len;
@@ -971,7 +972,7 @@ static BOOL isQMIInterface(io_service_t s) {
 - (uint64_t)oldestPendingOutMs {
     __block uint64_t oldest = 0;
     dispatch_sync(_ioQueue, ^{
-        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t now = now_ns();
         for (int i = 0; i < kOutSlots; i++) {
             if (self->_outSince[i] && now - self->_outSince[i] > oldest) oldest = now - self->_outSince[i];
         }
@@ -980,7 +981,7 @@ static BOOL isQMIInterface(io_service_t s) {
 }
 
 - (NSDictionary<NSNumber *, NSDictionary<NSString *, NSNumber *> *> *)statistics {
-    __block NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
     dispatch_sync(_ioQueue, ^{
         out[@0] = @{
             @"usb_in_transfers": @(self->_g.usb_in_transfers), @"usb_in_errors": @(self->_g.usb_in_errors),

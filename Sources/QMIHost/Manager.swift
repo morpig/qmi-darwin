@@ -201,6 +201,9 @@ public final class Manager {
     // PDN name → profile index qmid resolved last time, so a profile someone else edited is
     // taken back (rewritten) instead of being replaced by a new one.
     private var savedProfiles: [String: Int] = [:]
+    // The band preference as qmid found it before its first change ("lte", "nsa", "sa"), kept
+    // in the state file: resetBandPreference writes it back. nil when qmid changed nothing.
+    private var bandsBefore: [String: [Int]]?
     private var statePath: String {
         (configPath as NSString).deletingLastPathComponent + "/state.json"
     }
@@ -248,9 +251,6 @@ public final class Manager {
     // stays free for clients and the other PDN work.
     private let openQueue = DispatchQueue(label: "qmid.open")
     private var opening = false
-    // The band preference as qmid found it before its first change ("lte", "nsa", "sa"), kept
-    // in the state file: resetBandPreference writes it back. nil when qmid changed nothing.
-    private var bandsBefore: [String: [Int]]?
     private var openingDevice: QMIDevice?    // the interface the running open waits on
     private var stopped = false                 // shutdown(): a device opened late is closed
 
@@ -276,7 +276,8 @@ public final class Manager {
     }
 
     // On openQueue: opens the interface, waits for QMI, sets the data format and starts the
-    // datapath. Touches no manager state; a device that fails here is closed here.
+    // datapath. Touches manager state only through `queue`; a device that fails here is closed
+    // here.
     private func bringUp(interface: Int?, vendorIDs: [UInt16], booting: Bool, batch: Bool) throws -> BroughtUp {
         let dev = try QMIDevice.open(interface: interface, vendorIDs: vendorIDs)
         queue.async { [weak self] in
@@ -493,28 +494,10 @@ public final class Manager {
             publishStatus(p)
             return settle(p)
         }
-        guard !airplane else {
-            p.cancelRetry()
-            if p.config.oneShot { return stopOneShot(p, error: "airplane mode", reason: .airplaneMode) }
-            // Dialled again when airplane mode ends (and the modem attaches).
-            p.state = .waiting
-            p.lastError = "airplane mode"
-            p.reason = .airplaneMode
-            p.ends = [:]
-            publishStatus(p)
-            return settle(p)
-        }
-        guard psAttached != false else {
-            p.cancelRetry()
-            if p.config.oneShot { return stopOneShot(p, error: "not attached (\(serving))", reason: .notAttached) }
-            // Dialled again when the Serving System indication reports PS attach.
-            p.state = .waiting
-            p.lastError = "not attached (\(serving))"
-            p.reason = .notAttached
-            p.ends = [:]
-            publishStatus(p)
-            return settle(p)
-        }
+        // Dialled again when airplane mode ends (and the modem attaches), or when the Serving
+        // System indication reports PS attach.
+        guard !airplane else { return wait(p, error: "airplane mode", reason: .airplaneMode) }
+        guard psAttached != false else { return wait(p, error: "not attached (\(serving))", reason: .notAttached) }
         guard p.profileIndex != nil else {
             let error = "no modem profile for \(p.config.apn ?? p.config.name)"
             if p.config.oneShot { return stopOneShot(p, error: error, reason: .noProfile) }
@@ -541,6 +524,18 @@ public final class Manager {
             do { try session.connect() } catch { failure = error }
             self?.queue.async { self?.dialed(p, session, dev, failure) }
         }
+    }
+
+    // Nothing to dial into yet: the PDN waits (a one-shot PDN stops instead).
+    private func wait(_ p: PDNState, error: String, reason: QMIDReason) {
+        p.cancelRetry()
+        if p.config.oneShot { return stopOneShot(p, error: error, reason: reason) }
+        p.state = .waiting
+        p.lastError = error
+        p.reason = reason
+        p.ends = [:]
+        publishStatus(p)
+        settle(p)
     }
 
     // A dial returned (on `queue`).
@@ -599,7 +594,8 @@ public final class Manager {
                 p.state = .blocked
                 p.lastError = p.blockedSummary
                 if !loggedBlock {
-                    log("\(p.config.name): refused for every family; not retrying until reload or re-registration", level: .error)
+                    log("\(p.config.name): refused for every family; not retrying until the SIM, the registration or the config changes",
+                        level: .error)
                 }
                 publishStatus(p)
             } else {
@@ -735,8 +731,8 @@ public final class Manager {
         dump("throttled PDN reject timer", WDS.getThrottledPDNRejectTimer, [])
     }
 
-    // A family refused with a permanent 3GPP cause is not retried until reload or re-registration.
-    // True when it blocked (and logged) the whole PDN.
+    // A family refused with a permanent cause is not retried until the SIM, the registration or
+    // the config changes (or a connect). True when it blocked (and logged) the whole PDN.
     @discardableResult
     private func applyPermanentCauses(_ p: PDNState, _ session: PDNSession) -> Bool {
         // A rejection of the APN itself (not subscribed, unknown, ...) holds for every family:
@@ -798,7 +794,8 @@ public final class Manager {
         if cancelsDial { settle(p) }
     }
 
-    // 2 s, 4 s, 8 s … capped at 5 min (PLAN.md §7). Permanent causes block instead (dial()).
+    // 2 s, 4 s, 8 s … capped at 5 min (PLAN.md §7). Permanent causes block instead
+    // (applyPermanentCauses).
     private func scheduleRedial(_ p: PDNState) {
         guard p.wanted else { p.state = .idle; publishStatus(p); return }
         p.attempts += 1
@@ -1414,10 +1411,9 @@ public final class Manager {
         while case let s = IOIteratorNext(arrivalIterator), s != 0 { IOObjectRelease(s) }   // arm
     }
 
-    // Every interface of the modem arrives separately; one reopen, after they settle.
+    // Each of the modem's interfaces arrives separately: log and schedule one reopen per burst.
     private func deviceArrived() {
         guard device == nil else { return }
-        // Each of the modem's interfaces arrives separately: log and schedule once per burst.
         if let last = lastArrival, Date().timeIntervalSince(last) < 5 { return }
         lastArrival = Date()
         // Appeared again while an open waits on the earlier set (the modem enumerates twice
@@ -1468,8 +1464,7 @@ public final class Manager {
     // After wake, and every 15 s: the modem's data path and control channel must be alive and
     // every connected call must still be up; otherwise reopen the device or redial the PDN.
     // Catches a modem that restarted or hung its data side internally while USB stayed up (no
-    // termination, no indications). Returns false if the device
-    // was dropped.
+    // termination, no indications). Returns false if the device was dropped.
     @discardableResult
     private func checkHealth(reason: String?) -> Bool {
         guard let dev = device else { return false }
@@ -2087,17 +2082,20 @@ public final class Manager {
             log("band preference back to the setting before qmid changed it", level: .notice)
             return nil
         }
+        // Not through setBandPreference: that would save the current setting as the one to
+        // reset to, and the next reset would undo this one.
+        guard let n = nas else { return "modem not ready" }
         let caps = bandCapabilities()
         guard !caps.lte.isEmpty || !caps.nr.isEmpty else { return "the modem didn't report its supported bands" }
-        return setBandPreference(lte: caps.lte.isEmpty ? nil : caps.lte, nrNSA: caps.nr.isEmpty ? nil : caps.nr,
-                                 nrSA: caps.nr.isEmpty ? nil : caps.nr, persistent: persistent)
+        let nr = caps.nr.isEmpty ? nil : caps.nr
+        return writeBands(n, lte: caps.lte.isEmpty ? nil : caps.lte, nrNSA: nr, nrSA: nr, persistent: persistent)
     }
 
     static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
         var q = QMIDCell(rat: c.rat == .lte ? .lte : .nr,
                          role: c.role == .primary ? .primary : c.role == .secondary ? .secondary : .neighbor)
         q.channel = c.channel.map(Int.init)
-        q.band = q.channel.flatMap { QMIDCell.band(q.rat, channel: $0) }
+        q.band = c.band ?? q.channel.flatMap { QMIDCell.band(q.rat, channel: $0) }   // the modem's, else from the channel
         q.pci = c.pci.map(Int.init)
         q.cellID = c.cellID
         q.tac = c.tac.map(Int.init)
@@ -2125,7 +2123,7 @@ public final class Manager {
     private func publishStatus(_ p: PDNState) {
         var d: [String: Any]
         if let s = p.session, let u = p.utun {
-            d = ServicePublisher.pdnStatus(name: p.config.name, interface: u.name, muxID: p.muxID,
+            d = ServicePublisher.pdnStatus(name: p.config.name, interface: u.name,
                                            config: p.pdnConfig, settings: s.merged, policy: p.policy)
         } else {
             d = ["ServiceID": ServicePublisher.serviceID(for: p.config.name), "MuxID": Int(p.muxID),
@@ -2135,7 +2133,7 @@ public final class Manager {
         if let e = p.lastError { d["LastError"] = e }
         if p.qos != nil, let c = p.qosState.qci { d["QCI"] = Int(c) }
         if p.qos != nil, let a = p.qosState.ambr { d["AMBR"] = ["Uplink": NSNumber(value: a.uplink), "Downlink": NSNumber(value: a.downlink)] }
-        try? publisher.publish([ServicePublisher.pdnKey(p.config.name): d])
+        try? publisher.publish([QMIDStoreKey.pdn(p.config.name): d])
         emitPDN(p)
         updateLinkAnchor()
         _ = status()                            // the answer while `queue` is busy
@@ -2344,7 +2342,7 @@ public final class Manager {
         if airplane { d["AirplaneMode"] = true }
         d["SIM"] = simInfo(identities: false)?.dictionary
         d["PLMN"] = plmnInfo()?.dictionary
-        try? publisher.publish([ServicePublisher.modemKey: d])
+        try? publisher.publish([QMIDStoreKey.modem: d])
         emitIfChanged(modemEvent(), &lastModemEvent)
         emitIfChanged(simEvent(), &lastSIMEvent)
         emitIfChanged(plmnEvent(), &lastPLMNEvent)
@@ -2498,7 +2496,7 @@ public final class Manager {
             p.cancelRetry()
             teardown(p, stopCall: true, state: .idle, error: nil)
             if !resolved.contains(where: { $0.name == name }) {
-                publisher.remove(prefix: ServicePublisher.pdnKey(name))
+                publisher.remove(prefix: QMIDStoreKey.pdn(name))
                 lastPDNEvent[name] = nil
                 lastBearersEvent[name] = nil
             }
@@ -2545,8 +2543,7 @@ public final class Manager {
             p.cancelRetry()
             teardown(p, stopCall: true, state: .idle, error: nil)
         }
-        wda?.release()
-        control?.release()
+        [wda, control, nas, uimWatch, dmsWatch].forEach { $0?.release() }
         device?.close()
         device = nil
         publisher.removeAll()

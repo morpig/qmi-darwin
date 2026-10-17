@@ -748,6 +748,7 @@ public enum NAS {
         public var snr: Double?             // dB
         public var active: Bool?            // secondary cell: activated (false: configured only)
         public var scellIndex: UInt8?       // LTE secondary cell: the RRC sCellIndex
+        public var band: Int?               // 3GPP band number, when the modem names it
 
         public init(rat: RAT, role: Role) {
             self.rat = rat
@@ -816,14 +817,18 @@ public enum NAS {
             lte = c
         }
 
-        // Get LTE CPHY CA Info. PCell 0x13: PCI, EARFCN, bandwidth, band. Secondary cells 0x19
-        // (EARFCN as 32 bits) or else 0x15: count, then PCI, EARFCN, bandwidth, band, state
+        // Get LTE CPHY CA Info. PCell 0x13: PCI, EARFCN, bandwidth, band (QMI enum, activeBand).
+        // Secondary cells 0x19 (EARFCN as 32 bits) or else 0x15: count, then PCI, EARFCN,
+        // bandwidth, band, state
         // (0 deconfigured, 1 deactivated = configured, 2 activated), sCellIndex. 0x19 entries carry one byte more.
         var secondaries: [Cell] = []
         if let m = ca {
             if let v = m[tlv: 0x13], var c = lte {
                 var r = ByteReader(v)
-                if (try? r.take(4)) != nil, let bw = try? r.u32() { c.bandwidthMHz = bandwidth(bw) }
+                if (try? r.take(4)) != nil, let bw = try? r.u32() {
+                    c.bandwidthMHz = bandwidth(bw)
+                    if let b = try? r.u16() { c.band = activeBand(b)?.band ?? c.band }
+                }
                 lte = c
             }
             let (list, wide) = m[tlv: 0x19].map { ($0, true) } ?? m[tlv: 0x15].map { ($0, false) } ?? ([], false)
@@ -835,7 +840,7 @@ public enum NAS {
                 let pci = try! x.u16()
                 let earfcn = wide ? try! x.u32() : UInt32(try! x.u16())
                 let bw = try! x.u32()
-                _ = try! x.u16()                                     // band (QMI enum)
+                let band = try! x.u16()
                 let state = try! x.u32()
                 let index = try! x.u8()
                 guard state != 0 else { continue }
@@ -845,10 +850,22 @@ public enum NAS {
                 c.bandwidthMHz = bandwidth(bw)
                 c.active = state == 2
                 c.scellIndex = index
+                c.band = activeBand(band)?.band
                 if let own = measured.first(where: { $0.channel == earfcn && $0.cell.pci == pci })?.cell {
                     c.rsrp = own.rsrp; c.rsrq = own.rsrq; c.rssi = own.rssi
                 }
                 secondaries.append(c)
+            }
+        }
+        // Get RF Band Info 0x01: count, then radio interface, active band (QMI enum), channel
+        // (2 bytes) each. The RM551E lists only LTE in EN-DC.
+        var nrBand: Int?
+        if let v = rfBand?[tlv: 0x01] {
+            var r = ByteReader(v)
+            for _ in 0..<((try? r.u8()) ?? 0) {
+                guard let rat = try? r.u8(), let b = try? r.u16(), (try? r.u16()) != nil else { break }
+                if rat == 8, var c = lte, c.band == nil { c.band = activeBand(b)?.band; lte = c }
+                if rat == 12 { nrBand = activeBand(b)?.band }
             }
         }
         // Get RF Band Info 0x12: count, then radio interface and bandwidth (4 bytes) each.
@@ -900,6 +917,7 @@ public enum NAS {
             if pci <= 1007 { nr.pci = pci; nrSeen = true }
         }
         nr.bandwidthMHz = nrBandwidth
+        nr.band = nrBand
         // COEX Get WWAN State 0x22, NR carriers: count, then per entry centre frequency (kHz),
         // bandwidth (Hz), direction (4 bytes: 1 UL, 2 DL), 4 bytes unknown. The DL carrier whose
         // span holds the cell's NR-ARFCN (its SSB) is the cell's.
@@ -955,6 +973,34 @@ public enum NAS {
         }
         return out
     }
+
+    // QmiNasActiveBand (Get RF Band Info, Get LTE CPHY CA Info) to the 3GPP band, for LTE and
+    // NR; nil for other technologies and unknown values. Values from libqmi.
+    static func activeBand(_ v: UInt16) -> (rat: Cell.RAT, band: Int)? {
+        if let b = lteActiveBands[v] { return (.lte, b) }
+        if let b = nrActiveBands[v] { return (.nr, b) }
+        return nil
+    }
+
+    static let lteActiveBands: [UInt16: Int] = {
+        let bands = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17]       // 120…134
+        var t = Dictionary(uniqueKeysWithValues: bands.enumerated().map { (UInt16(120 + $0), $1) })
+        t.merge([135: 33, 136: 34, 137: 35, 138: 36, 139: 37, 140: 38, 141: 39, 142: 40, 143: 18, 144: 19,
+                 145: 20, 146: 21, 147: 24, 148: 25, 149: 41, 150: 42, 151: 43, 152: 23, 153: 26, 154: 32,
+                 155: 125, 156: 126, 157: 127, 158: 28, 159: 29, 160: 30, 161: 66, 162: 250, 163: 46,
+                 164: 27, 165: 31, 166: 47, 167: 48, 168: 71]) { a, _ in a }
+        return t
+    }()
+
+    static let nrActiveBands: [UInt16: Int] = {
+        let bands = [1, 2, 3, 5, 7, 8, 20, 28, 38, 41, 50, 51, 66, 70, 71, 74, 75, 76, 77, 78, 79, 80, 81, 82,
+                     83, 84, 85, 257, 258, 259, 260, 261, 12, 25, 34, 39, 40, 65, 86, 48, 14, 13, 18, 26, 30,
+                     29, 53, 46, 91, 92, 93, 94]                              // 250…301
+        var t = Dictionary(uniqueKeysWithValues: bands.enumerated().map { (UInt16(250 + $0), $1) })
+        t[315] = 100
+        t[316] = 101
+        return t
+    }()
 
     // QmiNasDLBandwidth (Get RF Band Info, Get LTE CPHY CA Info): LTE 1.4–20 MHz; 6 invalid,
     // 0xFF unknown. libqmi defines no NR values.
@@ -1078,7 +1124,7 @@ public enum UIM {
         guard let v = m[tlv: 0x11], v.count > 3 else { return nil }
         let ef = Array(v.dropFirst(2))
         let n = min(Int(ef[0]), ef.count - 1)
-        guard n >= 1 else { return nil }
+        guard n >= 2 else { return nil }
         var digits = [ef[1] >> 4]
         for b in ef[2...n] { digits += [b & 0x0F, b >> 4] }
         let s = String(digits.filter { $0 < 10 }.map { Character(String($0)) })

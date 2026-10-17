@@ -119,6 +119,8 @@ final class SIMTests: XCTestCase {
         // EF_IMSI 001010123456789: length 8, parity nibble 9 (odd), BCD low nibble first.
         let imsi = try response(.uim, UIM.readTransparent, [TLV(0x11, [UInt8](hex: "09 00 08 09 10 10 10 32 54 76 98")!)])
         XCTAssertEqual(UIM.parseIMSI(imsi), "001010123456789")
+        // EF length 1 (the parity byte only): none, not a crash.
+        XCTAssertNil(UIM.parseIMSI(try response(.uim, UIM.readTransparent, [TLV(0x11, [0x02, 0x00, 0x01, 0x09])])))
         // EF_MSISDN record: 4-byte alpha id, BCD length 7, TON international, +15555550100.
         let rec = try response(.uim, UIM.readRecord,
                                [TLV(0x11, [UInt8](hex: "12 00 ff ff ff ff 07 91 51 55 55 05 01 f0 ff ff ff ff ff ff")!)])

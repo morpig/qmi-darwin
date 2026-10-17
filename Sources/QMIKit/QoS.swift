@@ -208,17 +208,11 @@ public enum QoS {
 
     // IPv4 address and netmask, both u32 little-endian.
     private static func v4Prefix(_ b: [UInt8], _ o: Int) -> Prefix {
-        let addr = le32(b, o), mask = le32(b, o + 4)
-        let text = [24, 16, 8, 0].map { String((addr >> UInt32($0)) & 0xff) }.joined(separator: ".")
-        return Prefix(address: text, length: mask.nonzeroBitCount)
+        Prefix(address: IPv4(qmi: Array(b[o..<o + 4]))!.description, length: le32(b, o + 4).nonzeroBitCount)
     }
 
     // IPv6 address (16 bytes, network order) and prefix length.
     private static func v6Prefix(_ b: [UInt8], _ o: Int) -> Prefix {
-        var addr = in6_addr()
-        withUnsafeMutableBytes(of: &addr) { for i in 0..<16 { $0[i] = b[o + i] } }
-        var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-        inet_ntop(AF_INET6, &addr, &buf, socklen_t(buf.count))
-        return Prefix(address: String(cString: buf), length: Int(b[o + 16]))
+        Prefix(address: IPv6(Array(b[o..<o + 16])).description, length: Int(b[o + 16]))
     }
 }

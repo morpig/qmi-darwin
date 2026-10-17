@@ -657,7 +657,8 @@ public struct QMIDCell: Equatable {
         return d as NSDictionary
     }
 
-    // The band of a downlink channel number. LTE: exact (EARFCN ranges don't overlap, TS 36.101
+    // The band of a downlink channel number, for cells the modem doesn't name the band of
+    // (qmid uses the modem's when it reports one: the LTE cells, NR in SA). LTE: exact (EARFCN ranges don't overlap, TS 36.101
     // table 5.7.3-1). NR: the NR-ARFCN raster is shared, so overlapping bands can't be told
     // apart; the first match wins, the more common band listed first (n78 before n77, n41
     // before n7 and n90, n1 before n65/n66).

@@ -120,7 +120,7 @@ public final class QMIDevice {
             }
         case .indication:
             if msg.service == .ctl, msg.messageID == CTL.sync {
-                syncIndicationAt = Date()
+                lock.lock(); syncIndication = Date(); lock.unlock()
                 tr("<< CTL Sync indication: QMI ready")
             }
             onIndication?(msg)
@@ -176,7 +176,8 @@ public final class QMIDevice {
 
     // Set when the modem announces its QMI stack with a CTL Sync indication (it does so when
     // the firmware finishes booting after a reset or replug).
-    public private(set) var syncIndicationAt: Date?
+    public var syncIndicationAt: Date? { lock.lock(); defer { lock.unlock() }; return syncIndication }
+    private var syncIndication: Date?                // under `lock`: set on the control queue
 
     // CTL Sync: resets every client the modem holds for this port. Right after the modem
     // (re-)enumerates its USB interfaces are up ~20 s before QMI answers, so keep the interface

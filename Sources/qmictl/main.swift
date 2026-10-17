@@ -4,7 +4,8 @@ import QMIDatapath
 import QMIHost
 import QMIKit
 
-// qmictl: M1–M4 tool. probe and status need no root; connect does (utun, ifconfig, route).
+// qmictl: qmid's command line (XPC), plus tools that talk to the modem directly for development
+// (qmid stopped). Only run needs root (utun, ifconfig, route).
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
@@ -30,7 +31,8 @@ usage (through qmid):
   qmictl bands set [lte 1,3] [nsa 41] [sa 41] [--persistent]
                                             restrict bands (others unchanged); until the modem
                                             restarts unless --persistent
-  qmictl bands reset [--persistent]         every supported band allowed again
+  qmictl bands reset [--persistent]         back to the setting before qmid changed it (else
+                                            every supported band)
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -277,10 +279,10 @@ func nasSurvey(_ o: Options) {
     let messages: [(UInt16, String)] = [
         (NAS.getServingSystem, "Get Serving System"),
         (NAS.getSysInfo, "Get Sys Info"),
-        (0x0043, "Get Cell Location Info"),
-        (0x004F, "Get Signal Info"),
-        (0x0031, "Get RF Band Info"),
-        (0x00AC, "Get LTE CPHY CA Info"),
+        (NAS.getCellLocationInfo, "Get Cell Location Info"),
+        (NAS.getSignalInfo, "Get Signal Info"),
+        (NAS.getRFBandInfo, "Get RF Band Info"),
+        (NAS.getLTECPHYCAInfo, "Get LTE CPHY CA Info"),
         (0x00E8, "Get ENDC Config"),
     ]
     do {
@@ -316,13 +318,12 @@ func nasSurvey(_ o: Options) {
     } catch {
         fail("\(error)")
     }
-    // COEX (service 0x22) Get WWAN State: TLV 0x10, LTE UL/DL frequency and bandwidth (as used
-    // by quectel-CM); newer firmware may add NR5G.
+    // COEX Get WWAN State: TLV 0x13 the LTE carriers, 0x22 the NR carriers (NAS.radioCells).
     do {
-        let coex = try dev.allocateClient(QMIService(rawValue: 0x22))
+        let coex = try dev.allocateClient(NAS.coexService)
         defer { coex.release() }
         print("coex 0x0022 Get WWAN State:")
-        let r = try coex.request(0x0022, timeout: 2)
+        let r = try coex.request(NAS.coexGetWWANState, timeout: 2)
         for t in r.tlvs where t.type != 0x02 {
             print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
         }
@@ -385,20 +386,7 @@ func profileWrite(_ args: [String]) {
         case "imcn": p.imcn = bool()
         case "disabled": p.apnDisabled = bool()
         case "type":
-            var m: WDS.APNTypeMask = []
-            for t in v.split(separator: ",") {
-                switch t {
-                case "default": m.insert(.default)
-                case "ims": m.insert(.ims)
-                case "mms": m.insert(.mms)
-                case "dun": m.insert(.dun)
-                case "supl": m.insert(.supl)
-                case "ia": m.insert(.ia)
-                case "emergency": m.insert(.emergency)
-                case "ut": m.insert(.ut)
-                default: fail("bad type \(t)")
-                }
-            }
+            guard let m = WDS.APNTypeMask(names: v.split(separator: ",").map(String.init)) else { fail("bad type \(v)") }
             p.apnType = m
         default: fail("unknown key \(k)")
         }
@@ -554,7 +542,7 @@ func connect(_ o: Options) {
         if o.publish {
             let pub = try ServicePublisher(name: "qmictl")
             conn.publisher = pub
-            try pub.publish([ServicePublisher.modemKey: [
+            try pub.publish([QMIDStoreKey.modem: [
                 "VendorID": Int(dev.modem.vendorID), "ProductID": Int(dev.modem.productID),
                 "Interface": Int(dev.modem.interfaceNumber), "State": "running",
             ]])
@@ -579,8 +567,8 @@ func connect(_ o: Options) {
                 let id = ServicePublisher.serviceID(for: cfg.name)
                 var entries = ServicePublisher.entities(pdnName: cfg.name, interface: utun.name,
                                                         settings: session.merged, policy: policy)
-                entries[ServicePublisher.pdnKey(cfg.name)] = ServicePublisher.pdnStatus(
-                    name: cfg.name, interface: utun.name, muxID: cfg.muxID, config: cfg,
+                entries[QMIDStoreKey.pdn(cfg.name)] = ServicePublisher.pdnStatus(
+                    name: cfg.name, interface: utun.name, config: cfg,
                     settings: session.merged, policy: policy)
                 try pub.publish(entries)
                 print("  published service \(id) (\(policy.rawValue))")
@@ -655,40 +643,43 @@ func withDaemon(_ body: (QMIDControl, @escaping () -> Void) -> Void) {
 }
 
 func printStatus(_ d: NSDictionary) {
-    if let v = d[QMIDKey.version] { print("qmid: \(v)") }
-    print("modem: \(d["modem"] ?? "?")\(d["modemError"].map { " (\($0))" } ?? "")\(d["network"].map { ", \($0)" } ?? "")\(QMIDStatus(d).airplaneMode ? ", airplane mode" : "")")
-    if let s = QMIDStatus(d).sim {
+    let st = QMIDStatus(d)
+    if let v = st.version { print("qmid: \(v)") }
+    print("modem: \(st.modem)\(st.modemError.map { " (\($0))" } ?? "")\(st.network.map { ", \($0)" } ?? "")\(st.airplaneMode ? ", airplane mode" : "")")
+    if let s = st.sim {
         print("sim: \(describe(s))")
         let ids = [s.iccid.map { "iccid \($0)" }, s.imsi.map { "imsi \($0)" }, s.msisdn.map { "msisdn \($0)" }].compactMap { $0 }
         if !ids.isEmpty { print("  " + ids.joined(separator: ", ")) }
     }
-    if let i = QMIDStatus(d).imei { print("imei: \(i)") }
-    if let p = QMIDStatus(d).plmn { print("operator: \(describe(p))") }
-    for case let p as NSDictionary in (d["pdns"] as? NSArray) ?? [] {
-        var line = "\(p["name"] ?? "?"): \(p["state"] ?? "?")"
-        if let i = p["interface"] { line += " on \(i)" }
-        line += ", \(p["policy"] ?? "?")"
-        if let u = p["uptime"] as? Int { line += ", up \(u) s" }
-        if (p["wanted"] as? Bool) == false { line += ", manual" }
+    if let i = st.imei { print("imei: \(i)") }
+    if let p = st.plmn { print("operator: \(describe(p))") }
+    for case let p as NSDictionary in (d[QMIDKey.pdns] as? NSArray) ?? [] {
+        guard let q = QMIDPDN(p) else { continue }
+        var line = "\(q.name): \(q.stateName)"
+        if let i = q.interface { line += " on \(i)" }
+        line += ", \(q.policy ?? "?")"
+        if let u = q.uptime { line += ", up \(u) s" }
+        if !q.wanted { line += ", manual" }
         print(line)
-        if let a = p["ipv4"] { print("  ipv4 \(a)") }
-        if let a = p["ipv6"] { print("  ipv6 \(a)") }
-        if let pc = p["pcscf"] as? [String] { print("  p-cscf \(pc.joined(separator: " "))") }
-        if let q = QMIDPDN(p), q.qci != nil || q.ambr != nil {
+        if let a = q.ipv4 { print("  ipv4 \(a)") }
+        if let a = q.ipv6 { print("  ipv6 \(a)") }
+        if !q.pcscf.isEmpty { print("  p-cscf \(q.pcscf.joined(separator: " "))") }
+        if q.qci != nil || q.ambr != nil {
             print("  qci \(q.qci.map(String.init) ?? "?"), ambr \(q.ambr.map(describe) ?? "?")")
         }
-        for b in QMIDPDN(p)?.bearers ?? [] { describe(b).forEach { print("  " + $0) } }
-        if let c = p["counters"] as? NSDictionary {
+        for b in q.bearers ?? [] { describe(b).forEach { print("  " + $0) } }
+        if let c = p[QMIDKey.counters] as? NSDictionary {
             print("  rx \(c["rx_packets"] ?? 0) pkts/\(c["rx_bytes"] ?? 0) B, tx \(c["tx_packets"] ?? 0) pkts/\(c["tx_bytes"] ?? 0) B, drops rx \(c["rx_drops"] ?? 0)/tx \(c["tx_drops"] ?? 0)")
         }
-        if let e = p["error"] { print("  last error: \(e)\(p["reason"].map { " [\($0)]" } ?? "")") }
-        if let q = QMIDPDN(p), !q.causes.isEmpty {
+        if let e = q.error { print("  last error: \(e)\(q.reason.map { " [\($0.rawValue)]" } ?? "")") }
+        if !q.causes.isEmpty {
             print("  causes: " + q.causes.map { c in
                 [c.family.map { "ipv\($0)" }, "\(c.type) \(c.code.map(String.init) ?? "?")"].compactMap { $0 }.joined(separator: " ")
             }.joined(separator: ", "))
         }
-        if let b = p["blocked"] as? [String] {
+        if !q.blocked.isEmpty {
             // "ipv4: X", "ipv6: X" → "X" when every family is blocked for the same reason.
+            let b = q.blocked
             let reasons = Set(b.map { $0.split(separator: ":", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) } ?? $0 })
             print("  blocked: \(b.count > 1 && reasons.count == 1 ? reasons.first! : b.joined(separator: "; "))")
         }

@@ -27,14 +27,14 @@ public let qmidAPIVersion = 1
     // Starts pushing QMIDEvents to the caller's exported object for this connection. The
     // current modem and PDN state is sent right away as events.
     func subscribe(reply: @escaping (Bool) -> Void)
+    // Shuts qmid down cleanly (calls stopped, services removed); launchd starts it again right
+    // away, from the binary now in the app bundle. Used after an app update.
+    func restart(reply: @escaping (String?) -> Void)
     // Starts pushing qmid's log to this connection as events of type "log", at `level`
     // (QMIDLogLevel raw value) and above. qmid first sends the lines it still holds (a ring of
     // about 2000) newer than `since` (Unix time; 0 for all), then new ones. A debug subscriber
     // turns the QMI message trace on while it stays subscribed. Nothing is redacted.
     // Calling it again changes the level; unsubscribeLogs stops it.
-    // Shuts qmid down cleanly (calls stopped, services removed); launchd starts it again right
-    // away, from the binary now in the app bundle. Used after an app update.
-    func restart(reply: @escaping (String?) -> Void)
     func subscribeLogs(_ level: Int, since: Double, reply: @escaping (Bool) -> Void)
     func unsubscribeLogs(reply: @escaping () -> Void)
     // Before switching SIMs (e.g. an eSIM profile switch): qmid writes the attach profile for

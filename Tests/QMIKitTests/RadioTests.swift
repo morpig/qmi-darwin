@@ -30,7 +30,7 @@ final class RadioTests: XCTestCase {
 
         var pcell = NAS.Cell(rat: .lte, role: .primary)
         pcell.channel = 1313; pcell.pci = 272; pcell.cellID = 0x01234504; pcell.tac = 0x1234
-        pcell.bandwidthMHz = 20; pcell.rssi = -67; pcell.rsrq = -14; pcell.rsrp = -96; pcell.snr = 13
+        pcell.bandwidthMHz = 20; pcell.band = 3; pcell.rssi = -67; pcell.rsrq = -14; pcell.rsrp = -96; pcell.snr = 13
         XCTAssertEqual(info.cells[0], pcell)
 
         var nr = NAS.Cell(rat: .nr, role: .secondary)
@@ -38,7 +38,7 @@ final class RadioTests: XCTestCase {
         XCTAssertEqual(info.cells[2], nr)
 
         var scell = NAS.Cell(rat: .lte, role: .secondary)
-        scell.channel = 325; scell.pci = 66; scell.bandwidthMHz = 15; scell.active = false; scell.scellIndex = 1
+        scell.channel = 325; scell.pci = 66; scell.bandwidthMHz = 15; scell.active = false; scell.scellIndex = 1; scell.band = 1
         scell.rsrq = -17.3; scell.rsrp = -101.9; scell.rssi = -75.1
         XCTAssertEqual(info.cells[1], scell)
 
@@ -68,6 +68,29 @@ final class RadioTests: XCTestCase {
         XCTAssertEqual(nr.tac, 0x000102)
         XCTAssertEqual(nr.cellID, 0x123456789)
         XCTAssertEqual(nr.pci, 185)
+    }
+
+    // The modem's band (QmiNasActiveBand): the LTE PCell from Get RF Band Info as the RM551E sent
+    // it in EN-DC (no NR entry), the NR cell in SA from its NR entry.
+    func testActiveBand() throws {
+        let lteLoc = try response(NAS.getCellLocationInfo, [
+            (0x13, "00 00 f1 10 34 12 04 45 23 01 f4 01 2b 00 00 00 00 00 00"),
+        ])
+        let lte = NAS.radioCells(sysInfo: nil, cellLocation: lteLoc, signal: nil,
+                                 rfBand: try response(NAS.getRFBandInfo, [(0x01, "01 08 78 00 f4 01")]), ca: nil)
+        XCTAssertEqual(lte.cells.first?.band, 1)
+        // SA on n7 (an NR-ARFCN n41 shares): band 254 = n7.
+        let sa = NAS.radioCells(sysInfo: try response(NAS.getSysInfo, [(0x4A, "02 00 00"), (0x60, "f0 0c 08 00")]),
+                                cellLocation: nil, signal: nil,
+                                rfBand: try response(NAS.getRFBandInfo, [(0x01, "01 0c fe 00 00 00")]), ca: nil)
+        XCTAssertEqual(sa.cells.first?.role, .primary)
+        XCTAssertEqual(sa.cells.first?.band, 7)
+        XCTAssertEqual(NAS.activeBand(259)?.band, 41)
+        XCTAssertEqual(NAS.activeBand(286)?.band, 40)
+        XCTAssertEqual(NAS.activeBand(301)?.band, 94)
+        XCTAssertEqual(NAS.activeBand(134)?.band, 17)
+        XCTAssertEqual(NAS.activeBand(168)?.band, 71)
+        XCTAssertNil(NAS.activeBand(80))                  // a GSM / UMTS value
     }
 
     func testNothingReported() {

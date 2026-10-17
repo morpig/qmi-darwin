@@ -185,9 +185,7 @@ public struct QMIDConfig: Codable, Equatable {
 
     public static func load(path: String = defaultPath) throws -> QMIDConfig {
         guard FileManager.default.fileExists(atPath: path) else { return builtIn }
-        let c = try JSONDecoder().decode(QMIDConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-        try c.validate()
-        return c
+        return try decode(Data(contentsOf: URL(fileURLWithPath: path)))
     }
 
     // vendorIDs as numbers; nil entries are rejected by validate().

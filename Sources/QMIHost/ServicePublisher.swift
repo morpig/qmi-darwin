@@ -126,17 +126,14 @@ public final class ServicePublisher {
         published.removeAll()
     }
 
-    // MARK: Status keys for other apps (PLAN.md §5.4)
+    // MARK: Status keys for other apps (PLAN.md §5.4; QMIDStoreKey)
 
-    public static let modemKey = "State:/Network/QMI/Modem"
-    public static func pdnKey(_ name: String) -> String { "State:/Network/QMI/PDN/\(name)" }
-
-    public static func pdnStatus(name: String, interface: String, muxID: UInt8, config: PDNConfig,
+    public static func pdnStatus(name: String, interface: String, config: PDNConfig,
                                  settings s: WDS.RuntimeSettings, policy: QMIDPolicy) -> [String: Any] {
         var d: [String: Any] = [
             "ServiceID": serviceID(for: name),
             "InterfaceName": interface,
-            "MuxID": Int(muxID),
+            "MuxID": Int(config.muxID),
             "State": "connected",
             "Policy": policy.rawValue,
         ]
