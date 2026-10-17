@@ -81,7 +81,7 @@ final class BearerEncodingTests: XCTestCase {
     func testMCCMNCString() {
         XCTAssertEqual(Manager.mccmncString((mcc: 999, mnc: 99)), "99999")
         XCTAssertEqual(Manager.mccmncString((mcc: 1, mnc: 1)), "00101")
-        XCTAssertEqual(Manager.mccmncString((mcc: 310, mnc: 260)), "310260")
+        XCTAssertEqual(Manager.mccmncString((mcc: 1, mnc: 101)), "001101")
     }
 
     func testAMBRDescription() {
