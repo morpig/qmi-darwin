@@ -146,6 +146,8 @@ public enum WDS {
     public static let setIPFamily: UInt16 = 0x004D
     public static let bindMuxDataPort: UInt16 = 0x00A2
     public static let indicationRegister: UInt16 = 0x0003
+    public static let getPDNThrottleInfo: UInt16 = 0x006C       // TLV 0x01: tech type, 1 byte
+    public static let getThrottledPDNRejectTimer: UInt16 = 0x00D0
     public static let ambrIndication: UInt16 = 0x011E
     public static let getAMBRInfo: UInt16 = 0x011F
 
@@ -202,9 +204,19 @@ public enum WDS {
             }
         }
 
+        // The modem refused the call locally: it throttles the PDN after a network rejection.
+        public var isThrottled: Bool { verboseType == 2 && (verboseReason == 209 || verboseReason == 211) }
+
         // Rejections of the APN itself, not of one IP family: no family will do better.
         public var isAPNLevel: Bool {
             verboseType == 6 && verboseReason.map(WDS.apnLevel3GPPCauses.contains) == true
+        }
+
+        // A permanent rejection of the request rather than of its PDN type: when no family came
+        // up, it held for the others too (an IPv4v6 request is one request; the modem ends the
+        // family that rode on it with an internal cause such as #236).
+        public var isRequestLevel: Bool {
+            isPermanent && verboseType == 6 && verboseReason.map(WDS.pdnType3GPPCauses.contains) == false
         }
 
         // Verbose call end reason types.
@@ -254,6 +266,10 @@ public enum WDS {
     // The ones about the APN rather than an IP family: barred, unknown APN, authentication,
     // not supported, not subscribed.
     public static let apnLevel3GPPCauses: Set<UInt16> = [8, 27, 29, 32, 33]
+    // The ones about the requested PDN type (TS 24.301 §9.9.4.4): the network takes the APN
+    // with another family. The other permanent causes reject the PDN CONNECTIVITY REQUEST as
+    // a whole, which may carry one family or both (IPv4v6).
+    public static let pdnType3GPPCauses: Set<UInt16> = [50, 51, 52]
 
     // ESM cause names, TS 24.301 section 9.9.4.4 / annex B.
     static let esmCauses: [UInt16: String] = [

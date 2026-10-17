@@ -142,6 +142,15 @@ final class CallEndTests: XCTestCase {
         XCTAssertTrue(end(2, 210).isPermanent)    // internal: PDN IPv6 call disallowed
     }
 
+    func testRequestLevelCauses() {
+        // Permanent rejections of the request, not its PDN type (TS 24.301 §9.9.4.4).
+        for c: UInt16 in [8, 27, 29, 30, 31, 32, 33] { XCTAssertTrue(end(6, c).isRequestLevel, "#\(c)") }
+        for c: UInt16 in [50, 51, 52] { XCTAssertFalse(end(6, c).isRequestLevel, "#\(c)") }
+        XCTAssertFalse(end(2, 236).isRequestLevel)  // internal: the family that rode on the request
+        XCTAssertFalse(end(2, 210).isRequestLevel)  // internal: IPv6 disallowed, about the family
+        XCTAssertFalse(end(6, 26).isRequestLevel)   // insufficient resources: retried
+    }
+
     func testRetryableCauses() {
         XCTAssertFalse(end(6, 36).isPermanent)    // regular deactivation
         XCTAssertFalse(end(6, 26).isPermanent)    // insufficient resources

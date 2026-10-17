@@ -594,15 +594,16 @@ public final class Manager {
             }
             teardown(p, stopCall: true, state: .backoff, error: summary, reason: reason, ends: session.ends)
             p.lastErrorDetail = session.failures.isEmpty ? nil : session.failureDetail
-            applyPermanentCauses(p, session)
+            let loggedBlock = applyPermanentCauses(p, session)
             if p.dialFamilies.isEmpty {
                 p.state = .blocked
                 p.lastError = p.blockedSummary
-                if !session.ends.values.contains(where: \.isAPNLevel) {   // that one was logged already
+                if !loggedBlock {
                     log("\(p.config.name): refused for every family; not retrying until reload or re-registration", level: .error)
                 }
                 publishStatus(p)
             } else {
+                if session.ends.values.contains(where: \.isThrottled) { logThrottle(p) }
                 scheduleRedial(p)
             }
         }
@@ -716,8 +717,28 @@ public final class Manager {
         queue.asyncAfter(deadline: .now() + .seconds(limit), execute: item)
     }
 
+    // PROBE: the modem's throttle state for a PDN whose calls came back throttled, raw, to learn
+    // the layout of 0x006C / 0x00D0 while a throttle is active.
+    private func logThrottle(_ p: PDNState) {
+        guard let wds = control else { return }
+        func dump(_ name: String, _ message: UInt16, _ tlvs: [TLV]) {
+            do {
+                let r = try wds.request(message, tlvs, timeout: 5)
+                let body = r.tlvs.filter { $0.type != 0x02 }.map { String(format: "0x%02x[%d] ", $0.type, $0.value.count) + $0.value.hex }
+                log("\(p.config.name): probe \(name): " + (body.isEmpty ? "(no TLVs)" : body.joined(separator: " | ")), level: .notice)
+            } catch {
+                log("\(p.config.name): probe \(name): \(error)", level: .notice)
+            }
+        }
+        dump("PDN throttle info (3GPP)", WDS.getPDNThrottleInfo, [.u8(0x01, 0)])
+        dump("PDN throttle info (3GPP2)", WDS.getPDNThrottleInfo, [.u8(0x01, 1)])
+        dump("throttled PDN reject timer", WDS.getThrottledPDNRejectTimer, [])
+    }
+
     // A family refused with a permanent 3GPP cause is not retried until reload or re-registration.
-    private func applyPermanentCauses(_ p: PDNState, _ session: PDNSession) {
+    // True when it blocked (and logged) the whole PDN.
+    @discardableResult
+    private func applyPermanentCauses(_ p: PDNState, _ session: PDNSession) -> Bool {
         // A rejection of the APN itself (not subscribed, unknown, ...) holds for every family:
         // don't go on dialing the others, which the modem then only throttles.
         if let end = session.ends.values.first(where: \.isAPNLevel),
@@ -725,12 +746,23 @@ public final class Manager {
             for f in p.config.families { p.blocked[f] = end.text }
             log("\(p.config.name): \(end); not retrying until the SIM, the registration or the config changes",
                 level: .error)
-            return
+            return true
+        }
+        // Every family failed and the network refused the request itself (#30, #31): the
+        // family the modem ended with an internal cause shared that request.
+        if p.config.families.allSatisfy({ session.ends[$0] != nil }),
+           let end = session.ends.values.first(where: \.isRequestLevel),
+           p.config.families.contains(where: { p.blocked[$0] == nil }) {
+            for f in p.config.families { p.blocked[f] = end.text }
+            log("\(p.config.name): \(end) for every family; not retrying until the SIM, the registration or the config changes",
+                level: .error)
+            return true
         }
         for (family, end) in session.ends where end.isPermanent && p.blocked[family] == nil {
             p.blocked[family] = end.text
             log("\(p.config.name): ipv\(family) blocked: \(end)", level: .error)
         }
+        return false
     }
 
     private func teardown(_ p: PDNState, stopCall: Bool, state: QMIDPDN.State, error: String?,
