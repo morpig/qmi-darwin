@@ -662,6 +662,7 @@ func printStatus(_ d: NSDictionary) {
         if let i = q.interface { line += " on \(i)" }
         line += ", \(q.policy ?? "?")"
         if let u = q.uptime { line += ", up \(u) s" }
+        if let r = q.rat { line += ", on \(r)" }
         if !q.wanted { line += ", manual" }
         print(line)
         if let a = q.ipv4 { print("  ipv4 \(a)") }
@@ -744,6 +745,7 @@ func describe(_ p: QMIDPDN) -> String {
     if let a = p.ipv4 { s += " \(a)" }
     if let a = p.ipv6 { s += " \(a)" }
     if !p.pcscf.isEmpty { s += " p-cscf \(p.pcscf.joined(separator: ","))" }
+    if let r = p.rat { s += " on \(r)" }
     if let q = p.qci { s += " qci \(q)" }
     if let a = p.ambr { s += " ambr \(describe(a))" }
     if let e = p.error, !p.isConnected { s += " (\(e))" }

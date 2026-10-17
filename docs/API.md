@@ -168,6 +168,7 @@ APN re-attaches, which drops every PDN briefly.
 | `ambr` | APN-AMBR while connected (`QMIDAMBR`, `uplink` / `downlink` in bits per second), when the modem reports it. The network can change it on a live connection (e.g. following the radio: 500 Mbps on 5G NSA, 100 Mbps on LTE only); each change is a `.pdn` event |
 | `bearers` | the PDN's dedicated bearers (`[QMIDBearer]`); only in `status()`, `nil` in `.pdn` events (see "Dedicated bearers and QoS") |
 | `linkHeld` | `true` while it redials right after a drop with its `interface` kept (below); `false` otherwise and from an older qmid |
+| `rat` | while connected: the technology its data goes over, `"nr"`, `"lte"`, … (names as `QMIDBandPreference.modes`). Per PDN: in EN-DC the network can put internet on the NR leg and keep IMS on LTE, while the serving cell is LTE for both. Followed as the modem reports changes; nil when it doesn't say |
 
 Suggested UI mapping: `connected` → up (show interface and addresses); `dialing` /
 `waiting` / `backoff` → connecting (show `error` for backoff); `blocked` → error with the
@@ -643,7 +644,8 @@ quick check with `scutil`):
   `LastError`, `AirplaneMode` (present while on), `SIM`: a dictionary with the `QMIDSIM` keys
   above except `iccid`, `imsi` and `msisdn`, and `PLMN`: one with the `QMIDPLMN` keys)
 - `State:/Network/QMI/PDN/<name>` (keys `ServiceID`, `InterfaceName`, `MuxID`, `State`,
-  `Policy`, `Profile`, `APN`, `MTU`, `IPv4Address`, `IPv6Address`, `PCSCFv4`, `PCSCFv6`)
+  `Policy`, `Profile`, `APN`, `MTU`, `IPv4Address`, `IPv6Address`, `PCSCFv4`, `PCSCFv6`,
+  `RAT` while connected, `LastError`, `QCI`, `AMBR`)
 
 The key names are in `QMIDStoreKey`. XPC events are the preferred source; this is a fallback.
 
@@ -704,7 +706,7 @@ Added in qmid 0.16 (API still 1): `setBandPreference`, `resetBandPreference`,
 `QMIDBandPreference.supportedLTEBands` / `supportedNRBands`.
 
 Added in qmid 0.17 (API still 1): `setModePreference`, `resetModePreference`,
-`QMIDBandPreference.supportedModes`.
+`QMIDBandPreference.supportedModes`, `QMIDPDN.rat`.
 
 ## Testing from the command line
 

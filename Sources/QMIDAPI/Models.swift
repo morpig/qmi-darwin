@@ -51,6 +51,9 @@ public struct QMIDPDN: Equatable {
     // Redialing right after a drop with its interface, network service and stand-in interface
     // kept (state dialing/backoff/waiting, `interface` set): a stall, not the link going away.
     public var linkHeld: Bool
+    // While connected: the technology its data goes over, as QMIDBandPreference.modes names
+    // ("nr", "lte", …). Per PDN: in EN-DC one APN can be on the NR leg while another stays on LTE.
+    public var rat: String?
 
     public var isConnected: Bool { state == .connected }
     public var policyKind: QMIDPolicy? { policy.flatMap(QMIDPolicy.init(rawValue:)) }
@@ -97,6 +100,7 @@ public struct QMIDPDN: Equatable {
         ambr = QMIDAMBR(d[QMIDKey.ambr] as? NSDictionary)
         bearers = (d[QMIDKey.bearers] as? [NSDictionary]).map { $0.compactMap(QMIDBearer.init) }
         linkHeld = d[QMIDKey.linkHeld] as? Bool ?? false
+        rat = d[QMIDKey.rat] as? String
     }
 
     public var dictionary: NSDictionary {
@@ -122,6 +126,7 @@ public struct QMIDPDN: Equatable {
         d[QMIDKey.qci] = qci
         d[QMIDKey.ambr] = ambr?.dictionary
         d[QMIDKey.bearers] = bearers?.map(\.dictionary)
+        d[QMIDKey.rat] = rat
         return d as NSDictionary
     }
 }

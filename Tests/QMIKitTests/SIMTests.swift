@@ -187,6 +187,18 @@ final class SIMTests: XCTestCase {
         XCTAssertEqual(DMS.parseModeCapabilities(caps), ["umts", "lte", "nr"])
     }
 
+    // RM551E in EN-DC: internet's bearer on NR, IMS's on LTE (Get Current Data Bearer Technology),
+    // and the same layout in the Event Report's TLV 0x1D.
+    func testBearerRAT() throws {
+        let get = { try self.response(.wds, WDS.getCurrentDataBearerTechnology, [TLV(0x01, [UInt8](hex: $0)!)]) }
+        XCTAssertEqual(WDS.parseBearerRAT(try get("02 00 04 00 00 00 00 00 00")), "nr")
+        XCTAssertEqual(WDS.parseBearerRAT(try get("02 20 00 00 00 00 00 00 00")), "lte")
+        XCTAssertNil(WDS.parseBearerRAT(try get("02 00 80 00 00 00 00 00 00")))     // null bearer
+        let ind = QMIMessage(service: .wds, clientID: 1, kind: .indication, messageID: WDS.eventReport,
+                             tlvs: [TLV(0x1D, [UInt8](hex: "02 00 04 00 00 00 00 00 00")!)])
+        XCTAssertEqual(WDS.parseBearerRAT(ind), "nr")
+    }
+
     func testBandPreferenceRequest() throws {
         let t = Dictionary(uniqueKeysWithValues: NAS.bandPreferenceRequest(lte: [1, 3], nrNSA: [40, 41], nrSA: nil, persistent: false)
             .map { ($0.type, $0.value) })

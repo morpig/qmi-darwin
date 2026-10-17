@@ -147,6 +147,7 @@ public enum QMIDKey {
     public static let ambr = "ambr"                   // APN-AMBR: {uplink, downlink} in bps
     public static let bearers = "bearers"             // [bearer dictionary]: in status() and "bearers" events
     public static let linkHeld = "linkHeld"           // Bool: redialing with the interface kept after a drop
+    // rat (shared with the cell dictionary)          // String: technology the PDN's data goes over, "nr" | "lte" | …
 
     // bearer dictionary (dedicated EPS bearers of a PDN)
     public static let id = "id"                       // bearer: opaque, stable while the bearer lives; filter: 3GPP ID 0–15
@@ -179,7 +180,7 @@ public enum QMIDKey {
     public static let raw = "raw"                     // [String]: TLVs, with radio(raw: true)
 
     // cell dictionary
-    public static let rat = "rat"                     // QMIDCell.RAT: "lte" | "nr"
+    public static let rat = "rat"                     // QMIDCell.RAT: "lte" | "nr"; PDN: its data's technology
     // role                                           // QMIDCell.Role: "primary" | "secondary" | "neighbor"
     public static let channel = "channel"             // EARFCN / NR-ARFCN
     public static let band = "band"                   // 3GPP band number

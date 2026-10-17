@@ -149,6 +149,26 @@ public enum WDS {
     public static let getPDNThrottleInfo: UInt16 = 0x006C       // TLV 0x01: tech type, 1 byte
     public static let getThrottledPDNRejectTimer: UInt16 = 0x00D0
     public static let ambrIndication: UInt16 = 0x011E
+    // The technology a call's data goes over (per PDN: in EN-DC the network may put one APN's
+    // bearer on the NR leg and keep another on LTE). Get Current Data Bearer Technology TLV
+    // 0x01, and the Event Report indication TLV 0x1D once Set Event Report TLV 0x15 asked for
+    // it: network type (1 3GPP2, 2 3GPP as the RM551E sends it), RAT mask (4 bytes), SO mask.
+    public static let getCurrentDataBearerTechnology: UInt16 = 0x0044
+    public static let eventReport: UInt16 = 0x0001             // Set Event Report, and the indication
+    public static let bearerTechnologyEvents: TLV = .u8(0x15, 1)
+
+    // As a mode name (NAS.modeBits): "nr", "lte", "umts", "gsm", "td-scdma", "cdma1x"; nil when
+    // the message doesn't say (no TLV, or a null bearer).
+    public static func parseBearerRAT(_ m: QMIMessage) -> String? {
+        guard let v = m[tlv: m.messageID == eventReport ? 0x1D : 0x01], v.count >= 5 else { return nil }
+        var r = ByteReader(v)
+        let network = try! r.u8(), mask = try! r.u32()
+        if network == 1 { return mask == 0 ? nil : "cdma1x" }
+        let names: [(UInt32, String)] = [(1 << 10, "nr"), (1 << 5, "lte"), (1 << 9, "td-scdma"),
+                                         (1 << 0 | 1 << 2 | 1 << 3 | 1 << 6 | 1 << 7 | 1 << 8, "umts"),
+                                         (1 << 1 | 1 << 4, "gsm")]
+        return names.first { mask & $0.0 != 0 }?.1
+    }
     public static let getAMBRInfo: UInt16 = 0x011F
 
     // APN-AMBR of the call the client carries, bits per second (Get AMBR Info and the AMBR

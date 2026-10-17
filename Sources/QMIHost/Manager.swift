@@ -72,6 +72,7 @@ public final class Manager {
         var linkHold: DispatchWorkItem?
         var reason: QMIDReason?             // lastError as a word for clients
         var ends: [UInt8: WDS.CallEnd] = [:]  // lastError's call end causes, per family
+        var rat: String?                    // while connected: the technology its data goes over
 
         // Bookkeeping of the QoS snapshot (snapshotQoS); reset with the call.
         struct QoSSnapshot {
@@ -582,6 +583,7 @@ public final class Manager {
             if !p.config.oneShot { applyPermanentCauses(p, session) }
             armUptimeLimit(p)
             startQoS(p, dev)
+            watchBearerRAT(p)
         } catch {
             session.disconnect()
             let summary = session.failures.isEmpty ? "\(error)" : session.failureSummary
@@ -784,6 +786,7 @@ public final class Manager {
         p.qosState = PDNQoS.State()
         p.qos?.close(release: stopCall)
         p.qos = nil
+        p.rat = nil
         if stopCall { p.session?.disconnect() }
         p.session = nil
         p.connectedAt = nil
@@ -860,6 +863,13 @@ public final class Manager {
             if m.messageID == QoS.eventReport,
                let p = pdns.first(where: { $0.qos != nil && $0.qos?.indicationClientID == m.clientID }) {
                 applyQoSReport(p, m)
+            }
+            return
+        }
+        if m.service == .wds, m.messageID == WDS.eventReport {
+            if let p = pdns.first(where: { $0.session?.clientIDs.contains(m.clientID) == true }),
+               let rat = WDS.parseBearerRAT(m) {
+                setBearerRAT(p, rat)
             }
             return
         }
@@ -2188,6 +2198,7 @@ public final class Manager {
         }
         d["State"] = p.state.rawValue
         if let e = p.lastError { d["LastError"] = e }
+        if let r = p.rat { d["RAT"] = r }
         if p.qos != nil, let c = p.qosState.qci { d["QCI"] = Int(c) }
         if p.qos != nil, let a = p.qosState.ambr { d["AMBR"] = ["Uplink": NSNumber(value: a.uplink), "Downlink": NSNumber(value: a.downlink)] }
         try? publisher.publish([QMIDStoreKey.pdn(p.config.name): d])
@@ -2250,6 +2261,7 @@ public final class Manager {
         d.blocked = p.blocked.sorted { $0.key < $1.key }.map { "ipv\($0.key): \($0.value)" }
         d.uptime = p.connectedAt.map { Int(Date().timeIntervalSince($0)) }
         d.linkHeld = p.heldSettings != nil
+        d.rat = p.rat
         return d
     }
 
@@ -2269,6 +2281,28 @@ public final class Manager {
         guard ev != last else { return }
         last = ev
         onEvent?(ev)
+    }
+
+    // MARK: - Bearer technology
+
+    // The technology the PDN's data goes over: read now, then from Event Reports on the call's
+    // client (one family's; a PDN's families share the radio bearer's technology).
+    private func watchBearerRAT(_ p: PDNState) {
+        guard let session = p.session, let f = session.settings.keys.sorted().first,
+              let c = session.client(family: f) else { return }
+        do { try c.request(WDS.eventReport, [WDS.bearerTechnologyEvents], timeout: 5) }
+        catch { log("\(p.config.name): bearer technology events: \(error)") }
+        if let rat = (try? c.request(WDS.getCurrentDataBearerTechnology, timeout: 5)).flatMap(WDS.parseBearerRAT) {
+            setBearerRAT(p, rat)
+        }
+    }
+
+    private func setBearerRAT(_ p: PDNState, _ rat: String) {
+        guard p.state == .connected, rat != p.rat else { return }
+        let first = p.rat == nil
+        p.rat = rat
+        log("\(p.config.name): data \(first ? "on" : "now on") \(rat)")
+        publishStatus(p)
     }
 
     // MARK: - QoS (default bearer QCI, AMBR, dedicated bearers)
