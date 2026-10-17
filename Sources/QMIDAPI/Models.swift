@@ -135,6 +135,7 @@ public enum QMIDReason: String {
     case dropped                        // went down after connecting (`causes` when the modem said why)
     case maxUptime = "max-uptime"       // hung up after the config's maxUptime
     case modemLost = "modem-lost"       // the modem went away
+    case airplaneMode = "airplane-mode" // waiting: the modem's radio is off
 }
 
 // One family's call end cause.
@@ -311,6 +312,29 @@ public struct QMIDSIM: Equatable {
     public var attachAPN: String?         // APN of the default bearer as attached
     public var attachAPNFromNetwork: Bool // the network chose attachAPN (empty APN in the attach profile)
     public var pendingSIM: String?        // "…1234": a prepareSIM card not in yet
+    // Identities: in XPC replies and events only, never in SCDynamicStore (readable by any
+    // local user).
+    public var iccid: String?             // full ICCID
+    public var imsi: String?              // nil until the PIN is verified
+    public var msisdn: String?            // own number as stored on the SIM; many SIMs have none
+    public var card: CardState?
+    public var pin: PINState?             // PIN1 of the USIM (or the universal PIN)
+    public var pinRetries: Int?
+    public var pukRetries: Int?
+
+    public enum CardState: String { case present, absent, error }
+
+    public enum PINState: String {
+        case disabled                     // no PIN asked
+        case verified                     // PIN entered
+        case required                     // PIN needed before the SIM works
+        case pukRequired = "puk-required" // PIN blocked: PUK needed
+        case blocked                      // PUK blocked too: the card is unusable
+        case unknown
+    }
+
+    // The SIM can't be used until someone enters its PIN or PUK.
+    public var isLocked: Bool { pin == .required || pin == .pukRequired || pin == .blocked }
 
     public init(mccmnc: String? = nil, iccidSuffix: String? = nil) {
         self.mccmnc = mccmnc
@@ -319,7 +343,7 @@ public struct QMIDSIM: Equatable {
     }
 
     public init?(_ d: NSDictionary?) {
-        guard let d, d[QMIDKey.mccmnc] != nil || d[QMIDKey.iccidSuffix] != nil else { return nil }
+        guard let d, d[QMIDKey.mccmnc] != nil || d[QMIDKey.iccidSuffix] != nil || d[QMIDKey.card] != nil else { return nil }
         mccmnc = d[QMIDKey.mccmnc] as? String
         iccidSuffix = d[QMIDKey.iccidSuffix] as? String
         carrier = d[QMIDKey.carrier] as? String
@@ -327,10 +351,24 @@ public struct QMIDSIM: Equatable {
         attachAPN = d[QMIDKey.attachAPN] as? String
         attachAPNFromNetwork = d[QMIDKey.attachAPNFromNetwork] as? Bool ?? false
         pendingSIM = d[QMIDKey.pendingSIM] as? String
+        iccid = d[QMIDKey.iccid] as? String
+        imsi = d[QMIDKey.imsi] as? String
+        msisdn = d[QMIDKey.msisdn] as? String
+        card = (d[QMIDKey.card] as? String).flatMap(CardState.init)
+        pin = (d[QMIDKey.pin] as? String).map { PINState(rawValue: $0) ?? .unknown }
+        pinRetries = d[QMIDKey.pinRetries] as? Int
+        pukRetries = d[QMIDKey.pukRetries] as? Int
     }
 
     public var dictionary: NSDictionary {
         var d: [String: Any] = [:]
+        d[QMIDKey.iccid] = iccid
+        d[QMIDKey.imsi] = imsi
+        d[QMIDKey.msisdn] = msisdn
+        d[QMIDKey.card] = card?.rawValue
+        d[QMIDKey.pin] = pin?.rawValue
+        d[QMIDKey.pinRetries] = pinRetries
+        d[QMIDKey.pukRetries] = pukRetries
         d[QMIDKey.mccmnc] = mccmnc
         d[QMIDKey.iccidSuffix] = iccidSuffix
         d[QMIDKey.carrier] = carrier
@@ -381,6 +419,7 @@ public struct QMIDPLMN: Equatable {
     // shouldn't request an emergency PDN when it's false. nil when the modem doesn't say.
     public var emergencyBearers: Bool?
     public var emergencyAccessBarred: Bool?
+    public var roaming: Bool?             // the modem's roaming indicator; nil when it doesn't say
 
     // Long name, else short name; nil when there is neither (don't show the MCC/MNC instead).
     public var displayName: String? { longName ?? shortName }
@@ -400,6 +439,7 @@ public struct QMIDPLMN: Equatable {
         nameFromNetwork = d[QMIDKey.nameFromNetwork] as? Bool ?? false
         emergencyBearers = d[QMIDKey.emergencyBearers] as? Bool
         emergencyAccessBarred = d[QMIDKey.emergencyAccessBarred] as? Bool
+        roaming = d[QMIDKey.roaming] as? Bool
     }
 
     public var dictionary: NSDictionary {
@@ -408,6 +448,7 @@ public struct QMIDPLMN: Equatable {
         d[QMIDKey.shortName] = shortName
         d[QMIDKey.emergencyBearers] = emergencyBearers
         d[QMIDKey.emergencyAccessBarred] = emergencyAccessBarred
+        d[QMIDKey.roaming] = roaming
         return d as NSDictionary
     }
 }
@@ -421,6 +462,8 @@ public struct QMIDStatus: Equatable {
     public var pdns: [QMIDPDN]
     public var sim: QMIDSIM?
     public var plmn: QMIDPLMN?
+    public var imei: String?
+    public var airplaneMode: Bool
 
     public var modemState: QMIDModemState? { QMIDModemState(rawValue: modem) }
     public var isModemReady: Bool { modemState == .ready }
@@ -435,6 +478,8 @@ public struct QMIDStatus: Equatable {
         pdns = (d[QMIDKey.pdns] as? [NSDictionary] ?? []).compactMap(QMIDPDN.init)
         sim = QMIDSIM(d[QMIDKey.sim] as? NSDictionary)
         plmn = QMIDPLMN(d[QMIDKey.plmn] as? NSDictionary)
+        imei = d[QMIDKey.imei] as? String
+        airplaneMode = d[QMIDKey.airplaneMode] as? Bool ?? false
     }
 }
 
@@ -652,4 +697,30 @@ public struct QMIDCell: Equatable {
         (76, 285400...286400), (74, 295000...303600), (257, 2054166...2104165),
         (258, 2016667...2070832), (261, 2070833...2084999), (260, 2229166...2279165),
     ]
+}
+
+// bandPreference(): what the modem may use. Empty lists: the modem didn't report that field.
+public struct QMIDBandPreference: Equatable {
+    public var modes: [String]            // "lte", "nr", "umts", "gsm", "td-scdma", "cdma1x", "evdo"
+    public var lteBands: [Int]            // 1, 3, 40, …
+    public var nrNSABands: [Int]          // NR bands allowed for EN-DC: 41, 78, …
+    public var nrSABands: [Int]           // NR bands allowed for SA
+
+    public init(modes: [String] = [], lteBands: [Int] = [], nrNSABands: [Int] = [], nrSABands: [Int] = []) {
+        self.modes = modes
+        self.lteBands = lteBands
+        self.nrNSABands = nrNSABands
+        self.nrSABands = nrSABands
+    }
+
+    public init(_ d: NSDictionary) {
+        modes = d[QMIDKey.modes] as? [String] ?? []
+        lteBands = d[QMIDKey.lteBands] as? [Int] ?? []
+        nrNSABands = d[QMIDKey.nrNSABands] as? [Int] ?? []
+        nrSABands = d[QMIDKey.nrSABands] as? [Int] ?? []
+    }
+
+    public var dictionary: NSDictionary {
+        [QMIDKey.modes: modes, QMIDKey.lteBands: lteBands, QMIDKey.nrNSABands: nrNSABands, QMIDKey.nrSABands: nrSABands]
+    }
 }

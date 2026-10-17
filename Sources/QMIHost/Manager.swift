@@ -157,6 +157,15 @@ public final class Manager {
     private var profileCheck: DispatchSourceTimer?
     private var linkAnchor: (v4: Bool, v6: Bool) = (false, false)
     private var nas: QMIClient?              // Serving System indications (registration gate)
+    private var uimWatch: QMIClient?         // UIM card status indications
+    private var dmsWatch: QMIClient?         // DMS operating mode indications
+    private var airplane = false             // the radio is off: setAirplaneMode, or someone's AT+CFUN=4
+    private var restarting = false           // restartModem: its offline step isn't airplane mode
+    private var imei: String?
+    private var card: UIM.Card?              // the card in the modem: state, PIN
+    private var imsi: String?                // of `sim`; read once its PIN is verified
+    private var msisdn: String?
+    private var roaming: Bool?
     private var psAttached: Bool?            // nil until known
     private var sim: SIMIdentity?            // nil until read (and while the modem is away)
     // prepareSIM: the card a client is about to switch to. Wins over `sim` when resolving the
@@ -349,6 +358,16 @@ public final class Manager {
             return openFailed(error)
         }
         ensureModemAutoconnectOff()
+        if let dms = try? dev.allocateClient(.dms) {
+            imei = (try? dms.request(DMS.getIDs, timeout: 5)).flatMap(DMS.parseIMEI)
+            // A modem left in low power (airplane mode before qmid restarted, or AT+CFUN=4)
+            // stays so; only a re-attach's own low power is undone (radioOff, below).
+            if !radioOff, let mode = (try? dms.request(DMS.getOperatingMode, timeout: 5)).flatMap(DMS.parseOperatingMode) {
+                airplane = DMS.isLowPower(mode)
+                if airplane { log("modem radio is off (operating mode \(mode)): airplane mode", level: .notice) }
+            }
+            dms.release()
+        }
         if radioOff {
             // A re-attach was cut short by the reopen: bring the radio back.
             retryRadioOnline(dev) { [weak self] in
@@ -407,6 +426,15 @@ public final class Manager {
         wda = nil
         control = nil
         nas = nil
+        uimWatch = nil
+        dmsWatch = nil
+        airplane = false                            // read again when it comes back
+        restarting = false
+        imei = nil
+        card = nil
+        imsi = nil
+        msisdn = nil
+        roaming = nil
         psAttached = nil
         plmn = nil
         resetPLMNNames()
@@ -447,6 +475,17 @@ public final class Manager {
         guard !p.dialFamilies.isEmpty else {
             p.state = .blocked
             p.lastError = p.blockedSummary
+            publishStatus(p)
+            return settle(p)
+        }
+        guard !airplane else {
+            p.cancelRetry()
+            if p.config.oneShot { return stopOneShot(p, error: "airplane mode", reason: .airplaneMode) }
+            // Dialled again when airplane mode ends (and the modem attaches).
+            p.state = .waiting
+            p.lastError = "airplane mode"
+            p.reason = .airplaneMode
+            p.ends = [:]
             publishStatus(p)
             return settle(p)
         }
@@ -754,6 +793,14 @@ public final class Manager {
             if plmn != nil { setLTEEmergency(NAS.parseLTEEmergency(m), replace: false) }
             return
         }
+        if m.service == .dms, m.messageID == DMS.eventReportIndication, let mode = DMS.parseOperatingMode(m) {
+            operatingModeChanged(mode)
+            return
+        }
+        if m.service == .uim, m.messageID == UIM.statusChangeIndication {
+            if let c = (try? UIM.parseCardStatus(m)).flatMap(Self.mainCard) { cardChanged(c) }
+            return
+        }
         if m.service == .nas, m.messageID == NAS.networkTimeIndication {
             readPLMNName()                          // EMM Information: names may have come with it
             return
@@ -828,6 +875,41 @@ public final class Manager {
             log("NAS serving-system events unavailable (\(error)); dialing without a registration gate")
             psAttached = nil
         }
+        watchEvents(dev, "DMS operating mode", fallback: "airplane mode seen only when set through qmid",
+                    { try Self.registered(dev, .dms, DMS.setEventReport, [DMS.operatingModeEvents]) },
+                    { [weak self] in self?.dmsWatch = $0 })
+        watchEvents(dev, "UIM card status", fallback: "card state read with the SIM only",
+                    { try Self.registered(dev, .uim, UIM.registerEvents, [UIM.cardStatusEvents]) },
+                    { [weak self] in self?.uimWatch = $0 })
+    }
+
+    // An event registration; a modem still settling after a reset may not answer it in time,
+    // so it is tried 4 times, 10 s apart, while the same modem stays open.
+    private func watchEvents(_ dev: QMIDevice, _ what: String, fallback: String, attempt: Int = 1,
+                             _ open: @escaping () throws -> QMIClient, _ keep: @escaping (QMIClient) -> Void) {
+        guard device === dev else { return }
+        do {
+            keep(try open())
+            if attempt > 1 { log("\(what) events registered (attempt \(attempt))") }
+        } catch {
+            guard attempt < 4 else { return log("\(what) events unavailable (\(error)); \(fallback)") }
+            log("\(what) events: \(error); retrying in 10 s")
+            queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+                self?.watchEvents(dev, what, fallback: fallback, attempt: attempt + 1, open, keep)
+            }
+        }
+    }
+
+    // A client of `service` with `message` sent (an event registration); released if that fails.
+    static func registered(_ dev: QMIDevice, _ service: QMIService, _ message: UInt16, _ tlvs: [TLV]) throws -> QMIClient {
+        let c = try dev.allocateClient(service)
+        do {
+            try c.request(message, tlvs, timeout: 5)
+            return c
+        } catch {
+            c.release()
+            throw error
+        }
     }
 
     private func servingChanged(_ s: NAS.ServingSystem, initial: Bool = false) {
@@ -841,6 +923,10 @@ public final class Manager {
             resetPLMNNames()
             readPLMNName()
         }
+        // Indications may leave out the roaming indicator when it hasn't changed.
+        let roam = s.registration != 1 ? nil : s.roaming ?? roaming
+        let roamingChanged = roam != roaming
+        roaming = roam
         let was = psAttached
         psAttached = s.registration == 1 && s.psAttached
         // EMC BS comes with the attach: read it on attach and on a new network.
@@ -848,7 +934,10 @@ public final class Manager {
            let n = nas, let r = try? n.request(NAS.getSysInfo, timeout: 5) {
             setLTEEmergency(NAS.parseLTEEmergency(r), replace: true)
         }
-        guard was != psAttached || initial else { return }
+        guard was != psAttached || initial else {
+            if roamingChanged { publishModem() }
+            return
+        }
         log("network: \(serving)", level: .notice)
         publishModem()
         guard psAttached == true, !initial else { return }
@@ -965,6 +1054,7 @@ public final class Manager {
                          nameFromNetwork: plmnNITZ != nil)
         d.emergencyBearers = lteEmergency.bearers
         d.emergencyAccessBarred = lteEmergency.accessBarred
+        d.roaming = roaming
         return d
     }
 
@@ -982,6 +1072,7 @@ public final class Manager {
     @discardableResult
     private func checkSIM() -> Bool {
         guard let dev = device else { return false }
+        readCard()
         var id = SIMIdentity()
         if !dmsICCIDUnsupported, let dms = try? dev.allocateClient(.dms) {
             do {
@@ -1006,14 +1097,24 @@ public final class Manager {
             log("prepared SIM \(p.iccidSuffix ?? "") is in", level: .notice)
         }
         id = id.merged(over: sim)
-        guard id != sim else { return false }
+        guard id != sim else {
+            // Same card: its IMSI may have become readable (PIN entered).
+            if imsi == nil {
+                readSIMDetails()
+                if imsi != nil { publishModem() }
+            }
+            return false
+        }
         // Only a different card earns its own re-attach; the same card gaining its MCC/MNC
         // stays under the re-attach rate limit.
         if id.iccid != sim?.iccid {
+            imsi = nil
+            msisdn = nil
             lastReattach = nil
             for p in pdns { p.blocked.removeAll() }   // rejections were the old SIM's
         }
         sim = id
+        readSIMDetails()
         attach = nil
         attachFromNetwork = false
         let match = config.carrier(for: id)
@@ -1024,6 +1125,51 @@ public final class Manager {
         applySIM()
         readPLMNName()                              // SIM names apply on the home network; publishes
         return true
+    }
+
+    // The card a status reports for: the first present one, else the first.
+    static func mainCard(_ cards: [UIM.Card]) -> UIM.Card? { cards.first { $0.state == 1 } ?? cards.first }
+
+    private func readCard() {
+        guard let dev = device, let uim = uimWatch ?? (try? dev.allocateClient(.uim)) else { return }
+        if let c = (try? uim.request(UIM.getCardStatus, timeout: 5)).flatMap({ try? UIM.parseCardStatus($0) }).flatMap(Self.mainCard) {
+            card = c
+        }
+        if uim !== uimWatch { uim.release() }
+    }
+
+    // A card status indication: a card in or out, a PIN entered or blocked.
+    private func cardChanged(_ c: UIM.Card) {
+        guard c != card else { return }
+        card = c
+        log("SIM card \(c.stateName)\(c.pin.map { ", pin \(Self.pinState($0.state).rawValue)" } ?? "")", level: .notice)
+        if c.state != 1 { imsi = nil; msisdn = nil }
+        if checkSIM() { reconcile("follow the SIM") } else { publishModem() }
+    }
+
+    // IMSI and MSISDN of the card in the modem: once per card, after its PIN is verified.
+    private func readSIMDetails() {
+        guard let dev = device, sim != nil, card?.isReady != false, imsi == nil else { return }
+        if let uim = uimWatch ?? (try? dev.allocateClient(.uim)) {
+            imsi = (try? uim.request(UIM.readTransparent, UIM.readIMSIRequest, timeout: 5)).flatMap(UIM.parseIMSI)
+            msisdn = (try? uim.request(UIM.readRecord, UIM.readMSISDNRequest, timeout: 5)).flatMap(UIM.parseMSISDN)
+            if uim !== uimWatch { uim.release() }
+        }
+        if msisdn == nil, let dms = try? dev.allocateClient(.dms) {
+            msisdn = (try? dms.request(DMS.getMSISDN, timeout: 5)).flatMap(DMS.parseMSISDN)
+            dms.release()
+        }
+    }
+
+    static func pinState(_ s: UInt8) -> QMIDSIM.PINState {
+        switch s {
+        case 0, 3: return .disabled
+        case 1: return .required
+        case 2: return .verified
+        case 4: return .pukRequired
+        case 5: return .blocked
+        default: return .unknown
+        }
     }
 
     // Puts the SIM's attach PDN settings into the PDN states (see QMIDConfig.resolvedPDNs): the
@@ -1059,9 +1205,23 @@ public final class Manager {
         publishModem()
     }
 
-    private func simInfo() -> QMIDSIM? {
-        guard let sim else { return nil }
-        var d = QMIDSIM(mccmnc: sim.mccmnc, iccidSuffix: sim.iccidSuffix)
+    // identities: the full ICCID, IMSI and MSISDN, for XPC only (not SCDynamicStore).
+    private func simInfo(identities: Bool = true) -> QMIDSIM? {
+        var d = QMIDSIM(mccmnc: sim?.mccmnc, iccidSuffix: sim?.iccidSuffix)
+        if let c = card {
+            d.card = c.state == 0 ? .absent : c.state == 1 ? .present : .error
+            if let p = c.pin, c.state == 1 {
+                d.pin = Self.pinState(p.state)
+                d.pinRetries = Int(p.retries)
+                d.pukRetries = Int(p.pukRetries)
+            }
+        }
+        guard let sim else { return d.card == nil ? nil : d }
+        if identities {
+            d.iccid = sim.iccid
+            d.imsi = imsi
+            d.msisdn = msisdn
+        }
         if let m = config.carrier(for: sim) {
             d.carrier = m.carrier.name
             d.matchedBy = m.matchedBy
@@ -1543,6 +1703,8 @@ public final class Manager {
             return
         }
         reattachDeferred = false
+        // In airplane mode the radio is off already; turning it on attaches with the new APN.
+        guard !airplane else { return log("attach APN changed; it applies when airplane mode ends", level: .notice) }
         lastReattach = Date()
         guard let dev = device else { return }
         log("attach APN changed; re-attaching (all PDNs drop briefly)", level: .notice)
@@ -1753,6 +1915,66 @@ public final class Manager {
         let radio = QMIDRadio(cells: info.cells.map(Self.cellInfo), endcAvailable: info.endcAvailable,
                               raw: raw ? lines : nil)
         return (radio.dictionary, nil)
+    }
+
+    // MARK: - Airplane mode, restart, bands
+
+    public func setAirplaneMode(_ on: Bool) -> String? {
+        guard let dev = device else { return "modem not ready (\(deviceState.rawValue))" }
+        guard !radioOff else { return "a re-attach is in progress; try again in a few seconds" }
+        do {
+            let dms = try dev.allocateClient(.dms)
+            defer { dms.release() }
+            try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(on ? .lowPower : .online), timeout: 20,
+                            accept: [.noEffect])
+        } catch {
+            return "\(error)"
+        }
+        setAirplane(on, by: "request")
+        return nil
+    }
+
+    // The modem's operating mode changed (Event Report): someone else's AT+CFUN, or ours.
+    private func operatingModeChanged(_ mode: UInt8) {
+        guard !radioOff, !restarting else { return }   // a re-attach's or a restart's own mode change
+        setAirplane(DMS.isLowPower(mode), by: "operating mode \(mode)")
+    }
+
+    private func setAirplane(_ on: Bool, by why: String) {
+        guard on != airplane else { return }
+        airplane = on
+        log("airplane mode \(on ? "on" : "off") (\(why))", level: .notice)
+        publishModem()
+        redialWanted()                              // on: the PDNs show it; off: they wait for the attach
+    }
+
+    public func restartModem() -> String? {
+        guard let dev = device else { return "modem not ready (\(deviceState.rawValue))" }
+        restarting = true
+        // Ends when the modem goes away (deviceLost), or after 2 minutes if it never does.
+        queue.asyncAfter(deadline: .now() + 120) { [weak self] in self?.restarting = false }
+        do {
+            let dms = try dev.allocateClient(.dms)
+            defer { dms.release() }
+            try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.offline), timeout: 20, accept: [.noEffect])
+            // The modem resets right away; its answer may not make it out.
+            _ = try? dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.reset), timeout: 5)
+        } catch {
+            restarting = false
+            return "\(error)"
+        }
+        log("modem restart requested", level: .notice)
+        return nil
+    }
+
+    public func bandPreference() -> (NSDictionary?, String?) {
+        guard let n = nas else { return (nil, "modem not ready") }
+        do {
+            let p = NAS.parseBandPreference(try n.request(NAS.getSystemSelectionPreference, timeout: 5))
+            return (QMIDBandPreference(modes: p.modes, lteBands: p.lte, nrNSABands: p.nrNSA, nrSABands: p.nrSA).dictionary, nil)
+        } catch {
+            return (nil, "\(error)")
+        }
     }
 
     static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
@@ -1985,6 +2207,7 @@ public final class Manager {
         var d: [String: Any] = [QMIDKey.type: QMIDEventType.modem, QMIDKey.modem: deviceState.rawValue]
         if !serving.isEmpty { d[QMIDKey.network] = serving }
         if let e = deviceError { d[QMIDKey.modemError] = e }
+        if airplane { d[QMIDKey.airplaneMode] = true }
         return d as NSDictionary
     }
 
@@ -2002,7 +2225,8 @@ public final class Manager {
             d["Interface"] = Int(dev.modem.interfaceNumber)
         }
         if let e = deviceError { d["LastError"] = e }
-        d["SIM"] = simInfo()?.dictionary
+        if airplane { d["AirplaneMode"] = true }
+        d["SIM"] = simInfo(identities: false)?.dictionary
         d["PLMN"] = plmnInfo()?.dictionary
         try? publisher.publish([ServicePublisher.modemKey: d])
         emitIfChanged(modemEvent(), &lastModemEvent)
@@ -2051,6 +2275,8 @@ public final class Manager {
         }
         var out: [String: Any] = [QMIDKey.apiVersion: qmidAPIVersion, QMIDKey.modem: deviceState.rawValue, QMIDKey.pdns: list]
         if let v = version { out[QMIDKey.version] = v }
+        if let i = imei { out[QMIDKey.imei] = i }
+        out[QMIDKey.airplaneMode] = airplane
         if !serving.isEmpty { out[QMIDKey.network] = serving }
         if let e = deviceError { out[QMIDKey.modemError] = e }
         if let g = stats[0] { out[QMIDKey.datapath] = g }

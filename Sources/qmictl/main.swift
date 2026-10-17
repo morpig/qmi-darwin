@@ -24,6 +24,9 @@ usage (through qmid):
                                             switch; held until Ctrl-C (or SECONDS), which ends it
   qmictl cancel-sim ICCID                   end a prepare-sim: attach profile back to the current SIM
   qmictl radio [-v]                         serving cells (LTE CA, NR), neighbours, signal; -v: raw TLVs
+  qmictl airplane on|off                    modem radio off / on (PDNs wait while off)
+  qmictl restart-modem                      reset the modem; qmid reopens it and redials
+  qmictl bands                              allowed technologies and LTE / NR bands
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -649,8 +652,13 @@ func withDaemon(_ body: (QMIDControl, @escaping () -> Void) -> Void) {
 
 func printStatus(_ d: NSDictionary) {
     if let v = d[QMIDKey.version] { print("qmid: \(v)") }
-    print("modem: \(d["modem"] ?? "?")\(d["modemError"].map { " (\($0))" } ?? "")\(d["network"].map { ", \($0)" } ?? "")")
-    if let s = QMIDStatus(d).sim { print("sim: \(describe(s))") }
+    print("modem: \(d["modem"] ?? "?")\(d["modemError"].map { " (\($0))" } ?? "")\(d["network"].map { ", \($0)" } ?? "")\(QMIDStatus(d).airplaneMode ? ", airplane mode" : "")")
+    if let s = QMIDStatus(d).sim {
+        print("sim: \(describe(s))")
+        let ids = [s.iccid.map { "iccid \($0)" }, s.imsi.map { "imsi \($0)" }, s.msisdn.map { "msisdn \($0)" }].compactMap { $0 }
+        if !ids.isEmpty { print("  " + ids.joined(separator: ", ")) }
+    }
+    if let i = QMIDStatus(d).imei { print("imei: \(i)") }
     if let p = QMIDStatus(d).plmn { print("operator: \(describe(p))") }
     for case let p as NSDictionary in (d["pdns"] as? NSArray) ?? [] {
         var line = "\(p["name"] ?? "?"): \(p["state"] ?? "?")"
@@ -718,6 +726,8 @@ func describe(_ s: QMIDSIM) -> String {
     if let c = s.carrier { line += ", carrier \(c)\(s.matchedBy.map { " by \($0)" } ?? "")" }
     if let a = s.attachAPN { line += ", default bearer apn \(a)\(s.attachAPNFromNetwork ? " (chosen by the network)" : "")" }
     if let p = s.pendingSIM { line += ", prepared for SIM \(p)" }
+    if let c = s.card, c != .present { line += ", card \(c.rawValue)" }
+    if let p = s.pin { line += ", pin \(p.rawValue)\(s.pinRetries.map { " (\($0) tries left)" } ?? "")" }
     return line
 }
 
@@ -726,6 +736,7 @@ func describe(_ p: QMIDPLMN) -> String {
     var s = "\(p.longName ?? "-") / \(p.shortName ?? "-")\(p.nameFromNetwork ? " (network)" : "")"
     if let b = p.emergencyBearers { s += ", emergency bearers \(b ? "yes" : "no")" }
     if p.emergencyAccessBarred == true { s += ", emergency access barred" }
+    if let r = p.roaming { s += r ? ", roaming" : ", home" }
     return s
 }
 
@@ -869,6 +880,23 @@ func daemonCommand(_ args: [String]) -> Bool {
             d.radio(args.last == "-v") { dict, err in
                 guard let dict else { fail(err ?? "radio failed") }
                 printRadio(QMIDRadio(dict))
+                done()
+            }
+        }
+    case "airplane" where args.count == 2 && ["on", "off"].contains(args[1]):
+        withDaemon { d, done in d.setAirplaneMode(args[1] == "on") { reportResult($0); done() } }
+    case "restart-modem":
+        withDaemon { d, done in d.restartModem { reportResult($0); done() } }
+    case "bands":
+        withDaemon { d, done in
+            d.bandPreference { dict, err in
+                guard let dict else { fail(err ?? "bandPreference failed") }
+                let b = QMIDBandPreference(dict)
+                func list(_ l: [Int], _ p: String) -> String { l.isEmpty ? "-" : l.map { "\(p)\($0)" }.joined(separator: " ") }
+                print("modes:  \(b.modes.isEmpty ? "-" : b.modes.joined(separator: " "))")
+                print("lte:    \(list(b.lteBands, "B"))")
+                print("nr nsa: \(list(b.nrNSABands, "n"))")
+                print("nr sa:  \(list(b.nrSABands, "n"))")
                 done()
             }
         }

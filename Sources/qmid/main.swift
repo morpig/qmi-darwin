@@ -209,6 +209,18 @@ final class Control: NSObject, QMIDControl {
     func cancelSIM(_ iccid: String, reply: @escaping (String?) -> Void) {
         manager.queue.async { reply(self.manager.cancelSIM(iccid: iccid)) }
     }
+    func setAirplaneMode(_ on: Bool, reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.setAirplaneMode(on)) }
+    }
+    func restartModem(reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.restartModem()) }
+    }
+    func bandPreference(reply: @escaping (NSDictionary?, String?) -> Void) {
+        manager.queue.async {
+            let (d, err) = self.manager.bandPreference()
+            reply(d, err)
+        }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

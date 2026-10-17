@@ -433,6 +433,7 @@ public enum NAS {
         public var mcc: UInt16?
         public var mnc: UInt16?
         public var operatorName: String?
+        public var roaming: Bool?           // TLV 0x10 roaming indicator: 0 on, 1 off
 
         public var registrationName: String {
             [0: "not-registered", 1: "registered", 2: "searching", 3: "denied", 4: "unknown"][registration]
@@ -649,6 +650,36 @@ public enum NAS {
         }
         if b.count * 8 % 7 == 0, septets.last == 0 { septets.removeLast() }
         return String(septets.map { $0 == 0x1b ? "?" : table[$0] })
+    }
+
+    // Get System Selection Preference: which radio technologies and bands the modem may use
+    // (what AT+QNWPREFCFG sets on Quectel modems). Layouts from libqmi.
+    public static let getSystemSelectionPreference: UInt16 = 0x0034
+
+    public struct BandPreference: Equatable {
+        public var modes: [String] = []     // allowed technologies, TLV 0x11
+        public var lte: [Int] = []          // E-UTRA band numbers, TLV 0x23 (else 0x15)
+        public var nrNSA: [Int] = []        // NR band numbers for EN-DC, TLV 0x2D
+        public var nrSA: [Int] = []         // NR band numbers for SA, TLV 0x2C
+        public init() {}
+    }
+
+    public static func parseBandPreference(_ m: QMIMessage) -> BandPreference {
+        var p = BandPreference()
+        // Bit N of a little-endian bit field = band N + 1.
+        func bands(_ v: [UInt8]) -> [Int] {
+            (0..<v.count * 8).filter { v[$0 / 8] & (1 << ($0 % 8)) != 0 }.map { $0 + 1 }
+        }
+        if let v = m[tlv: 0x11], v.count >= 2 {
+            let mask = UInt16(v[0]) | UInt16(v[1]) << 8
+            let names: [(UInt16, String)] = [(1 << 0, "cdma1x"), (1 << 1, "evdo"), (1 << 2, "gsm"), (1 << 3, "umts"),
+                                             (1 << 4, "lte"), (1 << 5, "td-scdma"), (1 << 6, "nr")]
+            p.modes = names.filter { mask & $0.0 != 0 }.map(\.1)
+        }
+        if let v = m[tlv: 0x23], v.count == 32 { p.lte = bands(v) } else if let v = m[tlv: 0x15], v.count == 8 { p.lte = bands(v) }
+        if let v = m[tlv: 0x2D], v.count == 64 { p.nrNSA = bands(v) }
+        if let v = m[tlv: 0x2C], v.count == 64 { p.nrSA = bands(v) }
+        return p
     }
 
     // Radio information: serving cells, LTE carrier aggregation, neighbours, signal. Each
@@ -903,6 +934,7 @@ public enum NAS {
         let n = Int(try r.u8())
         let rats = try r.take(n)
         var s = ServingSystem(registration: reg, csAttached: cs == 1, psAttached: ps == 1, radioInterfaces: rats)
+        if let v = m[tlv: 0x10], let b = v.first, b <= 1 { s.roaming = b == 0 }
         if let p = m[tlv: 0x12] {
             var pr = ByteReader(p)
             s.mcc = try? pr.u16()
@@ -922,11 +954,29 @@ public enum DMS {
     public static let getRevision: UInt16 = 0x0023
     public static let uimGetICCID: UInt16 = 0x003C
     public static let setOperatingMode: UInt16 = 0x002E
+    public static let getMSISDN: UInt16 = 0x0024       // TLV 0x01: voice number, ASCII
 
     public enum OperatingMode: UInt8 {
         case online = 0
         case lowPower = 1
+        case offline = 3                                // required before reset
+        case reset = 4
     }
+
+    // Get Operating Mode: TLV 0x01, the mode (0 online, 1 low power, 2 factory test, 3 offline,
+    // 4 resetting, 5 shutting down, 6 persistent low power, 7 mode-only low power). Set Event
+    // Report TLV 0x14 = 1 reports changes in the Event Report indication (0x0001), TLV 0x14.
+    public static let getOperatingMode: UInt16 = 0x002D
+    public static let setEventReport: UInt16 = 0x0001
+    public static let eventReportIndication: UInt16 = 0x0001
+    public static let operatingModeEvents: TLV = .u8(0x14, 1)
+
+    public static func parseOperatingMode(_ m: QMIMessage) -> UInt8? {
+        m[tlv: m.messageID == eventReportIndication ? 0x14 : 0x01]?.first
+    }
+
+    // Low power in any of its forms: the radio is off.
+    public static func isLowPower(_ mode: UInt8) -> Bool { [1, 3, 6, 7].contains(mode) }
 
     public static func operatingModeRequest(_ mode: OperatingMode) -> [TLV] { [.u8(0x01, mode.rawValue)] }
 
@@ -942,6 +992,10 @@ public enum DMS {
     public static func parseIMEI(_ m: QMIMessage) -> String? {
         m[tlv: 0x11].map { String(decoding: $0, as: UTF8.self) }
     }
+
+    public static func parseMSISDN(_ m: QMIMessage) -> String? {
+        m[tlv: 0x01].map { String(decoding: $0, as: UTF8.self) }.flatMap(UIM.phoneNumber)
+    }
 }
 
 // MARK: - UIM
@@ -949,6 +1003,59 @@ public enum DMS {
 public enum UIM {
     public static let getCardStatus: UInt16 = 0x002F
     public static let readTransparent: UInt16 = 0x0020
+    public static let readRecord: UInt16 = 0x0021
+    // Register Events TLV 0x01, a 32-bit mask: bit 0 card status. The Status Change indication
+    // (0x0032) carries the same TLV 0x10 as Get Card Status.
+    public static let registerEvents: UInt16 = 0x002E
+    public static let statusChangeIndication: UInt16 = 0x0032
+    public static let cardStatusEvents = TLV(0x01, [0x01, 0x00, 0x00, 0x00])
+
+    // EF_IMSI (6F07) and EF_MSISDN (6F40, record 1) of the USIM, through the primary GW
+    // provisioning session (type 0, no AID): both readable only after PIN verification.
+    public static let readIMSIRequest: [TLV] = [
+        TLV(0x01, [0x00, 0x00]),
+        TLV(0x02, [0x07, 0x6F, 0x04, 0x00, 0x3F, 0xFF, 0x7F]),   // 6F07, path 3F00 7FFF
+        TLV(0x03, [0x00, 0x00, 0x00, 0x00]),
+    ]
+    public static let readMSISDNRequest: [TLV] = [
+        TLV(0x01, [0x00, 0x00]),
+        TLV(0x02, [0x40, 0x6F, 0x04, 0x00, 0x3F, 0xFF, 0x7F]),   // 6F40, path 3F00 7FFF
+        TLV(0x03, [0x01, 0x00, 0x00, 0x00]),                     // record 1, whole record
+    ]
+
+    // TLV 0x11: length (2 bytes), then EF_IMSI: length, then BCD, the first nibble the parity.
+    public static func parseIMSI(_ m: QMIMessage) -> String? {
+        guard let v = m[tlv: 0x11], v.count > 3 else { return nil }
+        let ef = Array(v.dropFirst(2))
+        let n = min(Int(ef[0]), ef.count - 1)
+        guard n >= 1 else { return nil }
+        var digits = [ef[1] >> 4]
+        for b in ef[2...n] { digits += [b & 0x0F, b >> 4] }
+        let s = String(digits.filter { $0 < 10 }.map { Character(String($0)) })
+        return (6...15).contains(s.count) ? s : nil
+    }
+
+    // TLV 0x11: length (2 bytes), then the EF_MSISDN record: alpha identifier, then 14 bytes:
+    // BCD length, TON/NPI, 10 bytes BCD (low nibble first, F padding), 2 bytes.
+    public static func parseMSISDN(_ m: QMIMessage) -> String? {
+        guard let v = m[tlv: 0x11], v.count >= 2 + 14 else { return nil }
+        let rec = Array(v.dropFirst(2)).suffix(14)
+        let len = Int(rec[rec.startIndex])
+        guard len >= 2, len <= 11 else { return nil }
+        let ton = rec[rec.startIndex + 1]
+        var s = ""
+        for b in rec[(rec.startIndex + 2)..<(rec.startIndex + 1 + len)] {
+            for d in [b & 0x0F, b >> 4] where d < 10 { s.append(Character(String(d))) }
+        }
+        return phoneNumber((ton & 0x70 == 0x10 ? "+" : "") + s)
+    }
+
+    // Digits with an optional leading "+", at least 3 digits; anything else: none.
+    static func phoneNumber(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
+        let digits = t.hasPrefix("+") ? t.dropFirst() : Substring(t)
+        return digits.count >= 3 && digits.allSatisfy(\.isNumber) && digits.allSatisfy(\.isASCII) ? t : nil
+    }
 
     // Read Transparent of EF_ICCID (2FE2 under the MF) on the card in slot 1.
     public static let readICCIDRequest: [TLV] = [
@@ -965,9 +1072,14 @@ public enum UIM {
     public struct Card: Equatable {
         public var state: UInt8                  // 0 absent, 1 present, 2 error
         public var applications: [(type: UInt8, state: UInt8)]
+        // PIN1 of the USIM (or SIM) application, or the universal PIN when it replaces PIN1:
+        // state 0 not initialized, 1 enabled not verified, 2 enabled verified, 3 disabled,
+        // 4 blocked (PUK needed), 5 permanently blocked.
+        public var pin: (state: UInt8, retries: UInt8, pukRetries: UInt8)?
 
         public static func == (a: Card, b: Card) -> Bool {
             a.state == b.state && a.applications.map { [$0.type, $0.state] } == b.applications.map { [$0.type, $0.state] }
+                && a.pin.map { [$0.state, $0.retries, $0.pukRetries] } == b.pin.map { [$0.state, $0.retries, $0.pukRetries] }
         }
 
         public var stateName: String { [0: "absent", 1: "present", 2: "error"][state] ?? "state \(state)" }
@@ -984,18 +1096,23 @@ public enum UIM {
         var out: [Card] = []
         for _ in 0..<cards {
             let state = try r.u8("card state")
-            _ = try r.take(4, "upin")                   // upin state, retries, puk retries, error code
+            let upin = try r.take(4, "upin")            // upin state, retries, puk retries, error code
             let apps = Int(try r.u8("apps"))
             var list: [(UInt8, UInt8)] = []
+            var pin: (state: UInt8, retries: UInt8, pukRetries: UInt8)?
             for _ in 0..<apps {
                 let type = try r.u8("app type"), appState = try r.u8("app state")
                 _ = try r.take(4, "perso")              // perso state, feature, retries, unblock retries
                 let aidLen = Int(try r.u8("aid len"))
                 _ = try r.take(aidLen, "aid")
-                _ = try r.take(7, "pins")               // upin replaces, pin1 x3, pin2 x3
+                let pins = try r.take(7, "pins")        // upin replaces, pin1 x3, pin2 x3
                 list.append((type, appState))
+                // Type 1 SIM, 2 USIM; the USIM's wins.
+                if type == 2 || (type == 1 && pin == nil) {
+                    pin = pins[0] != 0 ? (upin[0], upin[1], upin[2]) : (pins[1], pins[2], pins[3])
+                }
             }
-            out.append(Card(state: state, applications: list))
+            out.append(Card(state: state, applications: list, pin: pin))
         }
         return out
     }

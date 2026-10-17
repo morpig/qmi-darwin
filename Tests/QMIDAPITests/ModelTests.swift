@@ -288,4 +288,30 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(QMIDCell.band(.nr, channel: 660000), 77)
         XCTAssertNil(QMIDCell.band(.lte, channel: 10400))
     }
+
+    func testSIMIdentitiesCardPINAndRoaming() throws {
+        var s = QMIDSIM(mccmnc: "00101", iccidSuffix: "…1234")
+        s.iccid = "8900101000000001234"; s.imsi = "001010123456789"; s.msisdn = "+15555550100"
+        s.card = .present; s.pin = .required; s.pinRetries = 2; s.pukRetries = 10
+        let back = try XCTUnwrap(QMIDSIM(s.dictionary))
+        XCTAssertEqual(back, s)
+        XCTAssertTrue(back.isLocked)
+        // No card: a card state alone is still a SIM dictionary.
+        var absent = QMIDSIM()
+        absent.card = .absent
+        XCTAssertEqual(QMIDSIM(absent.dictionary)?.card, .absent)
+        XCTAssertEqual(QMIDSIM([QMIDKey.card: "present", QMIDKey.pin: "something-new"])?.pin, .unknown)
+        var p = QMIDPLMN(mccmnc: "00101")
+        p.roaming = true
+        XCTAssertEqual(QMIDPLMN(p.dictionary)?.roaming, true)
+        XCTAssertEqual(QMIDStatus([QMIDKey.imei: "490154203237518"]).imei, "490154203237518")
+    }
+
+    func testBandPreferenceAndAirplane() {
+        let b = QMIDBandPreference(modes: ["lte", "nr"], lteBands: [1, 3], nrNSABands: [41], nrSABands: [])
+        XCTAssertEqual(QMIDBandPreference(b.dictionary), b)
+        XCTAssertTrue(QMIDStatus([QMIDKey.airplaneMode: true]).airplaneMode)
+        XCTAssertFalse(QMIDStatus([:]).airplaneMode)
+        XCTAssertEqual(QMIDReason(rawValue: "airplane-mode"), .airplaneMode)
+    }
 }

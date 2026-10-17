@@ -51,6 +51,15 @@ public let qmidAPIVersion = 1
     // The serving and neighbour cells, read from the modem now (QMIDRadio). With raw, also
     // the TLVs it came from. Reply: the radio dictionary, or an error (no modem).
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void)
+    // Airplane mode: the modem's radio off (low power) or back on. PDNs wait while it is on
+    // (reason "airplane-mode") and come back when it ends. Lasts until turned off, or until the
+    // modem restarts or is unplugged (the modem comes back with its radio on).
+    func setAirplaneMode(_ on: Bool, reply: @escaping (String?) -> Void)
+    // Restarts the modem (offline, then reset). It goes away for 20–60 s; qmid reopens it and
+    // redials. Replies once the reset has been sent.
+    func restartModem(reply: @escaping (String?) -> Void)
+    // The modem's allowed technologies and bands (QMIDBandPreference), read now.
+    func bandPreference(reply: @escaping (NSDictionary?, String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -69,6 +78,8 @@ public enum QMIDKey {
     public static let datapath = "datapath"           // counters
     public static let sim = "sim"                     // SIM dictionary, absent until the SIM is read
     public static let plmn = "plmn"                   // PLMN dictionary, absent while not registered
+    public static let imei = "imei"                   // the modem's IMEI (XPC only)
+    public static let airplaneMode = "airplaneMode"   // Bool: the radio is off (setAirplaneMode, or AT+CFUN=4)
 
     // SIM dictionary (status() "sim" and "sim" events)
     public static let mccmnc = "mccmnc"               // home PLMN, "00101" / "001001"
@@ -78,6 +89,13 @@ public enum QMIDKey {
     public static let attachAPN = "attachAPN"         // APN of the default bearer as attached
     public static let attachAPNFromNetwork = "attachAPNFromNetwork" // Bool: the network chose it
     public static let pendingSIM = "pendingSIM"       // "…1234": prepareSIM card, until it is in or the prepare ends
+    public static let iccid = "iccid"                 // full ICCID (XPC only)
+    public static let imsi = "imsi"                   // XPC only; absent until the PIN is verified
+    public static let msisdn = "msisdn"               // own number from the SIM (XPC only); often absent
+    public static let card = "card"                   // QMIDSIM.CardState: "present" | "absent" | "error"
+    public static let pin = "pin"                     // QMIDSIM.PINState
+    public static let pinRetries = "pinRetries"
+    public static let pukRetries = "pukRetries"
 
     // PLMN dictionary (status() "plmn" and "plmn" events): the registered network
     // mccmnc                                         // registered PLMN, "00101"
@@ -86,6 +104,7 @@ public enum QMIDKey {
     public static let nameFromNetwork = "nameFromNetwork" // Bool: names sent by the network (NITZ)
     public static let emergencyBearers = "emergencyBearers"   // Bool: LTE EMC BS; absent when unknown
     public static let emergencyAccessBarred = "emergencyAccessBarred" // Bool; absent when unknown
+    public static let roaming = "roaming"             // Bool: the modem says roaming; absent when unknown
 
     // PDN dictionary (status() entries and "pdn" events)
     public static let name = "name"
@@ -159,6 +178,12 @@ public enum QMIDKey {
     public static let snr = "snr"                     // dB
     public static let active = "active"               // Bool: secondary cell activated
     public static let scellIndex = "scellIndex"       // LTE secondary cell: RRC sCellIndex
+
+    // band preference dictionary (bandPreference())
+    public static let modes = "modes"                 // [String]: "lte", "nr", "umts", "gsm", …
+    public static let lteBands = "lteBands"           // [Int]
+    public static let nrNSABands = "nrNSABands"       // [Int]: NR bands for EN-DC
+    public static let nrSABands = "nrSABands"         // [Int]: NR bands for SA
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

@@ -267,6 +267,22 @@ public final class QMIDClient: NSObject, QMIDEvents {
         }
     }
 
+    public func setAirplaneMode(_ on: Bool, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.setAirplaneMode(on) { self.finish($0, completion) }
+    }
+
+    public func restartModem(_ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.restartModem { self.finish($0, completion) }
+    }
+
+    public func bandPreference(_ completion: @escaping (Result<QMIDBandPreference, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.bandPreference { d, err in
+            self.queue.async {
+                if let d { completion(.success(QMIDBandPreference(d))) } else { completion(.failure(QMIDError(err ?? "bandPreference failed"))) }
+            }
+        }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -287,6 +303,9 @@ public extension QMIDClient {
     func prepareSIM(iccid: String, mccmnc: String?) async throws -> QMIDPreparedSIM { try await bridge { self.prepareSIM(iccid: iccid, mccmnc: mccmnc, $0) } }
     func cancelSIM(iccid: String) async throws { try await bridge { self.cancelSIM(iccid: iccid, $0) } }
     func radio(raw: Bool = false) async throws -> QMIDRadio { try await bridge { self.radio(raw: raw, $0) } }
+    func setAirplaneMode(_ on: Bool) async throws { try await bridge { self.setAirplaneMode(on, $0) } }
+    func restartModem() async throws { try await bridge { self.restartModem($0) } }
+    func bandPreference() async throws -> QMIDBandPreference { try await bridge { self.bandPreference($0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

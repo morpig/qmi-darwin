@@ -114,4 +114,63 @@ final class SIMTests: XCTestCase {
         let u = try response(.nas, NAS.getOperatorNameData, [TLV(0x10, [0, 7, 0x80, 0, 0x45, 0, 0x58, 0xff, 0xff])])
         XCTAssertEqual(NAS.parseSPN(u), "EX")
     }
+
+    func testIMSIAndMSISDN() throws {
+        // EF_IMSI 001010123456789: length 8, parity nibble 9 (odd), BCD low nibble first.
+        let imsi = try response(.uim, UIM.readTransparent, [TLV(0x11, [UInt8](hex: "09 00 08 09 10 10 10 32 54 76 98")!)])
+        XCTAssertEqual(UIM.parseIMSI(imsi), "001010123456789")
+        // EF_MSISDN record: 4-byte alpha id, BCD length 7, TON international, +15555550100.
+        let rec = try response(.uim, UIM.readRecord,
+                               [TLV(0x11, [UInt8](hex: "12 00 ff ff ff ff 07 91 51 55 55 05 01 f0 ff ff ff ff ff ff")!)])
+        XCTAssertEqual(UIM.parseMSISDN(rec), "+15555550100")
+        // An empty record (no number stored): none.
+        let empty = try response(.uim, UIM.readRecord, [TLV(0x11, [0x0E, 0x00] + [UInt8](repeating: 0xFF, count: 14))])
+        XCTAssertNil(UIM.parseMSISDN(empty))
+        XCTAssertEqual(DMS.parseMSISDN(try response(.dms, DMS.getMSISDN, [TLV(0x01, Array("15555550100".utf8))])), "15555550100")
+        XCTAssertNil(DMS.parseMSISDN(try response(.dms, DMS.getMSISDN, [TLV(0x01, [])])))
+    }
+
+    func testCardPIN() throws {
+        // One present card, USIM ready, PIN1 enabled and verified, 3 tries, PUK 10.
+        let v = [UInt8](hex: "ff ff ff ff ff ff ff ff 01  01 00 00 00 00 01  02 07 00 00 00 00 00  00 02 03 0a 01 03 0a")!
+        let card = try XCTUnwrap(UIM.parseCardStatus(response(.uim, UIM.getCardStatus, [TLV(0x10, v)])).first)
+        XCTAssertTrue(card.isReady)
+        XCTAssertEqual(card.pin?.state, 2)
+        XCTAssertEqual(card.pin?.retries, 3)
+        XCTAssertEqual(card.pin?.pukRetries, 10)
+        // Universal PIN replaces PIN1: its state counts (here PIN required, 2 tries).
+        let u = [UInt8](hex: "ff ff ff ff ff ff ff ff 01  01 01 02 0a 00 01  02 02 00 00 00 00 00  01 03 03 0a 01 03 0a")!
+        let locked = try XCTUnwrap(UIM.parseCardStatus(response(.uim, UIM.getCardStatus, [TLV(0x10, u)])).first)
+        XCTAssertFalse(locked.isReady)
+        XCTAssertEqual(locked.pin?.state, 1)
+        XCTAssertEqual(locked.pin?.retries, 2)
+    }
+
+    func testRoamingIndicator() throws {
+        func serving(_ roam: UInt8?) throws -> NAS.ServingSystem {
+            try NAS.parseServingSystem(response(.nas, NAS.getServingSystem,
+                [TLV(0x01, [1, 1, 1, 2, 1, 8])] + (roam.map { [TLV(0x10, [$0])] } ?? [])))
+        }
+        XCTAssertEqual(try serving(0).roaming, true)
+        XCTAssertEqual(try serving(1).roaming, false)
+        XCTAssertNil(try serving(nil).roaming)
+        XCTAssertNil(try serving(2).roaming)
+    }
+
+    func testBandPreferenceAndOperatingMode() throws {
+        // Modes LTE + NR (bits 4, 6); LTE B1 B3 B40 (extended, 4 x u64); NR NSA n41 n78; no SA TLV.
+        var lte = [UInt8](repeating: 0, count: 32); lte[0] = 0b101; lte[4] = 0x80           // bits 0, 2, 39
+        var nsa = [UInt8](repeating: 0, count: 64); nsa[5] = 0x01; nsa[9] = 0x20            // bits 40, 77
+        let r = try response(.nas, NAS.getSystemSelectionPreference,
+                             [TLV(0x11, [0x50, 0x00]), TLV(0x23, lte), TLV(0x2D, nsa)])
+        let p = NAS.parseBandPreference(r)
+        XCTAssertEqual(p.modes, ["lte", "nr"])
+        XCTAssertEqual(p.lte, [1, 3, 40])
+        XCTAssertEqual(p.nrNSA, [41, 78])
+        XCTAssertEqual(p.nrSA, [])
+        XCTAssertEqual(DMS.parseOperatingMode(try response(.dms, DMS.getOperatingMode, [TLV(0x01, [1])])), 1)
+        XCTAssertTrue(DMS.isLowPower(1))
+        XCTAssertTrue(DMS.isLowPower(6))
+        XCTAssertFalse(DMS.isLowPower(0))
+    }
 }

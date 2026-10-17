@@ -84,7 +84,7 @@ qmid.subscribe()                         // current state arrives immediately as
   and a fresh snapshot (one `.modem`, one `onSIM` and one `onPLMN` call, one `.pdn` per PDN, and one `onBearers` call per connected PDN)
   arrives each time.
 - Treat events as **full state, not deltas**: each `.pdn` event carries the whole PDN.
-- `status()` returns the same data on demand (plus datapath counters) if you need a pull.
+- `status()` returns the same data on demand (plus datapath counters and the modem's `imei`) if you need a pull.
 - Every call has a completion-handler form and an `async throws` form:
 
 ```swift
@@ -111,6 +111,9 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `prepareSIM(iccid:mccmnc:)` | before a SIM switch: attach profile for that card, no re-attach (see "Switching SIMs") | until the card is in, `cancelSIM`, the connection closes, or 10 s |
 | `cancelSIM(iccid:)` | the switch failed: attach profile back to the current card | – |
 | `radio(raw:)` | serving and neighbour cells, read from the modem now (see "Cells and signal") | – |
+| `setAirplaneMode(_:)` | the modem's radio off / on (see "Airplane mode and restart") | until turned off, or the modem restarts or is unplugged |
+| `restartModem` | resets the modem; qmid reopens it and redials (about a minute) | – |
+| `bandPreference` | the allowed technologies and LTE / NR bands (`QMIDBandPreference`), read now | – |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -154,7 +157,7 @@ APN re-attaches, which drops every PDN briefly.
 | `wanted` | `false` after `disconnect`, and for a one-shot PDN whenever it is down |
 | `uptime` | seconds connected (only in `status`, not in events) |
 | `error` | last failure as the cause code with its official name: `3GPP #33: Requested service option not subscribed` (TS 24.301), `internal #210: PDN IPv6 call disallowed` / `CM #2001: no service` (the modem's own names), or `call end reason N: …` without a verbose cause; a code without a known name is shown as the number only. Per family (`ipv4: …; ipv6: …`) unless every family failed alike |
-| `reason` | `error` as a word (`QMIDReason`): `notAttached`, `noProfile`, `rejected` (the network or modem ended the call, see `causes`), `failed` (no cause, e.g. a timeout), `dropped` (went down after connecting), `maxUptime`, `modemLost`; `nil` without an error or for a reason this client doesn't know |
+| `reason` | `error` as a word (`QMIDReason`): `notAttached`, `noProfile`, `rejected` (the network or modem ended the call, see `causes`), `failed` (no cause, e.g. a timeout), `dropped` (went down after connecting), `maxUptime`, `modemLost`, `airplaneMode` (waiting while the radio is off); `nil` without an error or for a reason this client doesn't know |
 | `causes` | `error`'s call end causes, one per family (`QMIDCause`: `family` 4/6, `type` `"3GPP"` / `"internal"` / `"CM"` / … / `"call end reason"`, `code`, `name`); `is3GPP` for TS 24.301 ESM causes. `[]` when there are none |
 | `blocked` | per-family rejections qmid won't retry, e.g. `["ipv6: 3GPP #50: PDN type IPv4 only allowed"]`. A 3GPP rejection of the APN itself (#8, #27, #29, #32, #33) blocks every family. Cleared by `connect`, `reload`, re-registration or a different SIM. Never set on a one-shot PDN |
 | `qci` | QoS class of the PDN's default bearer while connected, e.g. `6` for internet, `5` for IMS |
@@ -192,6 +195,16 @@ followed by the internet PDN reconnecting.
 | `attachAPN` | APN of the default bearer as the modem attached (`nil` until attached) |
 | `attachAPNFromNetwork` | `true` when the network chose `attachAPN` (the attach profile had an empty APN) |
 | `pendingSIM` | `"…1234"` while a `prepareSIM` card isn't in yet; `nil` otherwise |
+| `card` | `.present`, `.absent`, `.error`. With no card in the modem, `sim` carries only this |
+| `pin` | PIN1 of the USIM (or the universal PIN): `.disabled`, `.verified`, `.required`, `.pukRequired`, `.blocked`; `isLocked` is true for the last three |
+| `pinRetries`, `pukRetries` | tries left |
+| `iccid` | full ICCID |
+| `imsi` | read once the PIN is verified; `nil` before |
+| `msisdn` | own number as stored on the SIM; many SIMs have none |
+
+`iccid`, `imsi`, `msisdn` and the status's `imei` are in XPC replies and events only, never in
+SCDynamicStore, which any local user can read. Card and PIN changes arrive as `onSIM` calls
+(qmid listens for the UIM card status indication).
 
 Suggested UI: show the carrier name (or the MCC/MNC when `carrier` is `nil`) and the
 `attachAPN`. When `carrier` is `nil` and `attachAPNFromNetwork` is `true`, the SIM runs on the
@@ -253,6 +266,7 @@ not registered. Unlike `QMIDSIM.mccmnc` (the SIM's home network), this changes w
 | `displayName` | `longName`, else `shortName`; `nil` when there is neither |
 | `emergencyBearers` | LTE: whether the network supports emergency bearers (EMC BS in the Attach/TAU Accept, TS 24.301). A UE shouldn't request an emergency PDN when it is `false`. `nil` when the modem doesn't say (not registered, not LTE). Networks differ: some `true`, many `false` |
 | `emergencyAccessBarred` | LTE: emergency access is barred on the cell; `nil` when unknown |
+| `roaming` | the modem's roaming indicator; `nil` when it doesn't say |
 
 - Each name comes from the first source that has it:
   1. the network (NITZ),
@@ -345,6 +359,29 @@ Neighbours are LTE only: QMI has no NR neighbour list. On Quectel modems the AT 
 qmid leaves free) has one: with `AT+QNWCFG="nr5g_meas_info",1` set, reading
 `AT+QNWCFG="nr5g_meas_info"` lists the measured NR cells as NR-ARFCN, PCI, RSRP, RSRQ, the
 serving NR cell included. Entries with an implausible RSRP (e.g. −155 dBm) are placeholders.
+
+## Airplane mode and restart
+
+```swift
+try await qmid.setAirplaneMode(true)     // radio off: PDNs go waiting, reason .airplaneMode
+try await qmid.setAirplaneMode(false)    // radio on: the modem attaches, PDNs redial (a few seconds)
+let s = try await qmid.status()
+s.airplaneMode                           // also true after someone's AT+CFUN=4
+try await qmid.restartModem()            // the modem resets: modem "absent", then back in about a minute
+```
+
+- Airplane mode is the modem's low-power mode. It isn't kept across a modem restart or
+  unplug (the modem comes back with its radio on), but it is across a qmid restart.
+- qmid follows the modem's operating mode, so `AT+CFUN=4` / `=1` from another tool turns
+  `airplaneMode` on and off too. While it is on, an attach APN change waits for the radio.
+- `restartModem` replies once the reset is sent; the modem then goes away (`.modem` event
+  "absent") and comes back (re-enumeration takes about 30 s, its QMI stack another 20 s).
+
+## Band preference (`QMIDBandPreference`)
+
+`bandPreference()` reads what the modem may use: `modes` (`"lte"`, `"nr"`, …), `lteBands`,
+`nrNSABands` (NR bands for EN-DC) and `nrSABands`, as band numbers. It is the same setting
+as Quectel's `AT+QNWPREFCFG`. Read only for now.
 
 ## Dedicated bearers and QoS
 
@@ -570,8 +607,8 @@ qmid mirrors its state into SCDynamicStore, readable by any process (e.g. for a 
 quick check with `scutil`):
 
 - `State:/Network/QMI/Modem` (keys `State`, `Network`, `VendorID`, `ProductID`, `Interface`,
-  `LastError`, `SIM`: a dictionary with the `QMIDSIM` keys above, and `PLMN`: one with the
-  `QMIDPLMN` keys)
+  `LastError`, `AirplaneMode` (present while on), `SIM`: a dictionary with the `QMIDSIM` keys
+  above except `iccid`, `imsi` and `msisdn`, and `PLMN`: one with the `QMIDPLMN` keys)
 - `State:/Network/QMI/PDN/<name>` (keys `ServiceID`, `InterfaceName`, `MuxID`, `State`,
   `Policy`, `Profile`, `APN`, `MTU`, `IPv4Address`, `IPv6Address`, `PCSCFv4`, `PCSCFv6`)
 
@@ -622,6 +659,14 @@ the attempt has ended and dials run in parallel; `QMIDPLMN.emergencyBearers` and
 Added in qmid 0.11 (API still 1): `prepareSIM` / `cancelSIM` (`QMIDPreparedSIM`) and
 `QMIDSIM.pendingSIM`. Against an older qmid the calls get no reply; time them out.
 
+Added in qmid 0.13 (API still 1): `radio` (`QMIDRadio`, `QMIDCell`).
+
+Added in qmid 0.14 (API still 1): `QMIDSIM` `iccid`, `imsi`, `msisdn`, `card`, `pin`,
+`pinRetries`, `pukRetries`; `QMIDPLMN.roaming`; `QMIDStatus.imei`.
+
+Added in qmid 0.15 (API still 1): `setAirplaneMode`, `restartModem`, `bandPreference`
+(`QMIDBandPreference`), `QMIDStatus.airplaneMode`, `QMIDReason.airplaneMode`.
+
 ## Testing from the command line
 
 `qmictl` uses the same client:
@@ -637,4 +682,7 @@ qmictl config get > qmid.json && qmictl config set qmid.json
 qmictl prepare-sim 8901234567890123456 00101   # held until Ctrl-C; switch meanwhile
 qmictl cancel-sim 8901234567890123456
 qmictl radio [-v]                   # serving cells, carrier aggregation, neighbours; -v: raw TLVs
+qmictl airplane on|off              # modem radio off / on
+qmictl restart-modem                # reset the modem
+qmictl bands                        # allowed technologies and bands
 ```
