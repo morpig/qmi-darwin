@@ -58,6 +58,18 @@ final class RadioTests: XCTestCase {
         XCTAssertEqual(info.cells.first?.bandwidthMHz, 60)
     }
 
+    // NR5G Cell Information (0x2F): PLMN 001-01, TAC 0x000102 (most significant byte first),
+    // NCI 0x123456789, PCI 185.
+    func testNRCellInformation() throws {
+        let loc = try response(NAS.getCellLocationInfo, [
+            (0x2F, "00 f1 10 00 01 02 89 67 45 23 01 00 00 00 b9 00 92 ff 2e fc 9b 00"),
+        ])
+        let nr = try XCTUnwrap(NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil).cells.first)
+        XCTAssertEqual(nr.tac, 0x000102)
+        XCTAssertEqual(nr.cellID, 0x123456789)
+        XCTAssertEqual(nr.pci, 185)
+    }
+
     func testNothingReported() {
         XCTAssertEqual(NAS.radioCells(sysInfo: nil, cellLocation: nil, signal: nil, rfBand: nil, ca: nil), NAS.RadioInfo())
     }

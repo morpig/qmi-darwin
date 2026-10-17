@@ -221,6 +221,14 @@ final class Control: NSObject, QMIDControl {
             reply(d, err)
         }
     }
+    func setBandPreference(_ bands: NSDictionary, persistent: Bool, reply: @escaping (String?) -> Void) {
+        let lte = bands[QMIDKey.lteBands] as? [Int], nsa = bands[QMIDKey.nrNSABands] as? [Int]
+        let sa = bands[QMIDKey.nrSABands] as? [Int]
+        manager.queue.async { reply(self.manager.setBandPreference(lte: lte, nrNSA: nsa, nrSA: sa, persistent: persistent)) }
+    }
+    func resetBandPreference(persistent: Bool, reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.resetBandPreference(persistent: persistent)) }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

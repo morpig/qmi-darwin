@@ -18,8 +18,11 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
   rejects with the 3GPP cause, and backoff.
 - Exposes QoS: the QCI and APN-AMBR of each PDN, plus the dedicated bearers with their
   packet filters.
-- Reports the radio: LTE serving cell and carrier aggregation, the NR leg, neighbours and
-  signal (`qmictl radio`).
+- Reports the radio: PCell, LTE SCells (active or configured), the NR PSCell with its
+  bandwidth, LTE neighbours and signal (`qmictl radio`).
+- SIM and modem details: card and PIN state, ICCID, IMSI, MSISDN, IMEI and roaming.
+- Modem control: airplane mode, modem restart, and the allowed LTE / NR bands (read,
+  restrict, reset).
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works
@@ -78,7 +81,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 6. **Lifecycle.** Calls that drop are redialled with backoff. Permanent 3GPP rejects block
    that IP family until something changes, such as a config reload, a SIM change or
    re-registration. After a modem reset, unplug or wake, qmid reopens the device and
-   reconnects.
+   reconnects. A modem that enumerates twice after a reset (for example USB 2 first, then
+   USB 3) gets its open restarted on the new interface rather than timed out on the old one.
 
 ## Requirements
 
@@ -163,7 +167,15 @@ scutil --nwi                              # what macOS made of it
 ## Usage
 
 ```
-qmictl status                               PDNs, addresses, counters
+qmictl status                               everything read-only: modem, SIM, IMEI, operator,
+                                            PDNs, cells (pcell / scell / pscell), bands
+qmictl radio [-v]                           cells only; -v adds the modem's raw TLVs
+qmictl airplane on|off                      modem radio off / on
+qmictl restart-modem                        reset the modem; qmid reopens it
+qmictl bands                                allowed and supported LTE / NR bands
+qmictl bands set lte 1,3 nsa 41 sa 41       restrict bands (until the modem restarts;
+                                            --persistent to store); others unchanged
+qmictl bands reset                          back to the setting before qmid changed it
 qmictl connect NAME | disconnect NAME
 qmictl policy NAME prefer-wifi|prefer-cellular|last-resort|never
 qmictl events                               stream qmid's events
@@ -173,11 +185,11 @@ qmictl sync                                 APN sync report: PDN ↔ modem profi
 qmictl reload | restart
 ```
 
-With qmid stopped, `qmictl probe | modem-status | profiles | plmn-name | profile-write | run`
+With qmid stopped, `qmictl probe | modem-status | profiles | plmn-name | nas-survey | profile-write | run`
 talk to the modem directly, for development. Run `qmictl --help` to see all options.
 
 Client apps use the `QMIDAPI` library (XPC: status, events, connect/disconnect, policy,
-config, logs). Apps that only need to read state can watch the SCDynamicStore keys instead.
+config, logs, radio, airplane mode, restart, bands). Apps that only need to read state can watch the SCDynamicStore keys instead.
 Both are described in [docs/API.md](docs/API.md).
 
 ## Development

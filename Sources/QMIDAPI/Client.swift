@@ -283,6 +283,20 @@ public final class QMIDClient: NSObject, QMIDEvents {
         }
     }
 
+    // nil lists stay as they are.
+    public func setBandPreference(lte: [Int]? = nil, nrNSA: [Int]? = nil, nrSA: [Int]? = nil, persistent: Bool = false,
+                                  _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        var d: [String: Any] = [:]
+        d[QMIDKey.lteBands] = lte
+        d[QMIDKey.nrNSABands] = nrNSA
+        d[QMIDKey.nrSABands] = nrSA
+        proxy { completion(.failure($0)) }?.setBandPreference(d as NSDictionary, persistent: persistent) { self.finish($0, completion) }
+    }
+
+    public func resetBandPreference(persistent: Bool = false, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.resetBandPreference(persistent: persistent) { self.finish($0, completion) }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -306,6 +320,10 @@ public extension QMIDClient {
     func setAirplaneMode(_ on: Bool) async throws { try await bridge { self.setAirplaneMode(on, $0) } }
     func restartModem() async throws { try await bridge { self.restartModem($0) } }
     func bandPreference() async throws -> QMIDBandPreference { try await bridge { self.bandPreference($0) } }
+    func setBandPreference(lte: [Int]? = nil, nrNSA: [Int]? = nil, nrSA: [Int]? = nil, persistent: Bool = false) async throws {
+        try await bridge { self.setBandPreference(lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent, $0) }
+    }
+    func resetBandPreference(persistent: Bool = false) async throws { try await bridge { self.resetBandPreference(persistent: persistent, $0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

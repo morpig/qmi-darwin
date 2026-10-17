@@ -27,6 +27,10 @@ usage (through qmid):
   qmictl airplane on|off                    modem radio off / on (PDNs wait while off)
   qmictl restart-modem                      reset the modem; qmid reopens it and redials
   qmictl bands                              allowed technologies and LTE / NR bands
+  qmictl bands set [lte 1,3] [nsa 41] [sa 41] [--persistent]
+                                            restrict bands (others unchanged); until the modem
+                                            restarts unless --persistent
+  qmictl bands reset [--persistent]         every supported band allowed again
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -828,7 +832,19 @@ func daemonCommand(_ args: [String]) -> Bool {
     }
     switch args.first {
     case "status":
-        withDaemon { d, done in d.status { printStatus($0); done() } }
+        // Everything read-only: state, then the cells, then the band preference.
+        withDaemon { d, done in
+            d.status { s in
+                printStatus(s)
+                d.radio(false) { r, _ in
+                    if let r { printRadio(QMIDRadio(r)) }
+                    d.bandPreference { b, _ in
+                        if let b { printBands(QMIDBandPreference(b)) }
+                        done()
+                    }
+                }
+            }
+        }
     case "connect" where args.count == 2:
         withDaemon { d, done in d.connect(args[1]) { reportResult($0); done() } }
     case "disconnect" where args.count == 2:
@@ -887,16 +903,36 @@ func daemonCommand(_ args: [String]) -> Bool {
         withDaemon { d, done in d.setAirplaneMode(args[1] == "on") { reportResult($0); done() } }
     case "restart-modem":
         withDaemon { d, done in d.restartModem { reportResult($0); done() } }
+    case "bands" where args.count >= 2 && args[1] == "set":
+        var lte: [Int]?, nsa: [Int]?, sa: [Int]?
+        var i = 2
+        while i < args.count {
+            if args[i] == "--persistent" { i += 1; continue }
+            guard i + 1 < args.count else { fail("bands set: \(args[i]) needs a list, e.g. 1,3") }
+            let list = args[i + 1].split(separator: ",").compactMap { Int($0) }
+            switch args[i] {
+            case "lte": lte = list
+            case "nsa": nsa = list
+            case "sa": sa = list
+            default: fail("bands set: unknown \(args[i]) (lte, nsa, sa)")
+            }
+            i += 2
+        }
+        let persistent = args.contains("--persistent")
+        withDaemon { d, done in
+            var b: [String: Any] = [:]
+            b[QMIDKey.lteBands] = lte
+            b[QMIDKey.nrNSABands] = nsa
+            b[QMIDKey.nrSABands] = sa
+            d.setBandPreference(b as NSDictionary, persistent: persistent) { reportResult($0); done() }
+        }
+    case "bands" where args.count >= 2 && args[1] == "reset":
+        withDaemon { d, done in d.resetBandPreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
     case "bands":
         withDaemon { d, done in
             d.bandPreference { dict, err in
                 guard let dict else { fail(err ?? "bandPreference failed") }
-                let b = QMIDBandPreference(dict)
-                func list(_ l: [Int], _ p: String) -> String { l.isEmpty ? "-" : l.map { "\(p)\($0)" }.joined(separator: " ") }
-                print("modes:  \(b.modes.isEmpty ? "-" : b.modes.joined(separator: " "))")
-                print("lte:    \(list(b.lteBands, "B"))")
-                print("nr nsa: \(list(b.nrNSABands, "n"))")
-                print("nr sa:  \(list(b.nrSABands, "n"))")
+                printBands(QMIDBandPreference(dict))
                 done()
             }
         }
@@ -908,11 +944,31 @@ func daemonCommand(_ args: [String]) -> Bool {
     return true
 }
 
+func printBands(_ b: QMIDBandPreference) {
+    func list(_ l: [Int], _ p: String) -> String { l.isEmpty ? "-" : l.map { "\(p)\($0)" }.joined(separator: " ") }
+    print("allowed modes: \(b.modes.isEmpty ? "-" : b.modes.joined(separator: " "))")
+    print("allowed lte:    \(list(b.lteBands, "B"))")
+    print("allowed nr nsa: \(list(b.nrNSABands, "n"))")
+    print("allowed nr sa:  \(list(b.nrSABands, "n"))")
+    if !b.supportedLTEBands.isEmpty { print("supported lte:  \(list(b.supportedLTEBands, "B"))") }
+    if !b.supportedNRBands.isEmpty { print("supported nr:   \(list(b.supportedNRBands, "n"))") }
+}
+
+// PCell, SCell n (LTE carrier aggregation), PSCell (the NR leg of EN-DC; the PCell on SA).
+func cellRole(_ c: QMIDCell) -> String {
+    switch (c.rat, c.role) {
+    case (_, .primary): return "pcell"
+    case (.lte, .secondary): return "scell\(c.scellIndex.map { " \($0)" } ?? "")"
+    case (.nr, .secondary): return "pscell"
+    case (_, .neighbor): return "neighbour"
+    }
+}
+
 func printRadio(_ r: QMIDRadio) {
     func f(_ v: Double?, _ unit: String = "") -> String? { v.map { String(format: $0 == $0.rounded() ? "%.0f" : "%.1f", $0) + unit } }
     func line(_ c: QMIDCell) -> String {
         var parts: [String] = [c.rat.rawValue.padding(toLength: 4, withPad: " ", startingAt: 0)
-                               + c.role.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)]
+                               + cellRole(c).padding(toLength: 10, withPad: " ", startingAt: 0)]
         parts.append(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "band ?")
         if let ch = c.channel { parts.append("\(c.rat == .lte ? "earfcn" : "arfcn") \(ch)") }
         if let bw = f(c.bandwidth, " MHz") { parts.append(bw) }
@@ -922,14 +978,20 @@ func printRadio(_ r: QMIDRadio) {
                                        : String(format: "cell %llu", id))
         }
         if let t = c.tac { parts.append("tac \(t)") }
-        if let i = c.scellIndex { parts.append("scell \(i)") }
         if let a = c.active { parts.append(a ? "active" : "configured") }
         for (name, v, unit) in [("rsrp", c.rsrp, " dBm"), ("rsrq", c.rsrq, " dB"), ("rssi", c.rssi, " dBm"), ("snr", c.snr, " dB")] {
             if let s = f(v, unit) { parts.append("\(name) \(s)") }
         }
         return parts.joined(separator: "  ")
     }
-    if let e = r.endcAvailable { print("en-dc: \(e ? "available" : "not available") on the LTE cell") }
+    // Summary: "pcell B3 + scell B1 (configured) + pscell n41, 3 neighbours".
+    func name(_ c: QMIDCell) -> String {
+        "\(cellRole(c).split(separator: " ").first ?? "") \(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "?")"
+            + (c.active.map { $0 ? "" : " (configured)" } ?? "")
+    }
+    print("cells: " + (r.serving.isEmpty ? "none" : r.serving.map(name).joined(separator: " + "))
+          + ", \(r.neighbors.count) neighbours"
+          + (r.endcAvailable == true && !r.serving.contains { $0.rat == .nr } ? ", en-dc available" : ""))
     r.serving.forEach { print(line($0)) }
     if !r.neighbors.isEmpty {
         print("neighbours:")

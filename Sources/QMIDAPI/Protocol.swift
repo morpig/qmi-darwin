@@ -60,6 +60,14 @@ public let qmidAPIVersion = 1
     func restartModem(reply: @escaping (String?) -> Void)
     // The modem's allowed technologies and bands (QMIDBandPreference), read now.
     func bandPreference(reply: @escaping (NSDictionary?, String?) -> Void)
+    // Restricts the bands the modem may use: `bands` holds lteBands / nrNSABands / nrSABands
+    // ([Int]); a list left out stays as it is. Each must be non-empty and supported. Not
+    // persistent: until the modem restarts. Persistent: kept across restarts (like
+    // AT+QNWPREFCFG). The modem re-registers if its current band is excluded.
+    func setBandPreference(_ bands: NSDictionary, persistent: Bool, reply: @escaping (String?) -> Void)
+    // Back to the setting qmid found before its first setBandPreference (kept across qmid
+    // restarts); every supported band when qmid has changed nothing.
+    func resetBandPreference(persistent: Bool, reply: @escaping (String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -184,6 +192,8 @@ public enum QMIDKey {
     public static let lteBands = "lteBands"           // [Int]
     public static let nrNSABands = "nrNSABands"       // [Int]: NR bands for EN-DC
     public static let nrSABands = "nrSABands"         // [Int]: NR bands for SA
+    public static let supportedLTEBands = "supportedLTEBands" // [Int]: what the modem can use
+    public static let supportedNRBands = "supportedNRBands"   // [Int]
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

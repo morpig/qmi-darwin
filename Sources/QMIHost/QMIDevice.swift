@@ -5,6 +5,7 @@ import QMIKit
 public enum QMIHostError: Error, CustomStringConvertible {
     case open(String)
     case notFound(String)                   // no modem interface to open: the modem is away
+    case cancelled                          // the interface went away while it was being opened
     case transport(String)
     case timeout(QMIService, UInt16)
     case protocolError(QMIProtocolError, QMIMessage)
@@ -12,6 +13,7 @@ public enum QMIHostError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .open(let s), .notFound(let s): return "open: \(s)"
+        case .cancelled: return "open: the interface went away while opening (the modem re-enumerated)"
         case .transport(let s): return "transport: \(s)"
         case .timeout(let svc, let msg): return "timeout waiting for \(svc) 0x\(String(format: "%04x", msg))"
         case .protocolError(let e, let m): return "\(m.service) 0x\(String(format: "%04x", m.messageID)): \(e)"
@@ -26,6 +28,7 @@ public enum QMIHostError: Error, CustomStringConvertible {
     // The modem isn't there to open (unplugged, or re-enumerating).
     public var isModemAway: Bool {
         if case .notFound = self { return true }
+        if case .cancelled = self { return true }
         return false
     }
 }
@@ -164,6 +167,13 @@ public final class QMIDevice {
         return resp
     }
 
+    // cancel(): ends a sync() wait at its next 2 s step, when the interface being opened has
+    // gone away (the modem enumerates twice after a reset, and the first set vanishes).
+    private let cancelLock = NSLock()
+    private var cancelled = false
+    public func cancel() { cancelLock.lock(); cancelled = true; cancelLock.unlock() }
+    public var isCancelled: Bool { cancelLock.lock(); defer { cancelLock.unlock() }; return cancelled }
+
     // Set when the modem announces its QMI stack with a CTL Sync indication (it does so when
     // the firmware finishes booting after a reset or replug).
     public private(set) var syncIndicationAt: Date?
@@ -175,6 +185,7 @@ public final class QMIDevice {
         let deadline = Date().addingTimeInterval(within)
         var last: Error?
         repeat {
+            if isCancelled { throw QMIHostError.cancelled }
             let attempt = Date()
             do {
                 try send(.ctl, client: 0, message: CTL.sync, timeout: 2)

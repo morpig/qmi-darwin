@@ -114,6 +114,8 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `setAirplaneMode(_:)` | the modem's radio off / on (see "Airplane mode and restart") | until turned off, or the modem restarts or is unplugged |
 | `restartModem` | resets the modem; qmid reopens it and redials (about a minute) | – |
 | `bandPreference` | the allowed technologies and LTE / NR bands (`QMIDBandPreference`), read now | – |
+| `setBandPreference(lte:nrNSA:nrSA:persistent:)` | restricts the bands (see "Band preference") | until the modem restarts, unless `persistent` |
+| `resetBandPreference(persistent:)` | back to the setting before qmid's first change | as above |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -381,7 +383,22 @@ try await qmid.restartModem()            // the modem resets: modem "absent", th
 
 `bandPreference()` reads what the modem may use: `modes` (`"lte"`, `"nr"`, …), `lteBands`,
 `nrNSABands` (NR bands for EN-DC) and `nrSABands`, as band numbers. It is the same setting
-as Quectel's `AT+QNWPREFCFG`. Read only for now.
+as Quectel's `AT+QNWPREFCFG`; `supportedLTEBands` / `supportedNRBands` are what the modem can
+use at all.
+
+```swift
+try await qmid.setBandPreference(lte: [1, 3], nrNSA: [41])   // SA left as it is; until restart
+try await qmid.resetBandPreference()                        // back to the setting before
+```
+
+- A list left out (`nil`) stays as it is. An empty list, or a band outside the supported
+  ones, is refused before anything is sent.
+- Not persistent by default: the modem's stored setting comes back when it restarts.
+  `persistent: true` stores it, like `AT+QNWPREFCFG`.
+- If the modem's current band is excluded it re-registers, and PDNs redial.
+- `resetBandPreference` writes back the setting qmid read before its first change (kept
+  across qmid restarts), as it was: the modem's own default may include bands it doesn't
+  report as supported. With no saved setting, it allows every supported band.
 
 ## Dedicated bearers and QoS
 
@@ -667,12 +684,15 @@ Added in qmid 0.14 (API still 1): `QMIDSIM` `iccid`, `imsi`, `msisdn`, `card`, `
 Added in qmid 0.15 (API still 1): `setAirplaneMode`, `restartModem`, `bandPreference`
 (`QMIDBandPreference`), `QMIDStatus.airplaneMode`, `QMIDReason.airplaneMode`.
 
+Added in qmid 0.16 (API still 1): `setBandPreference`, `resetBandPreference`,
+`QMIDBandPreference.supportedLTEBands` / `supportedNRBands`.
+
 ## Testing from the command line
 
 `qmictl` uses the same client:
 
 ```
-qmictl status                       # includes the sim and operator lines
+qmictl status                       # everything read-only: sim, imei, operator, PDNs, cells, bands
 qmictl sync                         # APN sync, SIM match, default bearer APNs seen per MCC/MNC
 qmictl events                       # live events
 qmictl log [--level debug]          # qmid's log over XPC: recent lines, then live
@@ -685,4 +705,6 @@ qmictl radio [-v]                   # serving cells, carrier aggregation, neighb
 qmictl airplane on|off              # modem radio off / on
 qmictl restart-modem                # reset the modem
 qmictl bands                        # allowed technologies and bands
+qmictl bands set lte 1,3 nsa 41     # restrict (until the modem restarts; --persistent to store)
+qmictl bands reset                  # back to the setting before
 ```

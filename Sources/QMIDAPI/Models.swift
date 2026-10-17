@@ -705,12 +705,17 @@ public struct QMIDBandPreference: Equatable {
     public var lteBands: [Int]            // 1, 3, 40, …
     public var nrNSABands: [Int]          // NR bands allowed for EN-DC: 41, 78, …
     public var nrSABands: [Int]           // NR bands allowed for SA
+    public var supportedLTEBands: [Int]   // the bands the modem can use at all
+    public var supportedNRBands: [Int]
 
-    public init(modes: [String] = [], lteBands: [Int] = [], nrNSABands: [Int] = [], nrSABands: [Int] = []) {
+    public init(modes: [String] = [], lteBands: [Int] = [], nrNSABands: [Int] = [], nrSABands: [Int] = [],
+                supportedLTEBands: [Int] = [], supportedNRBands: [Int] = []) {
         self.modes = modes
         self.lteBands = lteBands
         self.nrNSABands = nrNSABands
         self.nrSABands = nrSABands
+        self.supportedLTEBands = supportedLTEBands
+        self.supportedNRBands = supportedNRBands
     }
 
     public init(_ d: NSDictionary) {
@@ -718,9 +723,12 @@ public struct QMIDBandPreference: Equatable {
         lteBands = d[QMIDKey.lteBands] as? [Int] ?? []
         nrNSABands = d[QMIDKey.nrNSABands] as? [Int] ?? []
         nrSABands = d[QMIDKey.nrSABands] as? [Int] ?? []
+        supportedLTEBands = d[QMIDKey.supportedLTEBands] as? [Int] ?? []
+        supportedNRBands = d[QMIDKey.supportedNRBands] as? [Int] ?? []
     }
 
     public var dictionary: NSDictionary {
-        [QMIDKey.modes: modes, QMIDKey.lteBands: lteBands, QMIDKey.nrNSABands: nrNSABands, QMIDKey.nrSABands: nrSABands]
+        [QMIDKey.modes: modes, QMIDKey.lteBands: lteBands, QMIDKey.nrNSABands: nrNSABands, QMIDKey.nrSABands: nrSABands,
+         QMIDKey.supportedLTEBands: supportedLTEBands, QMIDKey.supportedNRBands: supportedNRBands]
     }
 }

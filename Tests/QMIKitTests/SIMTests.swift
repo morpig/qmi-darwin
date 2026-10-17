@@ -173,4 +173,19 @@ final class SIMTests: XCTestCase {
         XCTAssertTrue(DMS.isLowPower(6))
         XCTAssertFalse(DMS.isLowPower(0))
     }
+
+    func testBandPreferenceRequest() throws {
+        let t = Dictionary(uniqueKeysWithValues: NAS.bandPreferenceRequest(lte: [1, 3], nrNSA: [40, 41], nrSA: nil, persistent: false)
+            .map { ($0.type, $0.value) })
+        XCTAssertEqual(t[0x24]?.count, 32)
+        XCTAssertEqual(t[0x24]?[0], 0b101)                       // B1, B3
+        XCTAssertEqual(t[0x30]?.count, 64)
+        XCTAssertEqual(t[0x30]?[4], 0x80)                        // n40 = bit 39
+        XCTAssertEqual(t[0x30]?[5], 0x01)                        // n41 = bit 40
+        XCTAssertNil(t[0x2F])                                    // SA left as it is
+        XCTAssertEqual(t[0x17], [0])                             // until power cycle
+        let caps = try response(.dms, DMS.getBandCapabilities, [TLV(0x12, [2, 0, 1, 0, 3, 0]), TLV(0x13, [1, 0, 41, 0])])
+        XCTAssertEqual(DMS.parseBandCapabilities(caps).lte, [1, 3])
+        XCTAssertEqual(DMS.parseBandCapabilities(caps).nr, [41])
+    }
 }

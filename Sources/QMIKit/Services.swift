@@ -664,6 +664,26 @@ public enum NAS {
         public init() {}
     }
 
+    // Set System Selection Preference: TLVs 0x24 (LTE, 256 bits), 0x30 (NR NSA, 512 bits),
+    // 0x2F (NR SA, 512 bits) — not the Get message's numbers — and 0x17, the duration (0 until
+    // the next power cycle, 1 permanent). A nil list is left out, so the modem keeps it.
+    public static let setSystemSelectionPreference: UInt16 = 0x0033
+
+    public static func bandPreferenceRequest(lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> [TLV] {
+        // Band N = bit N - 1 of a little-endian bit field.
+        func field(_ bands: [Int], bytes: Int) -> [UInt8] {
+            var v = [UInt8](repeating: 0, count: bytes)
+            for b in bands where b >= 1 && b <= bytes * 8 { v[(b - 1) / 8] |= 1 << ((b - 1) % 8) }
+            return v
+        }
+        var t: [TLV] = []
+        if let lte { t.append(TLV(0x24, field(lte, bytes: 32))) }
+        if let nrSA { t.append(TLV(0x2F, field(nrSA, bytes: 64))) }
+        if let nrNSA { t.append(TLV(0x30, field(nrNSA, bytes: 64))) }
+        t.append(.u8(0x17, persistent ? 1 : 0))
+        return t
+    }
+
     public static func parseBandPreference(_ m: QMIMessage) -> BandPreference {
         var p = BandPreference()
         // Bit N of a little-endian bit field = band N + 1.
@@ -846,12 +866,13 @@ public enum NAS {
             if let a = try? r.u32(), a != 0, a != UInt32.max { nr.channel = a; nrSeen = true }
         }
         // Get Cell Location Info 0x2F, NR5G Cell Information: PLMN (3), TAC (3), NCI (8), PCI,
-        // RSRQ, RSRP, SNR. Not sent by the RM551E in EN-DC, so the TAC byte order is unverified.
+        // RSRQ, RSRP, SNR. The TAC most significant byte first, as ModemManager reads it (the
+        // RM551E doesn't send this TLV in EN-DC).
         if let v = cellLocation?[tlv: 0x2F], v.count == 22 {
             var r = ByteReader(v)
             _ = try! r.take(3)
             let tac = try! r.take(3)
-            nr.tac = tac.reversed().reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+            nr.tac = tac.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
             nr.cellID = UInt64(try! r.u32()) | UInt64(try! r.u32()) << 32
             nr.pci = try! r.u16()
             nrSeen = true
@@ -955,6 +976,19 @@ public enum DMS {
     public static let uimGetICCID: UInt16 = 0x003C
     public static let setOperatingMode: UInt16 = 0x002E
     public static let getMSISDN: UInt16 = 0x0024       // TLV 0x01: voice number, ASCII
+    // Get Band Capabilities: TLV 0x12 the LTE bands, 0x13 the NR bands this modem supports,
+    // each a count (2 bytes) then band numbers (2 bytes each).
+    public static let getBandCapabilities: UInt16 = 0x0045
+
+    public static func parseBandCapabilities(_ m: QMIMessage) -> (lte: [Int], nr: [Int]) {
+        func list(_ t: UInt8) -> [Int] {
+            guard let v = m[tlv: t] else { return [] }
+            var r = ByteReader(v)
+            let n = Int((try? r.u16()) ?? 0)
+            return (0..<n).compactMap { _ in (try? r.u16()).map(Int.init) }
+        }
+        return (list(0x12), list(0x13))
+    }
 
     public enum OperatingMode: UInt8 {
         case online = 0

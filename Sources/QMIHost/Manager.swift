@@ -216,11 +216,13 @@ public final class Manager {
            let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             savedProfiles = j["profiles"] as? [String: Int] ?? [:]
             learned = j["learned"] as? [String: [String: String]] ?? [:]
+            bandsBefore = j["bandsBefore"] as? [String: [Int]]
         }
     }
 
     private func saveState() {
-        let j: [String: Any] = ["profiles": savedProfiles, "learned": learned]
+        var j: [String: Any] = ["profiles": savedProfiles, "learned": learned]
+        j["bandsBefore"] = bandsBefore
         if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: URL(fileURLWithPath: statePath))
         }
@@ -246,6 +248,10 @@ public final class Manager {
     // stays free for clients and the other PDN work.
     private let openQueue = DispatchQueue(label: "qmid.open")
     private var opening = false
+    // The band preference as qmid found it before its first change ("lte", "nsa", "sa"), kept
+    // in the state file: resetBandPreference writes it back. nil when qmid changed nothing.
+    private var bandsBefore: [String: [Int]]?
+    private var openingDevice: QMIDevice?    // the interface the running open waits on
     private var stopped = false                 // shutdown(): a device opened late is closed
 
     private func openDevice() {
@@ -273,9 +279,16 @@ public final class Manager {
     // datapath. Touches no manager state; a device that fails here is closed here.
     private func bringUp(interface: Int?, vendorIDs: [UInt16], booting: Bool, batch: Bool) throws -> BroughtUp {
         let dev = try QMIDevice.open(interface: interface, vendorIDs: vendorIDs)
-        queue.async { [weak self] in self?.interfaceFound() }
+        queue.async { [weak self] in
+            self?.openingDevice = dev
+            self?.interfaceFound()
+        }
         do {
-            dev.modem.terminationHandler = { [weak self] in self?.queue.async { self?.deviceLost(dev) } }
+            // Gone while still opening (waiting for QMI): end that wait now.
+            dev.modem.terminationHandler = { [weak self] in
+                dev.cancel()
+                self?.queue.async { self?.deviceLost(dev) }
+            }
             dev.trace = { [weak self] in self?.logSink(.debug, $0) }
             dev.traceEnabled = { [weak self] in self?.debugEnabled() ?? false }
             // Stamp arrival: a disconnect for a call we just stopped can reach `queue` after a new
@@ -325,6 +338,7 @@ public final class Manager {
     // Back on `queue` with the opened device, or why it couldn't be opened.
     private func opened(_ result: Result<BroughtUp, Error>) {
         opening = false
+        openingDevice = nil
         let up: BroughtUp
         do { up = try result.get() } catch { return openFailed(error) }
         guard !stopped, device == nil else {
@@ -386,6 +400,7 @@ public final class Manager {
         deviceState = .absent
         deviceError = "\(error)"
         publishModem()
+        if case .cancelled = error as? QMIHostError { log("\(error); opening the new one") }
         // No interface is normal while the modem is away; failing to open a present
         // interface over and over is not.
         if (error as? QMIHostError)?.isModemAway != true {
@@ -1373,6 +1388,12 @@ public final class Manager {
         // Each of the modem's interfaces arrives separately: log and schedule once per burst.
         if let last = lastArrival, Date().timeIntervalSince(last) < 5 { return }
         lastArrival = Date()
+        // Appeared again while an open waits on the earlier set (the modem enumerates twice
+        // after a reset): drop that open, which would only time out, and open the new one.
+        if opening, let d = openingDevice {
+            log("modem interfaces appeared again while opening; restarting the open")
+            d.cancel()
+        }
         log("modem interfaces appeared; opening")
         fastReopenUntil = Date().addingTimeInterval(60)
         reopenScheduled = false
@@ -1971,10 +1992,73 @@ public final class Manager {
         guard let n = nas else { return (nil, "modem not ready") }
         do {
             let p = NAS.parseBandPreference(try n.request(NAS.getSystemSelectionPreference, timeout: 5))
-            return (QMIDBandPreference(modes: p.modes, lteBands: p.lte, nrNSABands: p.nrNSA, nrSABands: p.nrSA).dictionary, nil)
+            let caps = bandCapabilities()
+            return (QMIDBandPreference(modes: p.modes, lteBands: p.lte, nrNSABands: p.nrNSA, nrSABands: p.nrSA,
+                                       supportedLTEBands: caps.lte, supportedNRBands: caps.nr).dictionary, nil)
         } catch {
             return (nil, "\(error)")
         }
+    }
+
+    private func bandCapabilities() -> (lte: [Int], nr: [Int]) {
+        guard let dev = device, let dms = try? dev.allocateClient(.dms) else { return ([], []) }
+        defer { dms.release() }
+        return (try? dms.request(DMS.getBandCapabilities, timeout: 5)).map(DMS.parseBandCapabilities) ?? ([], [])
+    }
+
+    // nil lists stay as they are. Refused: an empty list, or a band the modem doesn't support.
+    public func setBandPreference(lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> String? {
+        guard let n = nas else { return "modem not ready" }
+        guard lte != nil || nrNSA != nil || nrSA != nil else { return "no bands given" }
+        let caps = bandCapabilities()
+        for (name, list, supported) in [("lte", lte, caps.lte), ("nr nsa", nrNSA, caps.nr), ("nr sa", nrSA, caps.nr)] {
+            guard let list else { continue }
+            if list.isEmpty { return "\(name): at least one band is needed" }
+            let bad = list.filter { !supported.isEmpty && !supported.contains($0) }
+            if !bad.isEmpty { return "\(name): not supported by this modem: \(bad.map(String.init).joined(separator: ", "))" }
+        }
+        // The setting before qmid's first change, for resetBandPreference.
+        if bandsBefore == nil {
+            guard let r = try? n.request(NAS.getSystemSelectionPreference, timeout: 5) else {
+                return "couldn't read the current band preference (needed to reset it later)"
+            }
+            let p = NAS.parseBandPreference(r)
+            bandsBefore = ["lte": p.lte, "nsa": p.nrNSA, "sa": p.nrSA]
+            saveState()
+        }
+        return writeBands(n, lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent)
+    }
+
+    private func writeBands(_ n: QMIClient, lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> String? {
+        do {
+            try n.request(NAS.setSystemSelectionPreference,
+                          NAS.bandPreferenceRequest(lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent), timeout: 10)
+        } catch {
+            return "\(error)"
+        }
+        func show(_ l: [Int]?) -> String { l.map { $0.map(String.init).joined(separator: ",") } ?? "unchanged" }
+        log("band preference set (\(persistent ? "persistent" : "until restart")): lte \(show(lte)), nr nsa \(show(nrNSA)), nr sa \(show(nrSA))",
+            level: .notice)
+        return nil
+    }
+
+    // Back to the setting qmid found before its first change (written as it was, unchecked:
+    // the modem's own default may list bands it doesn't report as supported); without one,
+    // every supported band.
+    public func resetBandPreference(persistent: Bool) -> String? {
+        if let b = bandsBefore {
+            guard let n = nas else { return "modem not ready" }
+            func list(_ k: String) -> [Int]? { b[k].flatMap { $0.isEmpty ? nil : $0 } }
+            if let err = writeBands(n, lte: list("lte"), nrNSA: list("nsa"), nrSA: list("sa"), persistent: persistent) { return err }
+            bandsBefore = nil
+            saveState()
+            log("band preference back to the setting before qmid changed it", level: .notice)
+            return nil
+        }
+        let caps = bandCapabilities()
+        guard !caps.lte.isEmpty || !caps.nr.isEmpty else { return "the modem didn't report its supported bands" }
+        return setBandPreference(lte: caps.lte.isEmpty ? nil : caps.lte, nrNSA: caps.nr.isEmpty ? nil : caps.nr,
+                                 nrSA: caps.nr.isEmpty ? nil : caps.nr, persistent: persistent)
     }
 
     static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
