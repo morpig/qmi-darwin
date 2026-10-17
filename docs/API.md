@@ -110,6 +110,7 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `setConfig(_:)` | validates, writes qmid.json, reloads | yes |
 | `prepareSIM(iccid:mccmnc:)` | before a SIM switch: attach profile for that card, no re-attach (see "Switching SIMs") | until the card is in, `cancelSIM`, the connection closes, or 10 s |
 | `cancelSIM(iccid:)` | the switch failed: attach profile back to the current card | – |
+| `radio(raw:)` | serving and neighbour cells, read from the modem now (see "Cells and signal") | – |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -294,6 +295,56 @@ with no default route. An IMS/VoLTE client should:
   (the network may re-assign them after a reconnect).
 
 qmid sets up the IMS profile (P-CSCF request, IM CN flag, APN type ims) itself.
+
+## Cells and signal (`QMIDRadio`)
+
+`radio()` reads the cells the modem is using and sees, at the moment of the call (a few NAS
+queries, well under a second). It is read only and has no event: poll it while you show it,
+every few seconds at most.
+
+```swift
+let r = try await qmid.radio()
+for c in r.serving {                     // primary first, then secondary cells
+    // c.rat .lte / .nr, c.role .primary / .secondary, c.band 3, c.channel 1313, c.bandwidth 20
+}
+r.neighbors                              // measured cells that aren't serving
+r.endcAvailable                          // the LTE cell offers EN-DC
+```
+
+| Role | Cells |
+|---|---|
+| `primary` | the LTE PCell; the NR cell on 5G SA |
+| `secondary` | LTE carrier aggregation SCells (`active`: activated, `false`: configured only), and the NR leg of EN-DC |
+| `neighbor` | other LTE cells the modem measures, on the serving and the inter-frequency carriers |
+
+`QMIDCell` fields, each `nil` when the modem didn't report it:
+
+| Field | Meaning |
+|---|---|
+| `rat` | `.lte` or `.nr` |
+| `role` | `.primary`, `.secondary`, `.neighbor` |
+| `channel` | downlink EARFCN / NR-ARFCN |
+| `band` | 3GPP band number from the channel. Exact for LTE. NR bands share one raster, so overlapping bands (n77/n78, n7/n41) can't be told apart; the more common one is given |
+| `pci` | physical cell ID |
+| `cellID` | ECI (eNB ID << 8 + cell) or NCI |
+| `tac` | tracking area code |
+| `bandwidth` | downlink bandwidth in MHz |
+| `rsrp`, `rssi` | dBm |
+| `rsrq`, `snr` | dB |
+| `active` | secondary LTE cell: activated (carrying data) or only configured |
+| `scellIndex` | secondary LTE cell: the RRC sCellIndex (1–7), the number the network and modem logs use for it |
+
+What the modem reports varies by firmware. On a Quectel RM551E in EN-DC, the LTE cells are
+complete and SCells turn `active` within seconds of traffic; the NR leg comes with its
+`channel`, `band`, `pci`, `bandwidth` and signal but without `cellID`, and only one NR carrier
+is reported. The NR `channel` is the SSB's NR-ARFCN, not the carrier centre; the NR
+`bandwidth` comes from the modem's coexistence service (QMI COEX), not NAS. The NR cell stays in the list while the modem is idle (its last measured
+cell), so its presence doesn't mean NR carries data. `radio(raw: true)` adds the modem's TLVs (`raw`) for diagnostics.
+
+Neighbours are LTE only: QMI has no NR neighbour list. On Quectel modems the AT port (which
+qmid leaves free) has one: with `AT+QNWCFG="nr5g_meas_info",1` set, reading
+`AT+QNWCFG="nr5g_meas_info"` lists the measured NR cells as NR-ARFCN, PCI, RSRP, RSRQ, the
+serving NR cell included. Entries with an implausible RSRP (e.g. −155 dBm) are placeholders.
 
 ## Dedicated bearers and QoS
 
@@ -585,4 +636,5 @@ qmictl policy internet prefer-cellular
 qmictl config get > qmid.json && qmictl config set qmid.json
 qmictl prepare-sim 8901234567890123456 00101   # held until Ctrl-C; switch meanwhile
 qmictl cancel-sim 8901234567890123456
+qmictl radio [-v]                   # serving cells, carrier aggregation, neighbours; -v: raw TLVs
 ```

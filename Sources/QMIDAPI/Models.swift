@@ -520,3 +520,136 @@ public enum QMIDLogLevel: Int, Comparable, CaseIterable {
     public init?(name: String) { self.init(rawValue: Self.allCases.firstIndex { $0.name == name } ?? -1) }
     public static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
 }
+
+// radio(): the cells the modem is using and sees. Serving cells first (primary, then
+// secondary: LTE carrier aggregation and the NR leg of EN-DC), then neighbours. A snapshot
+// read when asked; values the modem didn't report are nil.
+public struct QMIDRadio: Equatable {
+    public var cells: [QMIDCell]
+    public var endcAvailable: Bool?       // the LTE cell offers EN-DC (NR as a secondary leg)
+    public var raw: [String]?             // radio(raw: true): the modem's TLVs, "0x0043 0x13: 00 15 …"
+
+    public var serving: [QMIDCell] { cells.filter { $0.role != .neighbor } }
+    public var neighbors: [QMIDCell] { cells.filter { $0.role == .neighbor } }
+
+    public init(cells: [QMIDCell] = [], endcAvailable: Bool? = nil, raw: [String]? = nil) {
+        self.cells = cells
+        self.endcAvailable = endcAvailable
+        self.raw = raw
+    }
+
+    public init(_ d: NSDictionary) {
+        cells = (d[QMIDKey.cells] as? [NSDictionary] ?? []).compactMap(QMIDCell.init)
+        endcAvailable = d[QMIDKey.endcAvailable] as? Bool
+        raw = d[QMIDKey.raw] as? [String]
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.cells: cells.map(\.dictionary)]
+        d[QMIDKey.endcAvailable] = endcAvailable
+        d[QMIDKey.raw] = raw
+        return d as NSDictionary
+    }
+}
+
+public struct QMIDCell: Equatable {
+    public enum RAT: String { case lte, nr }
+    public enum Role: String { case primary, secondary, neighbor }
+
+    public var rat: RAT
+    public var role: Role
+    public var channel: Int?              // EARFCN / NR-ARFCN (downlink)
+    public var band: Int?                 // 3GPP band number: 3 for B3, 41 for n41
+    public var pci: Int?
+    public var cellID: UInt64?            // ECI (28 bits: eNB ID << 8 | cell) / NCI (36 bits)
+    public var tac: Int?
+    public var bandwidth: Double?         // MHz, downlink
+    public var rsrp: Double?              // dBm
+    public var rsrq: Double?              // dB
+    public var rssi: Double?              // dBm
+    public var snr: Double?               // dB
+    public var active: Bool?              // secondary cell: activated; false = configured only
+    public var scellIndex: Int?           // LTE secondary cell: the RRC sCellIndex (1–7)
+
+    public init(rat: RAT, role: Role) {
+        self.rat = rat
+        self.role = role
+    }
+
+    public init?(_ d: NSDictionary) {
+        guard let rat = (d[QMIDKey.rat] as? String).flatMap(RAT.init),
+              let role = (d[QMIDKey.role] as? String).flatMap(Role.init) else { return nil }
+        self.rat = rat
+        self.role = role
+        channel = d[QMIDKey.channel] as? Int
+        band = d[QMIDKey.band] as? Int
+        pci = d[QMIDKey.pci] as? Int
+        cellID = (d[QMIDKey.cellID] as? NSNumber)?.uint64Value
+        tac = d[QMIDKey.tac] as? Int
+        bandwidth = d[QMIDKey.bandwidth] as? Double
+        rsrp = d[QMIDKey.rsrp] as? Double
+        rsrq = d[QMIDKey.rsrq] as? Double
+        rssi = d[QMIDKey.rssi] as? Double
+        snr = d[QMIDKey.snr] as? Double
+        active = d[QMIDKey.active] as? Bool
+        scellIndex = d[QMIDKey.scellIndex] as? Int
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.rat: rat.rawValue, QMIDKey.role: role.rawValue]
+        d[QMIDKey.channel] = channel
+        d[QMIDKey.band] = band
+        d[QMIDKey.pci] = pci
+        d[QMIDKey.cellID] = cellID.map { NSNumber(value: $0) }
+        d[QMIDKey.tac] = tac
+        d[QMIDKey.bandwidth] = bandwidth
+        d[QMIDKey.rsrp] = rsrp
+        d[QMIDKey.rsrq] = rsrq
+        d[QMIDKey.rssi] = rssi
+        d[QMIDKey.snr] = snr
+        d[QMIDKey.active] = active
+        d[QMIDKey.scellIndex] = scellIndex
+        return d as NSDictionary
+    }
+
+    // The band of a downlink channel number. LTE: exact (EARFCN ranges don't overlap, TS 36.101
+    // table 5.7.3-1). NR: the NR-ARFCN raster is shared, so overlapping bands can't be told
+    // apart; the first match wins, the more common band listed first (n78 before n77, n41
+    // before n7 and n90, n1 before n65/n66).
+    public static func band(_ rat: RAT, channel: Int) -> Int? {
+        let table = rat == .lte ? lteBands : nrBands
+        return table.first { $0.range.contains(channel) }?.band
+    }
+
+    static let lteBands: [(band: Int, range: ClosedRange<Int>)] = [
+        (1, 0...599), (2, 600...1199), (3, 1200...1949), (4, 1950...2399), (5, 2400...2649),
+        (6, 2650...2749), (7, 2750...3449), (8, 3450...3799), (9, 3800...4149), (10, 4150...4749),
+        (11, 4750...4949), (12, 5010...5179), (13, 5180...5279), (14, 5280...5379), (17, 5730...5849),
+        (18, 5850...5999), (19, 6000...6149), (20, 6150...6449), (21, 6450...6599), (22, 6600...7399),
+        (23, 7500...7699), (24, 7700...8039), (25, 8040...8689), (26, 8690...9039), (27, 9040...9209),
+        (28, 9210...9659), (29, 9660...9769), (30, 9770...9869), (31, 9870...9919), (32, 9920...10359),
+        (33, 36000...36199), (34, 36200...36349), (35, 36350...36949), (36, 36950...37549),
+        (37, 37550...37749), (38, 37750...38249), (39, 38250...38649), (40, 38650...39649),
+        (41, 39650...41589), (42, 41590...43589), (43, 43590...45589), (44, 45590...46589),
+        (45, 46590...46789), (46, 46790...54539), (47, 54540...55239), (48, 55240...56739),
+        (49, 56740...58239), (50, 58240...59089), (51, 59090...59139), (52, 59140...60139),
+        (53, 60140...60254), (65, 65536...66435), (66, 66436...67335), (67, 67336...67535),
+        (68, 67536...67835), (69, 67836...68335), (70, 68336...68585), (71, 68586...68935),
+        (72, 68936...68985), (73, 68986...69035), (74, 69036...69465), (75, 69466...70315),
+        (76, 70316...70365), (85, 70366...70545), (87, 70546...70595), (88, 70596...70645),
+    ]
+
+    static let nrBands: [(band: Int, range: ClosedRange<Int>)] = [
+        (78, 620000...653333), (77, 620000...680000), (79, 693334...733333), (41, 499200...537999),
+        (7, 524000...538000), (90, 499200...538000), (38, 514000...524000), (40, 460000...480000),
+        (1, 422000...434000), (66, 422000...440000), (65, 422000...440000), (3, 361000...376000),
+        (39, 376000...384000), (2, 386000...398000), (25, 386000...399000), (70, 399000...404000),
+        (34, 402000...405000), (30, 470000...472000), (53, 496700...499000), (48, 636667...646666),
+        (46, 743334...795000), (96, 795000...875000), (28, 151600...160600), (14, 151600...153600),
+        (20, 158200...164200), (8, 185000...192000), (5, 173800...178800), (26, 171800...178800),
+        (18, 172000...175000), (12, 145800...149200), (13, 149200...151200), (29, 143400...145600),
+        (71, 123400...130400), (50, 286400...303400), (75, 286400...303400), (51, 285400...286400),
+        (76, 285400...286400), (74, 295000...303600), (257, 2054166...2104165),
+        (258, 2016667...2070832), (261, 2070833...2084999), (260, 2229166...2279165),
+    ]
+}

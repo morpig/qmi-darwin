@@ -258,6 +258,15 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.cancelSIM(iccid) { self.finish($0, completion) }
     }
 
+    // The serving and neighbour cells, read now. raw: also the modem's TLVs (diagnostics).
+    public func radio(raw: Bool = false, _ completion: @escaping (Result<QMIDRadio, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.radio(raw) { d, err in
+            self.queue.async {
+                if let d { completion(.success(QMIDRadio(d))) } else { completion(.failure(QMIDError(err ?? "radio failed"))) }
+            }
+        }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -277,6 +286,7 @@ public extension QMIDClient {
     func setConfig(_ json: Data) async throws { try await bridge { self.setConfig(json, $0) } }
     func prepareSIM(iccid: String, mccmnc: String?) async throws -> QMIDPreparedSIM { try await bridge { self.prepareSIM(iccid: iccid, mccmnc: mccmnc, $0) } }
     func cancelSIM(iccid: String) async throws { try await bridge { self.cancelSIM(iccid: iccid, $0) } }
+    func radio(raw: Bool = false) async throws -> QMIDRadio { try await bridge { self.radio(raw: raw, $0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

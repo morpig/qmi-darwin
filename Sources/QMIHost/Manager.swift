@@ -1717,6 +1717,62 @@ public final class Manager {
         return out as NSArray
     }
 
+    // The serving and neighbour cells, read now on the registration-watch NAS client. Each
+    // message is optional (older firmware lacks some); a short timeout, as this runs on the
+    // manager queue.
+    public func radio(raw: Bool) -> (NSDictionary?, String?) {
+        guard let n = nas else { return (nil, "modem not ready") }
+        var lines: [String] = []
+        func read(_ message: UInt16) -> QMIMessage? {
+            do {
+                let r = try n.request(message, timeout: 2)
+                if raw {
+                    lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "0x%04x 0x%02x: ", message, $0.type) + $0.value.hex }
+                }
+                return r
+            } catch {
+                if raw { lines.append(String(format: "0x%04x: ", message) + "\(error)") }
+                return nil
+            }
+        }
+        // COEX for the NR bandwidth; a client per call, as radio() is polled rarely.
+        var coexReply: QMIMessage?
+        if let dev = device, let coex = try? dev.allocateClient(NAS.coexService) {
+            do {
+                let r = try coex.request(NAS.coexGetWWANState, timeout: 2)
+                if raw { lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "coex 0x0022 0x%02x: ", $0.type) + $0.value.hex } }
+                coexReply = r
+            } catch {
+                if raw { lines.append("coex 0x0022: \(error)") }
+            }
+            coex.release()
+        }
+        let info = NAS.radioCells(sysInfo: read(NAS.getSysInfo), cellLocation: read(NAS.getCellLocationInfo),
+                                  signal: read(NAS.getSignalInfo), rfBand: read(NAS.getRFBandInfo),
+                                  ca: read(NAS.getLTECPHYCAInfo), coex: coexReply)
+        let radio = QMIDRadio(cells: info.cells.map(Self.cellInfo), endcAvailable: info.endcAvailable,
+                              raw: raw ? lines : nil)
+        return (radio.dictionary, nil)
+    }
+
+    static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
+        var q = QMIDCell(rat: c.rat == .lte ? .lte : .nr,
+                         role: c.role == .primary ? .primary : c.role == .secondary ? .secondary : .neighbor)
+        q.channel = c.channel.map(Int.init)
+        q.band = q.channel.flatMap { QMIDCell.band(q.rat, channel: $0) }
+        q.pci = c.pci.map(Int.init)
+        q.cellID = c.cellID
+        q.tac = c.tac.map(Int.init)
+        q.bandwidth = c.bandwidthMHz
+        q.rsrp = c.rsrp
+        q.rsrq = c.rsrq
+        q.rssi = c.rssi
+        q.snr = c.snr
+        q.active = c.active
+        q.scellIndex = c.scellIndex.map(Int.init)
+        return q
+    }
+
     // MARK: - Publishing
 
     private func publishService(_ p: PDNState) throws {

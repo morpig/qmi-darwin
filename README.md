@@ -18,6 +18,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
   rejects with the 3GPP cause, and backoff.
 - Exposes QoS: the QCI and APN-AMBR of each PDN, plus the dedicated bearers with their
   packet filters.
+- Reports the radio: LTE serving cell and carrier aggregation, the NR leg, neighbours and
+  signal (`qmictl radio`).
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works

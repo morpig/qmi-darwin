@@ -651,6 +651,250 @@ public enum NAS {
         return String(septets.map { $0 == 0x1b ? "?" : table[$0] })
     }
 
+    // Radio information: serving cells, LTE carrier aggregation, neighbours, signal. Each
+    // message is optional; radioCells combines what came back. TLV layouts from libqmi
+    // (data/qmi-service-nas.json) and, for the TLVs libqmi doesn't define (Get Sys Info 0x54 and
+    // 0x60, Get LTE CPHY CA Info 0x19, Get Cell Location Info 0x27/0x28), a Quectel RM551E
+    // checked against AT+QENG / AT+QCAINFO (2026-10-17). Signal in 0.1 dB unless noted.
+    public static let getCellLocationInfo: UInt16 = 0x0043
+    public static let getSignalInfo: UInt16 = 0x004F
+    public static let getRFBandInfo: UInt16 = 0x0031
+    public static let getLTECPHYCAInfo: UInt16 = 0x00AC
+    // COEX (service 0x22) Get WWAN State: the carriers' centre frequencies and bandwidths, the
+    // only source of the NR bandwidth (TLV 0x22; checked against AT+QCAINFO on an RM551E).
+    public static let coexService = QMIService(rawValue: 0x22)
+    public static let coexGetWWANState: UInt16 = 0x0022
+
+    public struct Cell: Equatable {
+        public enum RAT: Equatable { case lte, nr }
+        public enum Role: Equatable { case primary, secondary, neighbor }
+        public var rat: RAT
+        public var role: Role
+        public var channel: UInt32?         // EARFCN / NR-ARFCN (downlink)
+        public var pci: UInt16?
+        public var cellID: UInt64?          // ECI (28 bits) / NCI (36 bits)
+        public var tac: UInt32?
+        public var bandwidthMHz: Double?    // downlink
+        public var rsrp: Double?            // dBm
+        public var rsrq: Double?            // dB
+        public var rssi: Double?            // dBm
+        public var snr: Double?             // dB
+        public var active: Bool?            // secondary cell: activated (false: configured only)
+        public var scellIndex: UInt8?       // LTE secondary cell: the RRC sCellIndex
+
+        public init(rat: RAT, role: Role) {
+            self.rat = rat
+            self.role = role
+        }
+    }
+
+    public struct RadioInfo: Equatable {
+        public var cells: [Cell] = []
+        public var endcAvailable: Bool?     // the LTE cell offers EN-DC (NR as a secondary leg)
+        public init() {}
+    }
+
+    public static func radioCells(sysInfo: QMIMessage?, cellLocation: QMIMessage?, signal: QMIMessage?,
+                                  rfBand: QMIMessage?, ca: QMIMessage?, coex: QMIMessage? = nil) -> RadioInfo {
+        var info = RadioInfo()
+        func s16(_ r: inout ByteReader) -> Int16? { (try? r.u16()).map { Int16(bitPattern: $0) } }
+        func tenths(_ v: Int16?) -> Double? { v.map { Double($0) / 10 } }
+
+        // Get Cell Location Info 0x13, LTE intra-frequency: idle, PLMN (3), TAC, ECI, EARFCN,
+        // serving PCI, 4 bytes reselection parameters, then cells (PCI, RSRQ, RSRP, RSSI,
+        // SRXLEV). 0x27: the EARFCN as 32 bits.
+        var lte: Cell?
+        var measured: [(channel: UInt32, cell: Cell)] = []
+        if let m = cellLocation, let v = m[tlv: 0x13] {
+            var r = ByteReader(v)
+            if (try? r.take(4)) != nil, let tac = try? r.u16(), let eci = try? r.u32(),
+               let earfcn = try? r.u16(), let pci = try? r.u16(), (try? r.take(4)) != nil {
+                var c = Cell(rat: .lte, role: .primary)
+                c.tac = UInt32(tac)
+                c.cellID = UInt64(eci)
+                c.channel = m[tlv: 0x27].flatMap { var x = ByteReader($0); return try? x.u32() } ?? UInt32(earfcn)
+                c.pci = pci
+                lte = c
+                measured += parseLTECells(&r, channel: c.channel!)
+            }
+        }
+        // 0x14, LTE inter-frequency: idle, frequency count, then per frequency EARFCN, 3 bytes
+        // reselection parameters, its cells. 0x28: the EARFCNs as 32 bits, in the same order.
+        if let m = cellLocation, let v = m[tlv: 0x14] {
+            var wide: [UInt32] = []
+            if let x = m[tlv: 0x28] {
+                var r = ByteReader(x)
+                for _ in 0..<((try? r.u8()) ?? 0) { if let e = try? r.u32() { wide.append(e) } }
+            }
+            var r = ByteReader(v)
+            if (try? r.u8()) != nil, let n = try? r.u8() {
+                for i in 0..<Int(n) {
+                    guard let e = try? r.u16(), (try? r.take(3)) != nil else { break }
+                    measured += parseLTECells(&r, channel: i < wide.count ? wide[i] : UInt32(e))
+                }
+            }
+        }
+        // Get Signal Info 0x14: LTE RSSI, RSRQ (1 dB, signed bytes), RSRP (1 dB), SNR.
+        if var c = lte {
+            if let own = measured.first(where: { $0.channel == c.channel && $0.cell.pci == c.pci })?.cell {
+                c.rsrp = own.rsrp; c.rsrq = own.rsrq; c.rssi = own.rssi
+            }
+            if let v = signal?[tlv: 0x14], v.count >= 6 {
+                var r = ByteReader(v)
+                c.rssi = Double(Int8(bitPattern: try! r.u8()))
+                c.rsrq = Double(Int8(bitPattern: try! r.u8()))
+                c.rsrp = s16(&r).map(Double.init)
+                c.snr = tenths(s16(&r))
+            }
+            lte = c
+        }
+
+        // Get LTE CPHY CA Info. PCell 0x13: PCI, EARFCN, bandwidth, band. Secondary cells 0x19
+        // (EARFCN as 32 bits) or else 0x15: count, then PCI, EARFCN, bandwidth, band, state
+        // (0 deconfigured, 1 deactivated = configured, 2 activated), sCellIndex. 0x19 entries carry one byte more.
+        var secondaries: [Cell] = []
+        if let m = ca {
+            if let v = m[tlv: 0x13], var c = lte {
+                var r = ByteReader(v)
+                if (try? r.take(4)) != nil, let bw = try? r.u32() { c.bandwidthMHz = bandwidth(bw) }
+                lte = c
+            }
+            let (list, wide) = m[tlv: 0x19].map { ($0, true) } ?? m[tlv: 0x15].map { ($0, false) } ?? ([], false)
+            var r = ByteReader(list)
+            let n = Int((try? r.u8()) ?? 0)
+            for _ in 0..<n {
+                guard let e = try? r.take(wide ? 18 : 15) else { break }
+                var x = ByteReader(e)
+                let pci = try! x.u16()
+                let earfcn = wide ? try! x.u32() : UInt32(try! x.u16())
+                let bw = try! x.u32()
+                _ = try! x.u16()                                     // band (QMI enum)
+                let state = try! x.u32()
+                let index = try! x.u8()
+                guard state != 0 else { continue }
+                var c = Cell(rat: .lte, role: .secondary)
+                c.pci = pci
+                c.channel = earfcn
+                c.bandwidthMHz = bandwidth(bw)
+                c.active = state == 2
+                c.scellIndex = index
+                if let own = measured.first(where: { $0.channel == earfcn && $0.cell.pci == pci })?.cell {
+                    c.rsrp = own.rsrp; c.rsrq = own.rsrq; c.rssi = own.rssi
+                }
+                secondaries.append(c)
+            }
+        }
+        // Get RF Band Info 0x12: count, then radio interface and bandwidth (4 bytes) each.
+        var nrBandwidth: Double?
+        if let v = rfBand?[tlv: 0x12] {
+            var r = ByteReader(v)
+            for _ in 0..<((try? r.u8()) ?? 0) {
+                guard let rat = try? r.u8(), let bw = try? r.u32() else { break }
+                if rat == 8, var c = lte, c.bandwidthMHz == nil { c.bandwidthMHz = bandwidth(bw); lte = c }
+                if rat == 12 { nrBandwidth = bandwidth(bw) }
+            }
+        }
+
+        // NR: Get Signal Info 0x17 (RSRP 1 dB, SNR) and 0x18 (RSRQ 1 dB); the NR-ARFCN from Get
+        // Cell Location Info 0x2E or Get Sys Info 0x60. A primary cell when the NR5G service
+        // status (Get Sys Info 0x4A) says service, i.e. 5G SA; a secondary leg (EN-DC) otherwise.
+        var nr = Cell(rat: .nr, role: .secondary)
+        var nrSeen = false
+        if let v = signal?[tlv: 0x17], v.count >= 4 {
+            var r = ByteReader(v)
+            if let p = s16(&r), p != Int16.min { nr.rsrp = Double(p); nrSeen = true }
+            if let s = s16(&r), s != Int16.min { nr.snr = tenths(s) }
+        }
+        if let v = signal?[tlv: 0x18], v.count >= 2 {
+            var r = ByteReader(v)
+            if let q = s16(&r), q != Int16.min { nr.rsrq = Double(q) }
+        }
+        for v in [cellLocation?[tlv: 0x2E], sysInfo?[tlv: 0x60]] {
+            guard let v, v.count == 4, nr.channel == nil else { continue }
+            var r = ByteReader(v)
+            if let a = try? r.u32(), a != 0, a != UInt32.max { nr.channel = a; nrSeen = true }
+        }
+        // Get Cell Location Info 0x2F, NR5G Cell Information: PLMN (3), TAC (3), NCI (8), PCI,
+        // RSRQ, RSRP, SNR. Not sent by the RM551E in EN-DC, so the TAC byte order is unverified.
+        if let v = cellLocation?[tlv: 0x2F], v.count == 22 {
+            var r = ByteReader(v)
+            _ = try! r.take(3)
+            let tac = try! r.take(3)
+            nr.tac = tac.reversed().reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+            nr.cellID = UInt64(try! r.u32()) | UInt64(try! r.u32()) << 32
+            nr.pci = try! r.u16()
+            nrSeen = true
+        }
+        // Get Sys Info 0x54: the NR PCI (matches AT+QENG's NR5G-NSA line). It stays set while
+        // the modem is idle, so it doesn't mean the NR leg carries data.
+        if nr.pci == nil, let v = sysInfo?[tlv: 0x54], v.count == 2 {
+            let pci = UInt16(v[0]) | UInt16(v[1]) << 8
+            if pci <= 1007 { nr.pci = pci; nrSeen = true }
+        }
+        nr.bandwidthMHz = nrBandwidth
+        // COEX Get WWAN State 0x22, NR carriers: count, then per entry centre frequency (kHz),
+        // bandwidth (Hz), direction (4 bytes: 1 UL, 2 DL), 4 bytes unknown. The DL carrier whose
+        // span holds the cell's NR-ARFCN (its SSB) is the cell's.
+        if let v = coex?[tlv: 0x22], let ssb = nr.channel.flatMap(nrFrequencyKHz) {
+            var r = ByteReader(v)
+            for _ in 0..<((try? r.u8()) ?? 0) {
+                guard let e = try? r.take(16) else { break }
+                var x = ByteReader(e)
+                let centre = Double(try! x.u32()), width = Double(try! x.u32()) / 1000, dir = try! x.u32()
+                if dir == 2, abs(ssb - centre) <= width / 2 { nr.bandwidthMHz = width / 1000; break }
+            }
+        }
+        if let v = sysInfo?[tlv: 0x4A], v.first == 2 { nr.role = .primary }
+        if let v = sysInfo?[tlv: 0x4E], let b = v.first { info.endcAvailable = b != 0 }
+
+        if let lte { info.cells.append(lte) }
+        if nrSeen, nr.role == .primary { info.cells.insert(nr, at: 0) } else if nrSeen { secondaries.append(nr) }
+        info.cells += secondaries
+        // Neighbours: the measured LTE cells that aren't serving.
+        for (channel, var c) in measured {
+            let serving = info.cells.contains { $0.rat == .lte && $0.channel == channel && $0.pci == c.pci }
+            guard !serving else { continue }
+            c.role = .neighbor
+            info.cells.append(c)
+        }
+        return info
+    }
+
+    // NR-ARFCN to frequency in kHz (TS 38.104 5.4.2.1).
+    static func nrFrequencyKHz(_ n: UInt32) -> Double? {
+        switch n {
+        case 0..<600_000: return Double(n) * 5
+        case 600_000..<2_016_667: return 3_000_000 + Double(n - 600_000) * 15
+        case 2_016_667...3_279_165: return 24_250_080 + Double(n - 2_016_667) * 60
+        default: return nil
+        }
+    }
+
+    // Cells of one LTE frequency in Get Cell Location Info: count, then PCI, RSRQ, RSRP, RSSI,
+    // SRXLEV (16 bits each; signal in 0.1 dB).
+    static func parseLTECells(_ r: inout ByteReader, channel: UInt32) -> [(channel: UInt32, cell: Cell)] {
+        var out: [(channel: UInt32, cell: Cell)] = []
+        for _ in 0..<((try? r.u8()) ?? 0) {
+            guard let e = try? r.take(10) else { break }
+            var x = ByteReader(e)
+            var c = Cell(rat: .lte, role: .neighbor)
+            c.channel = channel
+            c.pci = try! x.u16()
+            c.rsrq = Double(Int16(bitPattern: try! x.u16())) / 10
+            c.rsrp = Double(Int16(bitPattern: try! x.u16())) / 10
+            c.rssi = Double(Int16(bitPattern: try! x.u16())) / 10
+            out.append((channel, c))
+        }
+        return out
+    }
+
+    // QmiNasDLBandwidth (Get RF Band Info, Get LTE CPHY CA Info): LTE 1.4–20 MHz; 6 invalid,
+    // 0xFF unknown. libqmi defines no NR values.
+    static func bandwidth(_ v: UInt32) -> Double? {
+        let table: [Double] = [1.4, 3, 5, 10, 15, 20]
+        return v < table.count ? table[Int(v)] : nil
+    }
+
     public static func parseServingSystem(_ m: QMIMessage) throws -> ServingSystem {
         guard let v = m[tlv: 0x01] else { throw DecodeError.invalid("serving system: no TLV 0x01") }
         var r = ByteReader(v)

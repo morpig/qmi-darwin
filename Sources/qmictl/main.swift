@@ -23,12 +23,14 @@ usage (through qmid):
                                             write the attach profile for that card before a SIM
                                             switch; held until Ctrl-C (or SECONDS), which ends it
   qmictl cancel-sim ICCID                   end a prepare-sim: attach profile back to the current SIM
+  qmictl radio [-v]                         serving cells (LTE CA, NR), neighbours, signal; -v: raw TLVs
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
   qmictl modem-status [--iface N] [-v]
   qmictl profiles     [--iface N] [-v]     modem profiles, autoconnect, LTE attach PDN list
   qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
+  qmictl nas-survey   [--iface N] [-v]     raw TLVs of the NAS cell, signal, band and CA messages
   qmictl reattach     [--iface N] [-v]     low power, then online: attach again with the attach profile
   qmictl profile-write INDEX|new KEY=VALUE...   create/modify a profile; keys: apn, pdp
                       (ipv4|ipv6|ipv4v6), user, pass, auth (none|pap|chap|pap-chap),
@@ -255,6 +257,70 @@ func plmnName(_ o: Options) {
         print("modem:    long \"\(table.longName ?? "-")\", short \"\(table.shortName ?? "-")\" (Get PLMN Name)")
     } catch {
         fail("\(error)")
+    }
+}
+
+// MARK: - nas-survey
+
+// Raw TLVs of the NAS messages that carry cell, signal, band and CA information, to check the
+// layout on a given modem before writing parsers. Read only.
+func nasSurvey(_ o: Options) {
+    let dev = openDevice(o)
+    defer { dev.close() }
+    let messages: [(UInt16, String)] = [
+        (NAS.getServingSystem, "Get Serving System"),
+        (NAS.getSysInfo, "Get Sys Info"),
+        (0x0043, "Get Cell Location Info"),
+        (0x004F, "Get Signal Info"),
+        (0x0031, "Get RF Band Info"),
+        (0x00AC, "Get LTE CPHY CA Info"),
+        (0x00E8, "Get ENDC Config"),
+    ]
+    do {
+        let nas = try dev.allocateClient(.nas)
+        defer { nas.release() }
+        for (id, name) in messages {
+            print(String(format: "0x%04x %@:", id, name))
+            do {
+                let r = try nas.request(id, timeout: 2)
+                for t in r.tlvs where t.type != 0x02 {
+                    print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
+                }
+            } catch {
+                print("  \(error)")
+            }
+        }
+        // Get Supported Messages: TLV 0x10, a length-prefixed bitmap; bit N set = message ID N
+        // answered. Lists the IDs libqmi doesn't define, the ones worth probing.
+        do {
+            let r = try nas.request(0x001E, timeout: 2)
+            if let v = r[tlv: 0x10], v.count >= 2 {
+                let bits = Array(v.dropFirst(2))
+                let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
+                let known: Set<Int> = [0x00, 0x01, 0x02, 0x03, 0x1E, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                                       0x2A, 0x2B, 0x31, 0x33, 0x34, 0x39, 0x43, 0x44, 0x4D, 0x4F, 0x50, 0x5A,
+                                       0x65, 0x67, 0x6C, 0x89, 0xAC]
+                print("0x001e Get Supported Messages: \(ids.count) IDs")
+                print("  not in libqmi: " + ids.filter { !known.contains($0) }.map { String(format: "0x%04x", $0) }.joined(separator: " "))
+            }
+        } catch {
+            print("0x001e Get Supported Messages: \(error)")
+        }
+    } catch {
+        fail("\(error)")
+    }
+    // COEX (service 0x22) Get WWAN State: TLV 0x10, LTE UL/DL frequency and bandwidth (as used
+    // by quectel-CM); newer firmware may add NR5G.
+    do {
+        let coex = try dev.allocateClient(QMIService(rawValue: 0x22))
+        defer { coex.release() }
+        print("coex 0x0022 Get WWAN State:")
+        let r = try coex.request(0x0022, timeout: 2)
+        for t in r.tlvs where t.type != 0x02 {
+            print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
+        }
+    } catch {
+        print("  coex: \(error)")
     }
 }
 
@@ -798,12 +864,50 @@ func daemonCommand(_ args: [String]) -> Bool {
         }
     case "prepare-sim" where args.count >= 2:
         prepareSIM(Array(args.dropFirst()))
+    case "radio" where args.count <= 2:
+        withDaemon { d, done in
+            d.radio(args.last == "-v") { dict, err in
+                guard let dict else { fail(err ?? "radio failed") }
+                printRadio(QMIDRadio(dict))
+                done()
+            }
+        }
     case "cancel-sim" where args.count == 2:
         withDaemon { d, done in d.cancelSIM(args[1]) { reportResult($0); done() } }
     default:
         return false
     }
     return true
+}
+
+func printRadio(_ r: QMIDRadio) {
+    func f(_ v: Double?, _ unit: String = "") -> String? { v.map { String(format: $0 == $0.rounded() ? "%.0f" : "%.1f", $0) + unit } }
+    func line(_ c: QMIDCell) -> String {
+        var parts: [String] = [c.rat.rawValue.padding(toLength: 4, withPad: " ", startingAt: 0)
+                               + c.role.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)]
+        parts.append(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "band ?")
+        if let ch = c.channel { parts.append("\(c.rat == .lte ? "earfcn" : "arfcn") \(ch)") }
+        if let bw = f(c.bandwidth, " MHz") { parts.append(bw) }
+        if let p = c.pci { parts.append("pci \(p)") }
+        if let id = c.cellID {
+            parts.append(c.rat == .lte ? String(format: "cell %llu (eNB %llu/%llu)", id, id >> 8, id & 0xff)
+                                       : String(format: "cell %llu", id))
+        }
+        if let t = c.tac { parts.append("tac \(t)") }
+        if let i = c.scellIndex { parts.append("scell \(i)") }
+        if let a = c.active { parts.append(a ? "active" : "configured") }
+        for (name, v, unit) in [("rsrp", c.rsrp, " dBm"), ("rsrq", c.rsrq, " dB"), ("rssi", c.rssi, " dBm"), ("snr", c.snr, " dB")] {
+            if let s = f(v, unit) { parts.append("\(name) \(s)") }
+        }
+        return parts.joined(separator: "  ")
+    }
+    if let e = r.endcAvailable { print("en-dc: \(e ? "available" : "not available") on the LTE cell") }
+    r.serving.forEach { print(line($0)) }
+    if !r.neighbors.isEmpty {
+        print("neighbours:")
+        r.neighbors.forEach { print("  " + line($0)) }
+    }
+    if let raw = r.raw { print("raw:"); raw.forEach { print("  " + $0) } }
 }
 
 // The prepare lasts while this connection does, so qmictl stays until Ctrl-C or --hold runs out.
@@ -841,6 +945,7 @@ case "probe": probe(options)
 case "modem-status": status(options)
 case "profiles": profiles(options)
 case "plmn-name": plmnName(options)
+case "nas-survey": nasSurvey(options)
 case "reattach": reattach(options)
 case "run": connect(options)
 default: print(usage); exit(2)

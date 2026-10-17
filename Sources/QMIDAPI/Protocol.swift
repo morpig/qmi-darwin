@@ -48,6 +48,9 @@ public let qmidAPIVersion = 1
     // The switch failed or was cancelled: back to the card in the modem (no re-attach). Ignored
     // unless iccid is the pending card's.
     func cancelSIM(_ iccid: String, reply: @escaping (String?) -> Void)
+    // The serving and neighbour cells, read from the modem now (QMIDRadio). With raw, also
+    // the TLVs it came from. Reply: the radio dictionary, or an error (no modem).
+    func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -135,6 +138,27 @@ public enum QMIDKey {
     public static let ipProtocol = "protocol"         // 6 TCP, 17 UDP, …
     public static let sourcePorts = "sourcePorts"     // [low, high]
     public static let destinationPorts = "destinationPorts"
+
+    // radio dictionary (radio())
+    public static let cells = "cells"                 // [cell dictionary]
+    public static let endcAvailable = "endcAvailable" // Bool: the LTE cell offers EN-DC
+    public static let raw = "raw"                     // [String]: TLVs, with radio(raw: true)
+
+    // cell dictionary
+    public static let rat = "rat"                     // QMIDCell.RAT: "lte" | "nr"
+    // role                                           // QMIDCell.Role: "primary" | "secondary" | "neighbor"
+    public static let channel = "channel"             // EARFCN / NR-ARFCN
+    public static let band = "band"                   // 3GPP band number
+    public static let pci = "pci"
+    public static let cellID = "cellID"               // ECI / NCI (UInt64)
+    public static let tac = "tac"
+    public static let bandwidth = "bandwidth"         // MHz (Double)
+    public static let rsrp = "rsrp"                   // dBm (Double)
+    public static let rsrq = "rsrq"                   // dB
+    public static let rssi = "rssi"                   // dBm
+    public static let snr = "snr"                     // dB
+    public static let active = "active"               // Bool: secondary cell activated
+    public static let scellIndex = "scellIndex"       // LTE secondary cell: RRC sCellIndex
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

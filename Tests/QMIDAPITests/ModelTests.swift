@@ -269,4 +269,23 @@ final class ModelTests: XCTestCase {
         XCTAssertNil(QMIDStatus([QMIDKey.modem: "rebooting"]).modemState)   // a newer qmid's state
         XCTAssertEqual(QMIDPolicy.allCases.map(\.rawValue), ["prefer-wifi", "prefer-cellular", "last-resort", "never"])
     }
+
+    func testRadioRoundTripAndBands() throws {
+        var c = QMIDCell(rat: .lte, role: .primary)
+        c.channel = 1313; c.band = 3; c.pci = 272; c.cellID = 0x01234504; c.bandwidth = 20; c.rsrp = -96; c.snr = 13
+        var nr = QMIDCell(rat: .nr, role: .secondary)
+        nr.channel = 504990; nr.band = 41; nr.pci = 185; nr.rsrp = -90
+        var scell = QMIDCell(rat: .lte, role: .secondary)
+        scell.channel = 325; scell.active = true; scell.scellIndex = 1
+        let r = QMIDRadio(cells: [c, scell, nr], endcAvailable: true)
+        XCTAssertEqual(QMIDRadio(r.dictionary), r)
+        XCTAssertEqual(r.serving.count, 3)
+        XCTAssertEqual(QMIDCell.band(.lte, channel: 1313), 3)
+        XCTAssertEqual(QMIDCell.band(.lte, channel: 325), 1)
+        XCTAssertEqual(QMIDCell.band(.lte, channel: 66786), 66)
+        XCTAssertEqual(QMIDCell.band(.nr, channel: 504990), 41)
+        XCTAssertEqual(QMIDCell.band(.nr, channel: 636666), 78)
+        XCTAssertEqual(QMIDCell.band(.nr, channel: 660000), 77)
+        XCTAssertNil(QMIDCell.band(.lte, channel: 10400))
+    }
 }

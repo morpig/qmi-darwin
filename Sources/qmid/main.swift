@@ -209,6 +209,12 @@ final class Control: NSObject, QMIDControl {
     func cancelSIM(_ iccid: String, reply: @escaping (String?) -> Void) {
         manager.queue.async { reply(self.manager.cancelSIM(iccid: iccid)) }
     }
+    func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
+        manager.queue.async {
+            let (d, err) = self.manager.radio(raw: raw)
+            reply(d, err)
+        }
+    }
 }
 
 final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
