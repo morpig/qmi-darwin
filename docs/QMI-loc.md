@@ -77,10 +77,11 @@ registers and starts again. As observed:
 - Fixes work in airplane mode (2.9 s).
 - Releasing the client without Stop turns the engine off at once. A session does not survive
   a modem reset: a new client must Start again.
-- Started 1.4 s after the modem came back from a reset, the first fix took 99 s; started a
-  minute after a reset, 5.4 s. Likely the modem has no time until the network gives it one,
-  and can't use XTRA without it. qmid writes no time to the modem; each position carries the
-  modem's own UTC of the fix (TLV 0x25, `QMIDLocation.time`).
+- Time to first fix after a modem reset (outdoors, valid XTRA), the session started by
+  qmid 1.4 s after the modem came back: 5.9 s in one run, 99 s in another, with the same
+  setup. Started a minute after a reset (direct probe): 5.4 s. The cause of the slow run is
+  not known; not enough runs to say how often it happens. qmid writes no time to the modem;
+  each position carries the modem's own UTC of the fix (TLV 0x25, `QMIDLocation.time`).
 - Satellites, 0x0025: the list is **TLV 0x11** with 29-byte entries (libqmi: 0x10 with 28
   bytes). Each entry is valid mask u32, system u32, satellite ID u16, health u8, status u32,
   navigation data u8, elevation, azimuth and C/N0 as floats, then one byte that was always 0.

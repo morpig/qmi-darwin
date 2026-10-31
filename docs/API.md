@@ -498,8 +498,8 @@ dual-frequency modem lists a satellite once per signal (`signal` `"L1"`, `"L5"`,
   modem drops its session; qmid starts a new one) and sleep. Calling it again changes this
   client's options. `nmea: true` adds the modem's NMEA sentences (`onNMEA`).
 - GNSS works in airplane mode. A first fix outdoors takes about 5 s with valid XTRA data
-  (see "GNSS assistance (XTRA)"), about 1–3 s right after an earlier fix, and up to about
-  100 s right after a modem restart. `time` is the modem's UTC of the fix.
+  (see "GNSS assistance (XTRA)"), about 1–3 s right after an earlier fix. Right after a
+  modem restart it was usually about as fast, once 99 s. `time` is the modem's UTC of the fix.
 - `gnss()` / `onGNSS` (`QMIDGNSS`): `engine` (`"on"`, `"off"`, `"unknown"`), `running`,
   `interval`, `clients`, `lastFix` (time only). Also in `status()` as `gnss`.
 
