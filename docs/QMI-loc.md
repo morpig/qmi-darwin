@@ -77,11 +77,10 @@ registers and starts again. As observed:
 - Fixes work in airplane mode (2.9 s).
 - Releasing the client without Stop turns the engine off at once. A session does not survive
   a modem reset: a new client must Start again.
-- Right after a reset the modem has no time until the network gives it one, and without it
-  the engine can't use XTRA: started 1.4 s after the modem came back, the first fix took 99 s
-  (a cold start). qmid therefore injects the Mac's clock first (Inject UTC Time 0x0038: 0x01 UTC
-  in ms, 0x02 uncertainty in ms; 500 ms), and the first fix after a reset took 17 s. Started a
-  minute after a reset, without injection: 5.4 s.
+- Started 1.4 s after the modem came back from a reset, the first fix took 99 s; started a
+  minute after a reset, 5.4 s. Likely the modem has no time until the network gives it one,
+  and can't use XTRA without it. qmid writes no time to the modem; each position carries the
+  modem's own UTC of the fix (TLV 0x25, `QMIDLocation.time`).
 - Satellites, 0x0025: the list is **TLV 0x11** with 29-byte entries (libqmi: 0x10 with 28
   bytes). Each entry is valid mask u32, system u32, satellite ID u16, health u8, status u32,
   navigation data u8, elevation, azimuth and C/N0 as floats, then one byte that was always 0.

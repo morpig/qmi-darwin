@@ -139,19 +139,6 @@ public enum LOC {
 
     public static func stopRequest(session: UInt8 = 1) -> [TLV] { [.u8(0x01, session)] }
 
-    // Inject UTC Time: 0x01 UTC (u64 ms), 0x02 its uncertainty (u32 ms). Answered by an
-    // indication. Right after a modem reset the engine has no time until the network gives
-    // it one; without it, XTRA can't be used and the first fix is a cold start (~100 s).
-    public static let injectUTCTime: UInt16 = 0x0038
-
-    public static func injectUTCTimeRequest(_ date: Date, uncertaintyMs: UInt32) -> [TLV] {
-        var w = ByteWriter()
-        let ms = UInt64(max(0, date.timeIntervalSince1970 * 1000))
-        w.u32(UInt32(truncatingIfNeeded: ms))
-        w.u32(UInt32(truncatingIfNeeded: ms >> 32))
-        return [TLV(0x01, w.bytes), .u32(0x02, uncertaintyMs)]
-    }
-
     // Engine State: TLV 0x01 is the state (1 on, 2 off), not a status.
     public static func parseEngineOn(_ m: QMIMessage) -> Bool? {
         u32(m[tlv: 0x01]).flatMap { $0 == 1 ? true : $0 == 2 ? false : nil }

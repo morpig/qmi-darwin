@@ -2101,7 +2101,7 @@ public final class Manager {
     }
 
     private func makeLocationSession(_ dev: QMIDevice) -> GNSSSession {
-        let s = GNSSSession(device: dev) { [weak self] line, level in self?.queue.async { self?.log(line, level: level) } }
+        let s = GNSSSession(device: dev)
         s.onLocation = { [weak self] l in
             guard let self else { return }
             if l.fix == .fix {

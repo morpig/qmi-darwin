@@ -90,8 +90,6 @@ final class LOCTests: XCTestCase {
         XCTAssertEqual(LOC.startRequest(intervalMs: 1000),
                        [.u8(0x01, 1), .u32(0x10, 1), .u32(0x12, 1), .u32(0x13, 1000)])
         XCTAssertEqual(LOC.stopRequest(), [.u8(0x01, 1)])
-        XCTAssertEqual(LOC.injectUTCTimeRequest(Date(timeIntervalSince1970: 1_793_439_462.5), uncertaintyMs: 500),
-                       [TLV(0x01, [UInt8](hex: le(UInt64(1_793_439_462_500)))!), .u32(0x02, 500)])
         let mask: LOC.EventMask = [.position, .satellites, .engineState, .fixSessionState]
         XCTAssertEqual(mask.rawValue, 0x183)
         XCTAssertEqual(LOC.registerEventsRequest(mask), LOC.registerEventsRequest(0x183))

@@ -36,23 +36,8 @@ final class GNSSSession {
 
     private struct SignalKey: Hashable { let id: Int; let signal: UInt64? }
 
-    private let log: (String, QMIDLogLevel) -> Void
-
-    init(device: QMIDevice, log: @escaping (String, QMIDLogLevel) -> Void) {
+    init(device: QMIDevice) {
         self.device = device
-        self.log = log
-    }
-
-    // The Mac's clock (NTP) to the engine before a session starts. Needed after a modem reset,
-    // when the modem has no time yet; harmless otherwise (the engine keeps the better one).
-    private func injectTime(_ c: QMIClient) {
-        do {
-            let ind = try c.requestIndication(LOC.injectUTCTime, LOC.injectUTCTimeRequest(Date(), uncertaintyMs: 500))
-            let status = LOC.indicationStatus(ind) ?? .success
-            log("location: time injected (\(status))", status == .success ? .debug : .info)
-        } catch {
-            log("location: time not injected: \(error)", .info)
-        }
     }
 
     func owns(_ clientID: UInt8) -> Bool {
@@ -102,7 +87,7 @@ final class GNSSSession {
             try c.request(LOC.registerEvents, LOC.registerEventsRequest(events), timeout: 5)
         }
         if before?.interval != want.interval {
-            if before != nil { _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3) } else { injectTime(c) }
+            if before != nil { _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3) }
             try c.request(LOC.start, LOC.startRequest(intervalMs: UInt32(want.interval)), timeout: 5)
         }
         applied = want

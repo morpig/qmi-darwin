@@ -1015,6 +1015,9 @@ func gnssWatch(_ args: [String]) -> Never {
     }
     let fmt = DateFormatter()
     fmt.dateFormat = "HH:mm:ss"
+    let utc = DateFormatter()
+    utc.dateFormat = "HH:mm:ss.SSS"
+    utc.timeZone = TimeZone(identifier: "UTC")
     let started = Date()
     var first = true
     let client = QMIDClient(queue: .main)
@@ -1029,6 +1032,7 @@ func gnssWatch(_ args: [String]) -> Never {
         if let h = l.heading { s += String(format: ", heading %.0f°", h) }
         if let n = l.satellitesUsed { s += ", \(n) satellites" }
         if !l.technology.isEmpty { s += " [\(l.technology.joined(separator: ","))]" }
+        if let t = l.time { s += " utc \(utc.string(from: t))" }
         if first, l.fix == .fix {
             first = false
             s += String(format: "  (first fix after %.1f s)", Date().timeIntervalSince(started))
