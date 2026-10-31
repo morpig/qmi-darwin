@@ -742,3 +742,45 @@ public struct QMIDBandPreference: Equatable {
          QMIDKey.supportedModes: supportedModes]
     }
 }
+
+// GNSS assistance data (XTRA): predicted satellite orbits the modem uses for a fast first fix.
+// Quectel modems also fetch it themselves (AT+QGPSXTRA=1); loadXTRA puts in a file a client
+// downloaded from one of `servers`.
+public struct QMIDXTRA: Equatable {
+    public var supported: Bool
+    public var validFrom: Date?           // nil: the modem holds no XTRA data
+    public var validHours: Int?
+    public var servers: [String]
+
+    public var expires: Date? {
+        guard let validFrom, let validHours else { return nil }
+        return validFrom.addingTimeInterval(TimeInterval(validHours) * 3600)
+    }
+
+    // The data covers `date` (now by default).
+    public func isValid(at date: Date = Date()) -> Bool {
+        guard let validFrom, let expires else { return false }
+        return date >= validFrom && date < expires
+    }
+
+    public init(supported: Bool, validFrom: Date? = nil, validHours: Int? = nil, servers: [String] = []) {
+        self.supported = supported
+        self.validFrom = validFrom
+        self.validHours = validHours
+        self.servers = servers
+    }
+
+    public init(_ d: NSDictionary) {
+        supported = d[QMIDKey.supported] as? Bool ?? false
+        validFrom = (d[QMIDKey.validFrom] as? Double).map(Date.init(timeIntervalSince1970:))
+        validHours = d[QMIDKey.validHours] as? Int
+        servers = d[QMIDKey.servers] as? [String] ?? []
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.supported: supported, QMIDKey.servers: servers]
+        d[QMIDKey.validFrom] = validFrom?.timeIntervalSince1970
+        d[QMIDKey.validHours] = validHours
+        return d as NSDictionary
+    }
+}

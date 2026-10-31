@@ -315,4 +315,20 @@ final class ModelTests: XCTestCase {
         XCTAssertFalse(QMIDStatus([:]).airplaneMode)
         XCTAssertEqual(QMIDReason(rawValue: "airplane-mode"), .airplaneMode)
     }
+
+    func testXTRA() {
+        let x = QMIDXTRA(supported: true, validFrom: Date(timeIntervalSince1970: 1_793_433_600), validHours: 168,
+                         servers: ["https://xtra.example.com/a.bin"])
+        let back = QMIDXTRA(x.dictionary)
+        XCTAssertEqual(back, x)
+        XCTAssertEqual(back.expires, Date(timeIntervalSince1970: 1_793_433_600 + 168 * 3600))
+        XCTAssertTrue(x.isValid(at: Date(timeIntervalSince1970: 1_793_433_600 + 3600)))
+        XCTAssertFalse(x.isValid(at: Date(timeIntervalSince1970: 1_793_433_600 + 169 * 3600)))
+        XCTAssertFalse(x.isValid(at: Date(timeIntervalSince1970: 1_793_433_600 - 1)))
+        let none = QMIDXTRA([QMIDKey.supported: true] as NSDictionary)
+        XCTAssertNil(none.validFrom)
+        XCTAssertNil(none.expires)
+        XCTAssertFalse(none.isValid())
+        XCTAssertFalse(QMIDXTRA(NSDictionary()).supported)
+    }
 }

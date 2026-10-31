@@ -72,8 +72,19 @@ public final class QMIDevice {
     private struct Key: Hashable { let service: UInt8; let client: UInt8; let tx: UInt16; let message: UInt16 }
     private final class Waiter { let done = DispatchSemaphore(value: 0); var response: QMIMessage? }
 
+    // A reply that comes as an indication (LOC): keyed without the transaction ID, which
+    // indications don't echo, so one wait per (service, client, message) at a time.
+    private struct IndicationKey: Hashable { let service: UInt8; let client: UInt8; let message: UInt16 }
+    private final class IndicationWaiter {
+        let done = DispatchSemaphore(value: 0)
+        let match: (QMIMessage) -> Bool
+        var indication: QMIMessage?
+        init(_ match: @escaping (QMIMessage) -> Bool) { self.match = match }
+    }
+
     private let lock = NSLock()
     private var waiters: [Key: Waiter] = [:]
+    private var indicationWaiters: [IndicationKey: IndicationWaiter] = [:]
     private var ctlTX: UInt8 = 0
     private var serviceTX: UInt16 = 0
 
@@ -119,6 +130,16 @@ public final class QMIDevice {
                 w.done.signal()
             }
         case .indication:
+            let ik = IndicationKey(service: msg.service.rawValue, client: msg.clientID, message: msg.messageID)
+            lock.lock()
+            if let w = indicationWaiters[ik], w.match(msg) {
+                indicationWaiters[ik] = nil
+                lock.unlock()
+                w.indication = msg
+                w.done.signal()
+                return                              // a reply: not for onIndication
+            }
+            lock.unlock()
             if msg.service == .ctl, msg.messageID == CTL.sync {
                 lock.lock(); syncIndication = Date(); lock.unlock()
                 tr("<< CTL Sync indication: QMI ready")
@@ -165,6 +186,36 @@ public final class QMIDevice {
             throw QMIHostError.protocolError(r.error, resp)
         }
         return resp
+    }
+
+    // Sends a request whose answer comes as an indication with the same message ID on the
+    // same client (LOC), and returns that indication: the first one `match` accepts. The
+    // response must succeed as for send(); then up to `indicationTimeout` for the indication.
+    public func sendAwaitingIndication(_ service: QMIService, client: UInt8, message: UInt16, tlvs: [TLV] = [],
+                                       timeout: TimeInterval = 5, indicationTimeout: TimeInterval = 5,
+                                       accept: Set<QMIProtocolError> = [],
+                                       match: @escaping (QMIMessage) -> Bool = { _ in true }) throws -> QMIMessage {
+        let key = IndicationKey(service: service.rawValue, client: client, message: message)
+        let w = IndicationWaiter(match)
+        lock.lock()
+        guard indicationWaiters[key] == nil else {
+            lock.unlock()
+            throw QMIHostError.transport(String(format: "already waiting for %@ 0x%04x", service.name, message))
+        }
+        indicationWaiters[key] = w                  // before sending: the indication can come right behind the response
+        lock.unlock()
+        func drop() { lock.lock(); if indicationWaiters[key] === w { indicationWaiters[key] = nil }; lock.unlock() }
+        do {
+            try send(service, client: client, message: message, tlvs: tlvs, timeout: timeout, accept: accept)
+        } catch {
+            drop()
+            throw error
+        }
+        guard w.done.wait(timeout: .now() + indicationTimeout) == .success, let ind = w.indication else {
+            drop()
+            throw QMIHostError.timeout(service, message)
+        }
+        return ind
     }
 
     // cancel(): ends a sync() wait at its next 2 s step, when the interface being opened has
@@ -233,6 +284,15 @@ public final class QMIClient {
     public func request(_ message: UInt16, _ tlvs: [TLV] = [], timeout: TimeInterval = 10,
                         accept: Set<QMIProtocolError> = []) throws -> QMIMessage {
         try device.send(service, client: id, message: message, tlvs: tlvs, timeout: timeout, accept: accept)
+    }
+
+    // A request answered by an indication (QMIDevice.sendAwaitingIndication).
+    @discardableResult
+    public func requestIndication(_ message: UInt16, _ tlvs: [TLV] = [], timeout: TimeInterval = 5,
+                                  indicationTimeout: TimeInterval = 5, accept: Set<QMIProtocolError> = [],
+                                  match: @escaping (QMIMessage) -> Bool = { _ in true }) throws -> QMIMessage {
+        try device.sendAwaitingIndication(service, client: id, message: message, tlvs: tlvs, timeout: timeout,
+                                          indicationTimeout: indicationTimeout, accept: accept, match: match)
     }
 
     public func release() {

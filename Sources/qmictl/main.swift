@@ -36,6 +36,8 @@ usage (through qmid):
   qmictl modes set lte[,nr,...] [--persistent]
                                             allowed technologies (bands unchanged); lte = LTE only
   qmictl modes reset [--persistent]         back to the modes before qmid changed them
+  qmictl xtra                               GNSS assistance data (XTRA): validity, servers
+  qmictl xtra load FILE                     load an XTRA file (as downloaded from a server above)
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -944,12 +946,45 @@ func daemonCommand(_ args: [String]) -> Bool {
         withDaemon { d, done in d.setModePreference(modes, persistent: args.contains("--persistent")) { reportResult($0); done() } }
     case "modes" where args.count >= 2 && args[1] == "reset":
         withDaemon { d, done in d.resetModePreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
+    case "xtra" where args.count == 3 && args[1] == "load":
+        guard let data = FileManager.default.contents(atPath: args[2]) else { fail("cannot read \(args[2])") }
+        withDaemon { d, done in
+            d.loadXTRA(data) { dict, err in
+                guard let dict else { fail(err ?? "loadXTRA failed") }
+                print("loaded \(data.count) bytes")
+                printXTRA(QMIDXTRA(dict))
+                done()
+            }
+        }
+    case "xtra" where args.count == 1:
+        withDaemon { d, done in
+            d.xtra { dict, err in
+                guard let dict else { fail(err ?? "xtra failed") }
+                printXTRA(QMIDXTRA(dict))
+                done()
+            }
+        }
     case "cancel-sim" where args.count == 2:
         withDaemon { d, done in d.cancelSIM(args[1]) { reportResult($0); done() } }
     default:
         return false
     }
     return true
+}
+
+func printXTRA(_ x: QMIDXTRA) {
+    guard x.supported else { return print("xtra: not supported by this modem") }
+    if let from = x.validFrom, let hours = x.validHours, let expires = x.expires {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
+        f.timeZone = TimeZone(identifier: "UTC")
+        let left = expires.timeIntervalSinceNow
+        print("xtra: valid from \(f.string(from: from)) for \(hours) h, " +
+              (left > 0 ? "\(Int(left / 3600)) h \(Int(left.truncatingRemainder(dividingBy: 3600) / 60)) min left" : "expired"))
+    } else {
+        print("xtra: no data")
+    }
+    for s in x.servers { print("  server \(s)") }
 }
 
 func printBands(_ b: QMIDBandPreference) {

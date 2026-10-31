@@ -294,6 +294,16 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.resetModePreference(persistent: persistent) { self.finish($0, completion) }
     }
 
+    public func xtra(_ completion: @escaping (Result<QMIDXTRA, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.xtra { self.finish($0, $1, "xtra failed", QMIDXTRA.init, completion) }
+    }
+
+    // `data`: an XTRA file as downloaded from one of QMIDXTRA.servers. Completes with the
+    // XTRA state after the load.
+    public func loadXTRA(_ data: Data, _ completion: @escaping (Result<QMIDXTRA, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.loadXTRA(data) { self.finish($0, $1, "loadXTRA failed", QMIDXTRA.init, completion) }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -331,6 +341,9 @@ public extension QMIDClient {
         try await bridge { self.setModePreference(modes, persistent: persistent, $0) }
     }
     func resetModePreference(persistent: Bool = false) async throws { try await bridge { self.resetModePreference(persistent: persistent, $0) } }
+
+    func xtra() async throws -> QMIDXTRA { try await bridge { self.xtra($0) } }
+    func loadXTRA(_ data: Data) async throws -> QMIDXTRA { try await bridge { self.loadXTRA(data, $0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

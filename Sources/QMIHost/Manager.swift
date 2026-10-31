@@ -161,6 +161,8 @@ public final class Manager {
     private var nas: QMIClient?              // Serving System indications (registration gate)
     private var uimWatch: QMIClient?         // UIM card status indications
     private var dmsWatch: QMIClient?         // DMS operating mode indications
+    private var gnss: GNSSAssist?            // XTRA on the open modem; its calls run on gnssQueue
+    private let gnssQueue = DispatchQueue(label: "qmid.gnss")
     private var airplane = false             // the radio is off: setAirplaneMode, or someone's AT+CFUN=4
     private var restarting = false           // restartModem: its offline step isn't airplane mode
     private var imei: String?
@@ -355,6 +357,7 @@ public final class Manager {
         }
         let dev = up.device, g = up.granted
         device = dev
+        gnss = GNSSAssist(device: dev) { [weak self] s, level in self?.queue.async { self?.log(s, level: level) } }
         dmsICCIDUnsupported = false             // may be a different modem
         outsideEdits = []
         outsideEditsHalted = false
@@ -375,6 +378,7 @@ public final class Manager {
             // No PDN has been dialled yet, so there is nothing else to undo.
             wda = nil
             device = nil
+            gnss = nil
             dev.close()
             return openFailed(error)
         }
@@ -450,6 +454,7 @@ public final class Manager {
         nas = nil
         uimWatch = nil
         dmsWatch = nil
+        gnss = nil
         airplane = false                            // read again when it comes back
         restarting = false
         imei = nil
@@ -1980,6 +1985,30 @@ public final class Manager {
         return (radio.dictionary, nil)
     }
 
+    // MARK: - GNSS assistance (XTRA)
+
+    // On gnssQueue: a load takes a few seconds (60 parts, each acknowledged), and the modem's
+    // other work goes on meanwhile. Replies come from that queue.
+    public func xtra(_ reply: @escaping (NSDictionary?, String?) -> Void) {
+        guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
+        gnssQueue.async {
+            do { reply(try g.status().dictionary, nil) } catch { reply(nil, "\(error)") }
+        }
+    }
+
+    public func loadXTRA(_ data: Data, _ reply: @escaping (NSDictionary?, String?) -> Void) {
+        guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
+        log("XTRA: loading \(data.count) bytes (client request)")
+        gnssQueue.async {
+            do {
+                reply(try g.load([UInt8](data)).dictionary, nil)
+            } catch {
+                self.queue.async { self.log("XTRA: load failed: \(error)", level: .error) }
+                reply(nil, "\(error)")
+            }
+        }
+    }
+
     // MARK: - Airplane mode, restart, bands
 
     public func setAirplaneMode(_ on: Bool) -> String? {
@@ -2653,6 +2682,7 @@ public final class Manager {
         [wda, control, nas, uimWatch, dmsWatch].forEach { $0?.release() }
         device?.close()
         device = nil
+        gnss = nil
         publisher.removeAll()
         proxyMirror = nil
         LinkAnchor.down()

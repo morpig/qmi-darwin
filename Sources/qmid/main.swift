@@ -233,6 +233,12 @@ final class Control: NSObject, QMIDControl {
     func resetModePreference(persistent: Bool, reply: @escaping (String?) -> Void) {
         manager.queue.async { reply(self.manager.resetModePreference(persistent: persistent)) }
     }
+    func xtra(reply: @escaping (NSDictionary?, String?) -> Void) {
+        manager.queue.async { self.manager.xtra(reply) }
+    }
+    func loadXTRA(_ data: Data, reply: @escaping (NSDictionary?, String?) -> Void) {
+        manager.queue.async { self.manager.loadXTRA(data, reply) }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

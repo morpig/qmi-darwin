@@ -75,6 +75,13 @@ public let qmidAPIVersion = 1
     // Back to the modes qmid found before its first setModePreference (kept across qmid
     // restarts); every mode the modem has when qmid has changed nothing.
     func resetModePreference(persistent: Bool, reply: @escaping (String?) -> Void)
+    // GNSS assistance data (XTRA, predicted satellite orbits) as the modem holds it, read now
+    // (QMIDXTRA). Reply: the XTRA dictionary, or an error (no modem).
+    func xtra(reply: @escaping (NSDictionary?, String?) -> Void)
+    // Loads an XTRA file into the modem: the bytes as served by one of QMIDXTRA.servers, not
+    // checked by qmid (the modem checks them). Takes a few seconds. Reply: the XTRA dictionary
+    // read after the load, or an error (the modem did not take the file).
+    func loadXTRA(_ data: Data, reply: @escaping (NSDictionary?, String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -203,6 +210,12 @@ public enum QMIDKey {
     public static let supportedLTEBands = "supportedLTEBands" // [Int]: what the modem can use
     public static let supportedNRBands = "supportedNRBands"   // [Int]
     public static let supportedModes = "supportedModes"       // [String]: the technologies the modem has
+
+    // XTRA dictionary (xtra(), loadXTRA())
+    public static let supported = "supported"         // Bool: the modem takes XTRA data over QMI
+    public static let validFrom = "validFrom"         // Unix time (Double); absent without data
+    public static let validHours = "validHours"       // Int: how long the data lasts from validFrom
+    public static let servers = "servers"             // [String]: where the modem gets its XTRA file (URLs)
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

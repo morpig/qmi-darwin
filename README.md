@@ -23,6 +23,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 - SIM and modem details: card and PIN state, ICCID, IMSI, MSISDN, IMEI and roaming.
 - Modem control: airplane mode, modem restart, and the allowed technologies (e.g. LTE only)
   and LTE / NR bands (read, restrict, reset).
+- GNSS assistance: the modem's XTRA data (validity, servers) and loading an XTRA file
+  (`qmictl xtra`).
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works

@@ -118,6 +118,8 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `resetBandPreference(persistent:)` | back to the setting before qmid's first change | as above |
 | `setModePreference(_:persistent:)` | restricts the technologies, e.g. `["lte"]` for LTE only (see "Band preference") | as above |
 | `resetModePreference(persistent:)` | back to the modes before qmid's first change | as above |
+| `xtra` | the modem's GNSS assistance data (`QMIDXTRA`), read now (see "GNSS assistance (XTRA)") | – |
+| `loadXTRA(_:)` | loads an XTRA file into the modem; completes with `QMIDXTRA` after the load | in the modem, until the data expires or is replaced |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -416,6 +418,35 @@ try await qmid.resetModePreference()                        // back to the modes
 - Narrowing to LTE only drops the NR leg without a detach on the RM551E. Widening it again
   makes the modem detach for about a second: PDNs drop and redial, with their interfaces
   kept (`linkHeld`).
+
+## GNSS assistance (XTRA) (`QMIDXTRA`)
+
+XTRA is Qualcomm's predicted-orbit data: with it the GNSS engine needs no orbit data from the
+satellites themselves, and the first fix takes seconds instead of a minute or more. The modem
+keeps one file; `xtra()` reads what it holds:
+
+| Field | |
+|---|---|
+| `supported` | the modem takes XTRA over QMI |
+| `validFrom`, `validHours`, `expires` | the data's window (typically 168 h); nil without data. `isValid()`: covers now |
+| `servers` | the URLs the modem itself fetches the file from |
+
+```swift
+let x = try await qmid.xtra()
+if !x.isValid(), let url = x.servers.first.flatMap(URL.init(string:)) {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    let after = try await qmid.loadXTRA(data)     // a few seconds
+}
+```
+
+- Quectel modems fetch XTRA on their own (`AT+QGPSXTRA=1`, the default), over their own data
+  connection, and keep it fresh. `loadXTRA` is for when that is off or can't reach the
+  servers. A file older than the modem's still loads, and replaces it.
+- qmid doesn't check the file; the modem does. A file it doesn't accept fails the call, and
+  the data it held stays.
+- One load at a time; it takes about 2.5 s for a 60 KB file. The modem's GNSS doesn't need to
+  be idle, and it works in airplane mode.
+- The data survives a modem restart.
 
 ## Dedicated bearers and QoS
 
@@ -740,4 +771,6 @@ qmictl bands set lte 1,3 nsa 41     # restrict (until the modem restarts; --pers
 qmictl bands reset                  # back to the setting before
 qmictl modes set lte                # LTE only (bands unchanged; --persistent to store)
 qmictl modes reset                  # back to the modes before
+qmictl xtra                         # GNSS assistance data: validity, servers
+qmictl xtra load xtra3.bin          # load an XTRA file
 ```
