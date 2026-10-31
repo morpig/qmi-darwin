@@ -435,6 +435,8 @@ keeps one file; `xtra()` reads what it holds:
 | `supported` | the modem takes XTRA over QMI |
 | `validFrom`, `validHours`, `expires` | the data's window (typically 168 h); nil without data. `isValid()`: covers now |
 | `servers` | the URLs the modem names for its XTRA file |
+| `age()` | how old the data is (since `validFrom`) |
+| `autoUpdate`, `lastDownload`, `nextCheck`, `lastError` | qmid's own updates (below) |
 
 ```swift
 let x = try await qmid.xtra()
@@ -444,9 +446,15 @@ if !x.isValid(), let url = x.servers.first.flatMap(URL.init(string:)) {
 }
 ```
 
-- Don't count on the modem fetching XTRA itself: with `AT+QGPSXTRA=1` it has not been seen
-  doing so under qmid. Load a fresh file with `loadXTRA`. A file older than the modem's still
-  loads, and replaces it.
+- **qmid keeps it fresh** (config `xtra`, on by default): once the modem's data is older than
+  `maxAgeHours` (24), or missing or unreadable, qmid downloads the file from the first of
+  `servers` that answers, over the Mac's default route (HTTPS, `If-Modified-Since`, ~60 KB),
+  and loads it. It loads only a file newer than the modem's data (by `Last-Modified`). It looks
+  60 s after the modem opens, at least every 6 h, and after wake when a look was due; after a
+  failure it waits 15 min, 1 h, then 6 h. The modem has not been seen fetching XTRA by itself
+  (`AT+QGPSXTRA=1`).
+- `loadXTRA` loads a file a client brings. A file older than the modem's still loads, and
+  replaces it.
 - qmid doesn't check the file; the modem does. A file it doesn't accept fails the call, and
   the data it held stays.
 - One load at a time; it takes about 2.5 s for a 60 KB file. The modem's GNSS doesn't need to
@@ -655,6 +663,16 @@ therefore copies the settings of the first enabled service in the service order 
 proxy turned on (HTTP, HTTPS, SOCKS, PAC or auto-discovery) onto each **internet** PDN's service, and
 follows changes: turning a proxy tool on or off applies at once, without a reconnect. IMS and
 other PDNs get none. `"mirrorProxies": false` (top level) turns this off.
+
+### XTRA updates (`xtra`)
+
+```json
+"xtra": { "download": true, "maxAgeHours": 24 }
+```
+
+Top level, optional; these are the defaults. `download: false` stops qmid's own downloads
+(`loadXTRA` still works). `maxAgeHours` (1–167): how old the modem's data may get before qmid
+loads a fresh file. See "GNSS assistance (XTRA)".
 
 ### Per-SIM default bearer (`carriers`)
 

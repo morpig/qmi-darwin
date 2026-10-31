@@ -753,6 +753,15 @@ public struct QMIDXTRA: Equatable {
     public var validFrom: Date?           // nil: the modem holds no XTRA data
     public var validHours: Int?
     public var servers: [String]
+    // qmid's own updates (config "xtra"): on, the last file it loaded, its next look, and the
+    // last failure while it lasts.
+    public var autoUpdate: Bool = false
+    public var lastDownload: Date?
+    public var nextCheck: Date?
+    public var lastError: String?
+
+    // How old the data is (since validFrom).
+    public func age(at date: Date = Date()) -> TimeInterval? { validFrom.map { date.timeIntervalSince($0) } }
 
     public var expires: Date? {
         guard let validFrom, let validHours else { return nil }
@@ -777,12 +786,19 @@ public struct QMIDXTRA: Equatable {
         validFrom = (d[QMIDKey.validFrom] as? Double).map(Date.init(timeIntervalSince1970:))
         validHours = d[QMIDKey.validHours] as? Int
         servers = d[QMIDKey.servers] as? [String] ?? []
+        autoUpdate = d[QMIDKey.autoUpdate] as? Bool ?? false
+        lastDownload = (d[QMIDKey.lastDownload] as? Double).map(Date.init(timeIntervalSince1970:))
+        nextCheck = (d[QMIDKey.nextCheck] as? Double).map(Date.init(timeIntervalSince1970:))
+        lastError = d[QMIDKey.error] as? String
     }
 
     public var dictionary: NSDictionary {
-        var d: [String: Any] = [QMIDKey.supported: supported, QMIDKey.servers: servers]
+        var d: [String: Any] = [QMIDKey.supported: supported, QMIDKey.servers: servers, QMIDKey.autoUpdate: autoUpdate]
         d[QMIDKey.validFrom] = validFrom?.timeIntervalSince1970
         d[QMIDKey.validHours] = validHours
+        d[QMIDKey.lastDownload] = lastDownload?.timeIntervalSince1970
+        d[QMIDKey.nextCheck] = nextCheck?.timeIntervalSince1970
+        d[QMIDKey.error] = lastError
         return d as NSDictionary
     }
 }

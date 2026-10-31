@@ -177,6 +177,10 @@ public final class Manager {
     private var lastFix: Date?
     private var gnssRetry: DispatchWorkItem?
     private var lastGNSSEvent: NSDictionary?
+    private var xtraState = XTRAState()       // qmid's own XTRA updates (state.json "xtra")
+    private var xtraCheck: DispatchWorkItem?
+    private var xtraNext: Date?
+    private var xtraRunning = false
     private var airplane = false             // the radio is off: setAirplaneMode, or someone's AT+CFUN=4
     private var restarting = false           // restartModem: its offline step isn't airplane mode
     private var imei: String?
@@ -240,6 +244,7 @@ public final class Manager {
             learned = j["learned"] as? [String: [String: String]] ?? [:]
             bandsBefore = j["bandsBefore"] as? [String: [Int]]
             modesBefore = j["modesBefore"] as? [String]
+            xtraState = XTRAState(j["xtra"] as? [String: Any])
         }
     }
 
@@ -247,6 +252,7 @@ public final class Manager {
         var j: [String: Any] = ["profiles": savedProfiles, "learned": learned]
         j["bandsBefore"] = bandsBefore
         j["modesBefore"] = modesBefore
+        j["xtra"] = xtraState.json
         if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: URL(fileURLWithPath: statePath))
         }
@@ -420,6 +426,7 @@ public final class Manager {
         startProfileCheck()
         for p in pdns where p.wanted { dial(p) }
         applyLocation()                             // a session doesn't survive a modem reset: start anew
+        scheduleXTRACheck(in: 60)                   // once the modem has settled
     }
 
     private func openFailed(_ error: Error) {
@@ -471,6 +478,9 @@ public final class Manager {
         dmsWatch = nil
         gnss = nil
         dropLocationSession()                       // its client went with the modem; startLocation clients stay
+        xtraCheck?.cancel()
+        xtraCheck = nil
+        xtraNext = nil
         airplane = false                            // read again when it comes back
         restarting = false
         imei = nil
@@ -1565,7 +1575,10 @@ public final class Manager {
     }
 
     private func wakeCheck() {
-        if checkHealth(reason: "wake"), gnssSession != nil { applyLocation(restart: true) }
+        if checkHealth(reason: "wake") {
+            if gnssSession != nil { applyLocation(restart: true) }
+            if let next = xtraNext, next < Date() { scheduleXTRACheck(in: 5) }   // overdue while asleep
+        }
         log("wake check done")
     }
 
@@ -2015,8 +2028,22 @@ public final class Manager {
     // other work goes on meanwhile. Replies come from that queue.
     public func xtra(_ reply: @escaping (NSDictionary?, String?) -> Void) {
         guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
+        let add = xtraAnnotate
         gnssQueue.async {
-            do { reply(try g.status().dictionary, nil) } catch { reply(nil, "\(error)") }
+            do { reply(add(try g.status()).dictionary, nil) } catch { reply(nil, "\(error)") }
+        }
+    }
+
+    // qmid's update state onto a QMIDXTRA (captured on `queue`).
+    private var xtraAnnotate: (QMIDXTRA) -> QMIDXTRA {
+        let st = xtraState, next = xtraNext, on = config.xtraSettings.downloads
+        return { x in
+            var x = x
+            x.autoUpdate = on
+            x.lastDownload = st.lastDownload
+            x.nextCheck = on ? next : nil
+            x.lastError = st.lastError
+            return x
         }
     }
 
@@ -2025,12 +2052,108 @@ public final class Manager {
         log("XTRA: loading \(data.count) bytes (client request)")
         gnssQueue.async {
             do {
-                reply(try g.load([UInt8](data)).dictionary, nil)
+                let x = try g.load([UInt8](data))
+                self.queue.async { self.xtraState.failures = 0; self.xtraState.lastError = nil; self.xtraState.notBefore = nil }
+                reply(x.dictionary, nil)
             } catch {
                 self.queue.async { self.log("XTRA: load failed: \(error)", level: .error) }
                 reply(nil, "\(error)")
             }
         }
+    }
+
+    // MARK: - XTRA updates (config "xtra")
+
+    private func scheduleXTRACheck(in seconds: TimeInterval) {
+        xtraCheck?.cancel()
+        xtraCheck = nil
+        xtraNext = nil
+        guard config.xtraSettings.downloads, device != nil else { return }
+        let item = DispatchWorkItem { [weak self] in self?.runXTRACheck() }
+        xtraCheck = item
+        xtraNext = Date().addingTimeInterval(seconds)
+        queue.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    private enum XTRAOutcome {
+        case unsupported
+        case notDue(Date)
+        case loaded(QMIDXTRA, lastModified: String?, from: String)
+        case notNewer(String)
+        case failed(String)
+    }
+
+    // On gnssQueue: what the modem holds; if a load is due, download and load. The outcome is
+    // applied on `queue`.
+    private func runXTRACheck() {
+        guard let g = gnss, !xtraRunning else { return }
+        xtraRunning = true
+        let st = xtraState, maxAge = config.xtraSettings.maxAge
+        gnssQueue.async {
+            let outcome: XTRAOutcome
+            do {
+                let snap = try g.snapshot()
+                let now = Date()
+                let due = XTRASchedule.loadDue(validFrom: snap.validity?.start, unreadable: snap.unreadable, now: now,
+                                               maxAge: maxAge, notBefore: st.notBefore)
+                if !snap.supported {
+                    outcome = .unsupported
+                } else if due > now {
+                    outcome = .notDue(due)
+                } else {
+                    // Without usable data, any file will do: no If-Modified-Since.
+                    let since = snap.validity == nil ? nil : st.lastModified
+                    switch try XTRADownload.fetch(snap.servers, since: since) {
+                    case .notModified(let host):
+                        outcome = .notNewer("not modified on \(host)")
+                    case .file(let bytes, let lm, let host):
+                        let lmDate = lm.flatMap(XTRASchedule.httpDate)
+                        if !snap.unreadable, !XTRASchedule.isNewer(lastModified: lmDate, than: snap.validity?.start) {
+                            outcome = .notNewer("\(host) has nothing newer (\(lm ?? "?"))")
+                        } else {
+                            outcome = .loaded(try g.load(bytes), lastModified: lm, from: host)
+                        }
+                    }
+                }
+            } catch {
+                outcome = .failed("\(error)")
+            }
+            self.queue.async { self.xtraChecked(outcome) }
+        }
+    }
+
+    private func xtraChecked(_ outcome: XTRAOutcome) {
+        xtraRunning = false
+        let now = Date()
+        let maxAge = config.xtraSettings.maxAge
+        var next: Date?
+        switch outcome {
+        case .unsupported:
+            log("XTRA: not supported by this modem; no updates")
+        case .notDue(let due):
+            next = XTRASchedule.nextCheck(due: due, now: now)
+        case .loaded(let x, let lm, let host):
+            xtraState.lastModified = lm
+            xtraState.lastDownload = now
+            xtraState.failures = 0
+            xtraState.lastError = nil
+            xtraState.notBefore = nil
+            log("XTRA: updated from \(host)", level: .notice)
+            next = XTRASchedule.nextCheck(due: x.validFrom.map { $0.addingTimeInterval(maxAge) } ?? now, now: now)
+        case .notNewer(let why):
+            xtraState.notBefore = now.addingTimeInterval(XTRASchedule.notNewerDelay)
+            log("XTRA: \(why); asking again in 1 h")
+            next = xtraState.notBefore
+        case .failed(let e):
+            xtraState.failures += 1
+            xtraState.lastError = e
+            let delay = XTRASchedule.retryDelay(failures: xtraState.failures)
+            xtraState.notBefore = now.addingTimeInterval(delay)
+            log("XTRA: update failed (\(xtraState.failures) in a row): \(e); again in \(Int(delay / 60)) min", level: .error)
+            next = xtraState.notBefore
+        }
+        saveState()
+        if let next { scheduleXTRACheck(in: max(60, next.timeIntervalSince(now))) }
     }
 
     // MARK: - Location (GNSS sessions for client apps)
@@ -2764,8 +2887,10 @@ public final class Manager {
         // As dialed: checkSIM below may already resolve the old states against the new config.
         let before = Dictionary(uniqueKeysWithValues: pdns.map { ($0.config.name, ($0, $0.config)) })
         let mirrorChanged = (config.mirrorProxies ?? true) != (c.mirrorProxies ?? true)
+        let xtraChanged = config.xtraSettings != c.xtraSettings
         config = c
         if device != nil { checkSIM() }             // resolve against the SIM in the modem now
+        if xtraChanged { scheduleXTRACheck(in: 5) }
         let resolved = c.resolvedPDNs(for: pendingSIM ?? sim, prepared: pendingSIM != nil)
 
         var kept: [String: PDNState] = [:]

@@ -1074,6 +1074,16 @@ func printXTRA(_ x: QMIDXTRA) {
     } else {
         print("xtra: no data")
     }
+    func ago(_ d: Date) -> String {
+        let s = Int(-d.timeIntervalSinceNow)
+        return s < 3600 ? "\(s / 60) min ago" : "\(s / 3600) h \(s % 3600 / 60) min ago"
+    }
+    if let a = x.age() { print("  age \(Int(a / 3600)) h \(Int(a.truncatingRemainder(dividingBy: 3600) / 60)) min") }
+    var auto = "  updates by qmid: \(x.autoUpdate ? "on" : "off")"
+    if let d = x.lastDownload { auto += ", last \(ago(d))" }
+    if let n = x.nextCheck { auto += ", next check in \(max(0, Int(n.timeIntervalSinceNow / 60))) min" }
+    print(auto)
+    if let e = x.lastError { print("  last error: \(e)") }
     for s in x.servers { print("  server \(s)") }
 }
 

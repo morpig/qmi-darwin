@@ -226,6 +226,10 @@ public enum QMIDKey {
     public static let validFrom = "validFrom"         // Unix time (Double); absent without data
     public static let validHours = "validHours"       // Int: how long the data lasts from validFrom
     public static let servers = "servers"             // [String]: where the modem gets its XTRA file (URLs)
+    public static let autoUpdate = "autoUpdate"       // Bool: qmid downloads and loads fresh files (config "xtra")
+    public static let lastDownload = "lastDownload"   // Unix time qmid last loaded a file it downloaded
+    public static let nextCheck = "nextCheck"         // Unix time qmid looks again
+    // error                                          // the last download / load failure, while it lasts
 
     // location dictionary ("location" events)
     public static let fix = "fix"                     // QMIDLocation.Fix: "fix" | "intermediate" | "failed"

@@ -58,7 +58,9 @@ response.
 - The data survives `AT+CFUN=1,1`.
 - `AT+QGPSXTRA: 1` (XTRA on), but the modem has not been seen fetching a file by itself: the
   data it held had been loaded from outside. With qmid owning the data connections it may have
-  no way to; not checked.
+  no way to; not checked. qmid therefore keeps it fresh itself (XTRAUpdater: download from the
+  servers above, load once the data is older than 24 h; only a file whose Last-Modified is
+  after the data's start, so older data never replaces newer).
 
 ## Sessions, positions and satellites
 

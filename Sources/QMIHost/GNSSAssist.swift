@@ -39,23 +39,37 @@ final class GNSSAssist {
         self.log = log
     }
 
-    func status() throws -> QMIDXTRA {
+    struct Snapshot {
+        var supported: Bool
+        var servers: [String] = []
+        var validity: LOC.XTRAValidity?
+        var unreadable = false              // a load left unfinished: Get Validity answers MalformedMessage
+    }
+
+    // What the modem holds; the stuck state is reported, not thrown (a complete load clears it).
+    func snapshot() throws -> Snapshot {
         try withClient { c in
             let source: LOC.XTRASource
             do {
                 source = LOC.parseSource(try reply(c, LOC.getPredictedOrbitsDataSource))
             } catch QMIHostError.protocolError(.notSupported, _) {
-                return QMIDXTRA(supported: false)
+                return Snapshot(supported: false)
             }
-            let v: LOC.XTRAValidity?
             do {
-                v = try validity(c)
+                return Snapshot(supported: true, servers: source.servers, validity: try validity(c))
             } catch QMIHostError.protocolError(let e, _) where e.rawValue == 1 {
                 // MalformedMessage (AT+QGPSXTRADATA? answers ERROR alike) after a load left unfinished.
-                throw Failure.stuck("XTRA state unreadable: a load was left unfinished; a complete load or a modem restart clears it")
+                return Snapshot(supported: true, servers: source.servers, unreadable: true)
             }
-            return QMIDXTRA(supported: true, validFrom: v?.start, validHours: v?.hours, servers: source.servers)
         }
+    }
+
+    func status() throws -> QMIDXTRA {
+        let s = try snapshot()
+        if s.unreadable {
+            throw Failure.stuck("XTRA state unreadable: a load was left unfinished; a complete load or a modem restart clears it")
+        }
+        return QMIDXTRA(supported: s.supported, validFrom: s.validity?.start, validHours: s.validity?.hours, servers: s.servers)
     }
 
     // Injects `data` part by part, each acknowledged before the next; then reads the validity

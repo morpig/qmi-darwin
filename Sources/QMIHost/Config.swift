@@ -101,7 +101,20 @@ public struct QMIDConfig: Codable, Equatable {
     // Copy the proxy settings of the Mac's other services onto internet PDNs (ProxyMirror.swift),
     // so a system proxy still applies while cellular is primary. Default on.
     public var mirrorProxies: Bool? = nil
+    // GNSS assistance data: qmid downloads and loads a fresh XTRA file once the modem's is
+    // older than maxAgeHours (default 24), or missing. Default on.
+    public var xtra: XTRA? = nil
     public var pdns: [PDN]
+
+    public struct XTRA: Codable, Equatable {
+        public var download: Bool?
+        public var maxAgeHours: Int?
+
+        public var downloads: Bool { download ?? true }
+        public var maxAge: TimeInterval { TimeInterval(maxAgeHours ?? 24) * 3600 }
+    }
+
+    public var xtraSettings: XTRA { xtra ?? XTRA() }
     public var carriers: [Carrier]? = nil
 
     public struct Carrier: Codable, Equatable {
@@ -197,6 +210,9 @@ public struct QMIDConfig: Codable, Equatable {
     }
 
     public func validate() throws {
+        if let h = xtra?.maxAgeHours, !(1...167).contains(h) {
+            throw QMIHostError.transport("config: xtra maxAgeHours must be 1–167 (a file lasts 168 h)")
+        }
         for v in vendorIDs ?? [] where v.count != 4 || UInt16(v, radix: 16) == nil {
             throw QMIHostError.transport("config: vendorID \(v) is not 4 hex digits")
         }

@@ -24,8 +24,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 - Modem control: airplane mode, modem restart, and the allowed technologies (e.g. LTE only)
   and LTE / NR bands (read, restrict, reset).
 - GNSS: positions and satellites (per constellation and signal) for client apps, with the
-  engine on only while one asks (`qmictl gnss watch`); the modem's XTRA data and loading an
-  XTRA file (`qmictl xtra`).
+  engine on only while one asks (`qmictl gnss watch`); XTRA data kept fresh (downloaded
+  and loaded once a day), and loading an XTRA file (`qmictl xtra`).
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works
