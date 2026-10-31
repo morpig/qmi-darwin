@@ -746,8 +746,8 @@ public struct QMIDBandPreference: Equatable {
 }
 
 // GNSS assistance data (XTRA): predicted satellite orbits the modem uses for a fast first fix.
-// Quectel modems also fetch it themselves (AT+QGPSXTRA=1); loadXTRA puts in a file a client
-// downloaded from one of `servers`.
+// The modem has not been seen fetching it by itself under qmid; loadXTRA puts in a file a
+// client downloaded from one of `servers`.
 public struct QMIDXTRA: Equatable {
     public var supported: Bool
     public var validFrom: Date?           // nil: the modem holds no XTRA data

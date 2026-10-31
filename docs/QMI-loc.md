@@ -56,8 +56,9 @@ response.
 - Neither a running GNSS session (`AT+QGPS=1`) nor airplane mode (`AT+CFUN=4`) stops a load:
   no "engine busy", no "phone offline". qmid still retries a part up to 3 times on engine busy.
 - The data survives `AT+CFUN=1,1`.
-- The modem fetches XTRA itself (`AT+QGPSXTRA: 1`), over its own data connection: it held the
-  04:00 UTC file the same morning.
+- `AT+QGPSXTRA: 1` (XTRA on), but the modem has not been seen fetching a file by itself: the
+  data it held had been loaded from outside. With qmid owning the data connections it may have
+  no way to; not checked.
 
 ## Sessions, positions and satellites
 

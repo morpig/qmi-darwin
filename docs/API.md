@@ -434,7 +434,7 @@ keeps one file; `xtra()` reads what it holds:
 |---|---|
 | `supported` | the modem takes XTRA over QMI |
 | `validFrom`, `validHours`, `expires` | the data's window (typically 168 h); nil without data. `isValid()`: covers now |
-| `servers` | the URLs the modem itself fetches the file from |
+| `servers` | the URLs the modem names for its XTRA file |
 
 ```swift
 let x = try await qmid.xtra()
@@ -444,9 +444,9 @@ if !x.isValid(), let url = x.servers.first.flatMap(URL.init(string:)) {
 }
 ```
 
-- Quectel modems fetch XTRA on their own (`AT+QGPSXTRA=1`, the default), over their own data
-  connection, and keep it fresh. `loadXTRA` is for when that is off or can't reach the
-  servers. A file older than the modem's still loads, and replaces it.
+- Don't count on the modem fetching XTRA itself: with `AT+QGPSXTRA=1` it has not been seen
+  doing so under qmid. Load a fresh file with `loadXTRA`. A file older than the modem's still
+  loads, and replaces it.
 - qmid doesn't check the file; the modem does. A file it doesn't accept fails the call, and
   the data it held stays.
 - One load at a time; it takes about 2.5 s for a 60 KB file. The modem's GNSS doesn't need to
