@@ -239,6 +239,27 @@ final class Control: NSObject, QMIDControl {
     func loadXTRA(_ data: Data, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async { self.manager.loadXTRA(data, reply) }
     }
+    func startLocation(_ options: NSDictionary, reply: @escaping (String?) -> Void) {
+        guard let c = connection else { return reply("no connection") }
+        // Location events go to this connection only (not to subscribe()'s broadcast).
+        let events = c.remoteObjectProxyWithErrorHandler { _ in } as! QMIDEvents
+        let owner = AnyHashable(ObjectIdentifier(c))
+        let interval = options[QMIDKey.interval] as? Int ?? 1000
+        let satellites = options[QMIDKey.satellites] as? Bool ?? false
+        let nmea = options[QMIDKey.nmea] as? Bool ?? false
+        manager.queue.async {
+            reply(self.manager.startLocation(owner: owner, interval: interval, satellites: satellites, nmea: nmea,
+                                             sink: { events.qmidEvent($0) }))
+        }
+    }
+    func stopLocation(reply: @escaping (String?) -> Void) {
+        guard let c = connection else { return reply(nil) }
+        let owner = AnyHashable(ObjectIdentifier(c))
+        manager.queue.async { reply(self.manager.stopLocation(owner: owner)) }
+    }
+    func gnss(reply: @escaping (NSDictionary) -> Void) {
+        manager.queue.async { reply(self.manager.gnssStatus()) }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

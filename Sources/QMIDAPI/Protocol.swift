@@ -82,6 +82,16 @@ public let qmidAPIVersion = 1
     // checked by qmid (the modem checks them). Takes a few seconds. Reply: the XTRA dictionary
     // read after the load, or an error (the modem did not take the file).
     func loadXTRA(_ data: Data, reply: @escaping (NSDictionary?, String?) -> Void)
+    // Starts location for this connection: the modem's GNSS runs while any connection wants
+    // it, and this one gets "location" events (QMIDLocation), with satellites "satellites"
+    // events (QMIDSatellites) and with nmea "nmea" events. options: interval (ms, at least
+    // 1000), satellites (Bool), nmea (Bool). Calling it again changes the options. Lasts until
+    // stopLocation or the connection closes; kept across modem restarts. These events go only
+    // to connections that started location, without subscribe().
+    func startLocation(_ options: NSDictionary, reply: @escaping (String?) -> Void)
+    func stopLocation(reply: @escaping (String?) -> Void)
+    // The GNSS engine and session (QMIDGNSS); no position.
+    func gnss(reply: @escaping (NSDictionary) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -217,6 +227,42 @@ public enum QMIDKey {
     public static let validHours = "validHours"       // Int: how long the data lasts from validFrom
     public static let servers = "servers"             // [String]: where the modem gets its XTRA file (URLs)
 
+    // location dictionary ("location" events)
+    public static let fix = "fix"                     // QMIDLocation.Fix: "fix" | "intermediate" | "failed"
+    public static let latitude = "latitude"           // degrees (Double), WGS-84
+    public static let longitude = "longitude"
+    public static let horizontalAccuracy = "horizontalAccuracy" // m (Double), circular
+    public static let altitude = "altitude"           // m above the WGS-84 ellipsoid
+    public static let altitudeMSL = "altitudeMSL"     // m above mean sea level
+    public static let verticalAccuracy = "verticalAccuracy"
+    public static let speed = "speed"                 // m/s, horizontal
+    public static let verticalSpeed = "verticalSpeed" // m/s
+    public static let heading = "heading"             // degrees from true north
+    // time                                           // UTC of the fix (Unix time, Double)
+    public static let satellitesUsed = "satellitesUsed" // Int: satellites (not signals) in the fix
+    public static let technology = "technology"       // [String]: "satellite" | "cellular" | "wifi" | "sensors" | …
+
+    // satellite dictionary ("satellites" events: key satellites, and time)
+    public static let satellites = "satellites"
+    public static let system = "system"               // "gps" | "glonass" | "galileo" | "beidou" | "qzss" | "navic" | "sbas"
+    // id                                             // satellite number within the system's range (GPS 1–32, BeiDou 201–, …)
+    public static let signal = "signal"               // "L1", "L5", "B1I", "B1C", "B2a", "E1", "G1", …
+    // state                                          // "tracking" | "searching"
+    public static let elevation = "elevation"         // degrees
+    public static let azimuth = "azimuth"             // degrees
+    public static let cn0 = "cn0"                     // dB-Hz
+    public static let used = "used"                   // Bool: in the last fix
+
+    // GNSS dictionary (gnss(), status() "gnss", "gnss" events); never a position
+    public static let engine = "engine"               // "on" | "off" | "unknown"
+    public static let session = "session"             // "running" | "idle"
+    public static let interval = "interval"           // ms between reports while running; startLocation option
+    public static let lastFix = "lastFix"             // Unix time of the last fix
+    public static let clients = "clients"             // Int: connections that started location
+    public static let nmea = "nmea"                   // "nmea" events: the sentence; startLocation option (Bool)
+    public static let location = "location"           // "location" events: the location dictionary
+    public static let gnss = "gnss"                   // status() and "gnss" events
+
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"
     public static let pdn = "pdn"                     // PDN dictionary for type "pdn"; PDN name for type "bearers"
@@ -239,6 +285,11 @@ public enum QMIDEventType {
     public static let sim = "sim"                     // key QMIDKey.sim, absent when no SIM is known
     public static let plmn = "plmn"                   // key QMIDKey.plmn, absent while not registered
     public static let bearers = "bearers"             // keys QMIDKey.pdn (name) and QMIDKey.bearers
+    public static let gnss = "gnss"                   // key QMIDKey.gnss; to every subscriber
+    // Only to connections that called startLocation:
+    public static let location = "location"           // key QMIDKey.location
+    public static let satellites = "satellites"       // keys QMIDKey.satellites, QMIDKey.time
+    public static let nmea = "nmea"                   // key QMIDKey.nmea
 }
 
 // Status keys qmid publishes in SCDynamicStore (readable without XPC, e.g. with

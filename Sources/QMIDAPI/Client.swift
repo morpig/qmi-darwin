@@ -11,6 +11,8 @@ import Foundation
 //   qmid.status { result in ... }
 //   qmid.onLog = { entry in ... }
 //   qmid.subscribeLogs(level: .debug)        // recent history, then live; kept across restarts
+//   qmid.onLocation = { loc in ... }         // GNSS positions, after startLocation
+//   qmid.startLocation(satellites: true)     // GNSS on while this client wants it; kept across restarts
 //
 // qmid is started by launchd on demand, so the first call works even if it isn't running.
 // If qmid restarts (crash, update), the connection is re-established and the subscription
@@ -31,12 +33,20 @@ public final class QMIDClient: NSObject, QMIDEvents {
     // whenever they change; an empty list when the last one goes or the PDN goes down.
     // onEvent sees these as .unknown(type: "bearers").
     public var onBearers: ((_ pdn: String, _ bearers: [QMIDBearer]) -> Void)?
+    // After startLocation: positions (about one per interval), satellites (at most every 5 s,
+    // sooner when one is gained, lost or used) and NMEA sentences, if asked for.
+    public var onLocation: ((QMIDLocation) -> Void)?
+    public var onSatellites: ((QMIDSatellites) -> Void)?
+    public var onNMEA: ((String) -> Void)?
+    // The GNSS engine / session (after subscribe(), to every subscriber); no position.
+    public var onGNSS: ((QMIDGNSS) -> Void)?
 
     private let queue: DispatchQueue
     private let lock = NSLock()
     private var connection: NSXPCConnection?
     private var subscribed = false
     private var logLevel: QMIDLogLevel?
+    private var locationOptions: NSDictionary?  // startLocation, renewed after qmid restarts
     private var lastLogTime: Double = 0
     private var renewalPending = false
     private var available: Bool?
@@ -130,7 +140,7 @@ public final class QMIDClient: NSObject, QMIDEvents {
     // is kept pending, so qmid doesn't get the subscription (and send its snapshot) twice.
     private func resubscribe(after delay: TimeInterval) {
         lock.lock()
-        let wanted = subscribed || logLevel != nil
+        let wanted = subscribed || logLevel != nil || locationOptions != nil
         guard wanted, !renewalPending else { lock.unlock(); return }
         renewalPending = true
         lock.unlock()
@@ -140,8 +150,14 @@ public final class QMIDClient: NSObject, QMIDEvents {
             self.renewalPending = false
             let events = self.subscribed
             let level = self.logLevel
+            let location = self.locationOptions
             self.lock.unlock()
             let p = self.proxy { _ in self.resubscribe(after: 3) }
+            if let location {
+                p?.startLocation(location) { err in
+                    if err == nil { self.setAvailable(true) } else if !events && level == nil { self.resubscribe(after: 3) }
+                }
+            }
             if events {
                 p?.subscribe { ok in
                     if ok { self.setAvailable(true) } else { self.resubscribe(after: 3) }
@@ -181,8 +197,53 @@ public final class QMIDClient: NSObject, QMIDEvents {
             let bearers = (event[QMIDKey.bearers] as? [NSDictionary] ?? []).compactMap(QMIDBearer.init)
             queue.async { self.onBearers?(pdn, bearers) }
         }
+        switch event[QMIDKey.type] as? String {
+        case QMIDEventType.location?:
+            if let d = event[QMIDKey.location] as? NSDictionary {
+                let l = QMIDLocation(d)
+                queue.async { self.onLocation?(l) }
+            }
+            return
+        case QMIDEventType.satellites?:
+            let s = QMIDSatellites(event)
+            queue.async { self.onSatellites?(s) }
+            return
+        case QMIDEventType.nmea?:
+            if let n = event[QMIDKey.nmea] as? String { queue.async { self.onNMEA?(n) } }
+            return
+        case QMIDEventType.gnss?:
+            if let d = event[QMIDKey.gnss] as? NSDictionary {
+                let g = QMIDGNSS(d)
+                queue.async { self.onGNSS?(g) }
+            }
+        default:
+            break
+        }
         guard let e = QMIDEvent(event) else { return }
         queue.async { self.onEvent?(e) }
+    }
+
+    // Starts location for this client (see QMIDControl.startLocation); kept across qmid
+    // restarts until stopLocation. Calling it again changes the options.
+    public func startLocation(interval: TimeInterval = 1, satellites: Bool = false, nmea: Bool = false,
+                              _ completion: ((Result<Void, QMIDError>) -> Void)? = nil) {
+        let o: NSDictionary = [QMIDKey.interval: max(1000, Int(interval * 1000)), QMIDKey.satellites: satellites,
+                               QMIDKey.nmea: nmea]
+        lock.lock(); locationOptions = o; lock.unlock()
+        proxy { e in completion?(.failure(e)) }?.startLocation(o) { err in
+            if let completion { self.finish(err, completion) }
+        }
+    }
+
+    public func stopLocation(_ completion: ((Result<Void, QMIDError>) -> Void)? = nil) {
+        lock.lock(); locationOptions = nil; lock.unlock()
+        proxy { e in completion?(.failure(e)) }?.stopLocation { err in
+            if let completion { self.finish(err, completion) }
+        }
+    }
+
+    public func gnss(_ completion: @escaping (Result<QMIDGNSS, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.gnss { d in self.queue.async { completion(.success(QMIDGNSS(d))) } }
     }
 
     // MARK: Calls (completion on `queue`)
@@ -344,6 +405,11 @@ public extension QMIDClient {
 
     func xtra() async throws -> QMIDXTRA { try await bridge { self.xtra($0) } }
     func loadXTRA(_ data: Data) async throws -> QMIDXTRA { try await bridge { self.loadXTRA(data, $0) } }
+    func startLocation(interval: TimeInterval = 1, satellites: Bool = false, nmea: Bool = false) async throws {
+        try await bridge { self.startLocation(interval: interval, satellites: satellites, nmea: nmea, $0) }
+    }
+    func stopLocation() async throws { try await bridge { self.stopLocation($0) } }
+    func gnss() async throws -> QMIDGNSS { try await bridge { self.gnss($0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

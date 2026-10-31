@@ -1,7 +1,8 @@
 # GNSS over QMI (LOC)
 
-What the modem's location service (QMI LOC, service 0x10) does, and how qmid uses it. qmid
-reads and loads XTRA assistance data (docs/API.md, "GNSS assistance (XTRA)").
+What the modem's location service (QMI LOC, service 0x10) does, and how qmid uses it: XTRA
+assistance data, and location sessions for client apps (docs/API.md, "GNSS assistance
+(XTRA)" and "Location").
 
 Message and TLV numbers follow Qualcomm's QMI IDL (`location_service_v02`). Where libqmi
 differs, the IDL is what the modem sends. Everything below was checked on an RM551E-GL
@@ -58,9 +59,13 @@ response.
 - The modem fetches XTRA itself (`AT+QGPSXTRA: 1`), over its own data connection: it held the
   04:00 UTC file the same morning.
 
-## Sessions, positions and satellites (for location support)
+## Sessions, positions and satellites
 
-Not used by qmid yet. As observed:
+`GNSSSession`: one LOC client while some client app wants location; Register Events
+(position, engine state, plus satellites / NMEA when asked), then Start with the shortest
+interval asked for. An interval change is Stop + Start. When no client wants it: Stop, and the
+client is released. After a modem reset or reopen a new session starts; after wake it
+registers and starts again. As observed:
 
 - Start 0x0022: 0x01 session ID, 0x10 recurrence (1 periodic), 0x12 intermediate reports
   (1 on), 0x13 minimum interval in ms. Stop 0x0023: 0x01 session ID.
@@ -71,7 +76,12 @@ Not used by qmid yet. As observed:
   session (hot). Accuracy ±5–8 m within 13 s, with 15–20 signals used.
 - Fixes work in airplane mode (2.9 s).
 - Releasing the client without Stop turns the engine off at once. A session does not survive
-  a modem reset: a new client must Start again (5.4 s to a fix after the reset).
+  a modem reset: a new client must Start again.
+- Right after a reset the modem has no time until the network gives it one, and without it
+  the engine can't use XTRA: started 1.4 s after the modem came back, the first fix took 99 s
+  (a cold start). qmid therefore injects the Mac's clock first (Inject UTC Time 0x0038: 0x01 UTC
+  in ms, 0x02 uncertainty in ms; 500 ms), and the first fix after a reset took 17 s. Started a
+  minute after a reset, without injection: 5.4 s.
 - Satellites, 0x0025: the list is **TLV 0x11** with 29-byte entries (libqmi: 0x10 with 28
   bytes). Each entry is valid mask u32, system u32, satellite ID u16, health u8, status u32,
   navigation data u8, elevation, azimuth and C/N0 as floats, then one byte that was always 0.

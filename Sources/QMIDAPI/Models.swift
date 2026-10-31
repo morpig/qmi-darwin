@@ -469,6 +469,7 @@ public struct QMIDStatus: Equatable {
     public var plmn: QMIDPLMN?
     public var imei: String?
     public var airplaneMode: Bool
+    public var gnss: QMIDGNSS?
 
     public var modemState: QMIDModemState? { QMIDModemState(rawValue: modem) }
     public var isModemReady: Bool { modemState == .ready }
@@ -485,6 +486,7 @@ public struct QMIDStatus: Equatable {
         plmn = QMIDPLMN(d[QMIDKey.plmn] as? NSDictionary)
         imei = d[QMIDKey.imei] as? String
         airplaneMode = d[QMIDKey.airplaneMode] as? Bool ?? false
+        gnss = (d[QMIDKey.gnss] as? NSDictionary).map(QMIDGNSS.init)
     }
 }
 
@@ -781,6 +783,176 @@ public struct QMIDXTRA: Equatable {
         var d: [String: Any] = [QMIDKey.supported: supported, QMIDKey.servers: servers]
         d[QMIDKey.validFrom] = validFrom?.timeIntervalSince1970
         d[QMIDKey.validHours] = validHours
+        return d as NSDictionary
+    }
+}
+
+// A position from the modem's GNSS ("location" events, after startLocation).
+public struct QMIDLocation: Equatable {
+    public enum Fix: String {
+        case fix                              // a satellite fix
+        case intermediate                     // while searching: coarse (e.g. cell based, ±km), may improve
+        case failed                           // the attempt failed (no position)
+    }
+
+    public var fixName: String                // raw value, kept when unknown
+    public var latitude: Double?
+    public var longitude: Double?
+    public var horizontalAccuracy: Double?
+    public var altitude: Double?
+    public var altitudeMSL: Double?
+    public var verticalAccuracy: Double?
+    public var speed: Double?
+    public var verticalSpeed: Double?
+    public var heading: Double?
+    public var time: Date?
+    public var satellitesUsed: Int?
+    public var technology: [String]
+
+    public var fix: Fix? { Fix(rawValue: fixName) }
+
+    public init(fix: Fix) {
+        fixName = fix.rawValue
+        technology = []
+    }
+
+    public init(_ d: NSDictionary) {
+        fixName = d[QMIDKey.fix] as? String ?? "unknown"
+        latitude = d[QMIDKey.latitude] as? Double
+        longitude = d[QMIDKey.longitude] as? Double
+        horizontalAccuracy = d[QMIDKey.horizontalAccuracy] as? Double
+        altitude = d[QMIDKey.altitude] as? Double
+        altitudeMSL = d[QMIDKey.altitudeMSL] as? Double
+        verticalAccuracy = d[QMIDKey.verticalAccuracy] as? Double
+        speed = d[QMIDKey.speed] as? Double
+        verticalSpeed = d[QMIDKey.verticalSpeed] as? Double
+        heading = d[QMIDKey.heading] as? Double
+        time = (d[QMIDKey.time] as? Double).map(Date.init(timeIntervalSince1970:))
+        satellitesUsed = d[QMIDKey.satellitesUsed] as? Int
+        technology = d[QMIDKey.technology] as? [String] ?? []
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.fix: fixName, QMIDKey.technology: technology]
+        d[QMIDKey.latitude] = latitude
+        d[QMIDKey.longitude] = longitude
+        d[QMIDKey.horizontalAccuracy] = horizontalAccuracy
+        d[QMIDKey.altitude] = altitude
+        d[QMIDKey.altitudeMSL] = altitudeMSL
+        d[QMIDKey.verticalAccuracy] = verticalAccuracy
+        d[QMIDKey.speed] = speed
+        d[QMIDKey.verticalSpeed] = verticalSpeed
+        d[QMIDKey.heading] = heading
+        d[QMIDKey.time] = time?.timeIntervalSince1970
+        d[QMIDKey.satellitesUsed] = satellitesUsed
+        return d as NSDictionary
+    }
+}
+
+// One signal of one satellite: a dual-frequency receiver lists a satellite once per signal.
+public struct QMIDSatellite: Equatable {
+    public var system: String                 // "gps", "beidou", …; "system N" when unknown
+    public var id: Int
+    public var signal: String?
+    public var tracking: Bool                 // false: searching
+    public var elevation: Double?
+    public var azimuth: Double?
+    public var cn0: Double?
+    public var used: Bool
+
+    public init(system: String, id: Int, signal: String? = nil, tracking: Bool, elevation: Double? = nil,
+                azimuth: Double? = nil, cn0: Double? = nil, used: Bool = false) {
+        self.system = system
+        self.id = id
+        self.signal = signal
+        self.tracking = tracking
+        self.elevation = elevation
+        self.azimuth = azimuth
+        self.cn0 = cn0
+        self.used = used
+    }
+
+    public init?(_ d: NSDictionary) {
+        guard let system = d[QMIDKey.system] as? String, let id = d[QMIDKey.id] as? Int else { return nil }
+        self.system = system
+        self.id = id
+        signal = d[QMIDKey.signal] as? String
+        tracking = d[QMIDKey.state] as? String == "tracking"
+        elevation = d[QMIDKey.elevation] as? Double
+        azimuth = d[QMIDKey.azimuth] as? Double
+        cn0 = d[QMIDKey.cn0] as? Double
+        used = d[QMIDKey.used] as? Bool ?? false
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.system: system, QMIDKey.id: id, QMIDKey.state: tracking ? "tracking" : "searching",
+                                QMIDKey.used: used]
+        d[QMIDKey.signal] = signal
+        d[QMIDKey.elevation] = elevation
+        d[QMIDKey.azimuth] = azimuth
+        d[QMIDKey.cn0] = cn0
+        return d as NSDictionary
+    }
+}
+
+// The satellites the engine sees ("satellites" events): searched and tracked signals.
+public struct QMIDSatellites: Equatable {
+    public var satellites: [QMIDSatellite]
+    public var time: Date
+
+    public init(satellites: [QMIDSatellite], time: Date) {
+        self.satellites = satellites
+        self.time = time
+    }
+
+    public init(_ d: NSDictionary) {
+        satellites = (d[QMIDKey.satellites] as? [NSDictionary] ?? []).compactMap(QMIDSatellite.init)
+        time = (d[QMIDKey.time] as? Double).map(Date.init(timeIntervalSince1970:)) ?? Date()
+    }
+
+    public var dictionary: NSDictionary {
+        [QMIDKey.satellites: satellites.map(\.dictionary), QMIDKey.time: time.timeIntervalSince1970]
+    }
+
+    public var tracking: [QMIDSatellite] { satellites.filter(\.tracking) }
+
+    // Per system: signals tracked and satellites (not signals) used in the fix.
+    public var summary: [(system: String, tracking: Int, used: Int)] {
+        Dictionary(grouping: satellites, by: \.system).map { system, list in
+            (system, list.filter(\.tracking).count, Set(list.filter(\.used).map(\.id)).count)
+        }.sorted { $0.system < $1.system }
+    }
+}
+
+// The GNSS engine and the location session qmid runs for its clients; never a position.
+public struct QMIDGNSS: Equatable {
+    public var engine: String                 // "on" | "off" | "unknown"
+    public var running: Bool                  // a session runs (some connection started location)
+    public var interval: Int?                 // ms between reports while running
+    public var lastFix: Date?
+    public var clients: Int
+
+    public init(engine: String = "unknown", running: Bool = false, interval: Int? = nil, lastFix: Date? = nil, clients: Int = 0) {
+        self.engine = engine
+        self.running = running
+        self.interval = interval
+        self.lastFix = lastFix
+        self.clients = clients
+    }
+
+    public init(_ d: NSDictionary) {
+        engine = d[QMIDKey.engine] as? String ?? "unknown"
+        running = d[QMIDKey.session] as? String == "running"
+        interval = d[QMIDKey.interval] as? Int
+        lastFix = (d[QMIDKey.lastFix] as? Double).map(Date.init(timeIntervalSince1970:))
+        clients = d[QMIDKey.clients] as? Int ?? 0
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.engine: engine, QMIDKey.session: running ? "running" : "idle",
+                                QMIDKey.clients: clients]
+        d[QMIDKey.interval] = interval
+        d[QMIDKey.lastFix] = lastFix?.timeIntervalSince1970
         return d as NSDictionary
     }
 }

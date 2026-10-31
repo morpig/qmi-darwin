@@ -77,11 +77,13 @@ qmid.onPLMN = { plmn in                  // QMIDPLMN?, see "Registered network a
 qmid.onBearers = { pdn, bearers in       // [QMIDBearer], see "Dedicated bearers and QoS"
     // full list for that PDN; [] when it has none
 }
+qmid.onGNSS = { gnss in                  // QMIDGNSS, see "Location"; never a position
+}
 qmid.subscribe()                         // current state arrives immediately as events
 ```
 
 - Call `subscribe()` once. The client reconnects and resubscribes by itself if qmid restarts,
-  and a fresh snapshot (one `.modem`, one `onSIM` and one `onPLMN` call, one `.pdn` per PDN, and one `onBearers` call per connected PDN)
+  and a fresh snapshot (one `.modem`, one `onSIM`, `onPLMN` and `onGNSS` call, one `.pdn` per PDN, and one `onBearers` call per connected PDN)
   arrives each time.
 - Treat events as **full state, not deltas**: each `.pdn` event carries the whole PDN.
 - `status()` returns the same data on demand (plus datapath counters and the modem's `imei`) if you need a pull.
@@ -120,6 +122,9 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `resetModePreference(persistent:)` | back to the modes before qmid's first change | as above |
 | `xtra` | the modem's GNSS assistance data (`QMIDXTRA`), read now (see "GNSS assistance (XTRA)") | – |
 | `loadXTRA(_:)` | loads an XTRA file into the modem; completes with `QMIDXTRA` after the load | in the modem, until the data expires or is replaced |
+| `startLocation(interval:satellites:nmea:)` | the modem's GNSS on for this client: positions to `onLocation` (see "Location") | until `stopLocation` or the client goes; kept across qmid and modem restarts |
+| `stopLocation` | this client no longer wants positions; GNSS off when no client does | – |
+| `gnss` | the GNSS engine and session (`QMIDGNSS`); no position | – |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -448,6 +453,56 @@ if !x.isValid(), let url = x.servers.first.flatMap(URL.init(string:)) {
   be idle, and it works in airplane mode.
 - The data survives a modem restart.
 
+## Location (`QMIDLocation`, `QMIDSatellites`)
+
+qmid runs the modem's GNSS for client apps that ask for it, and only while one does:
+
+```swift
+qmid.onLocation = { loc in               // QMIDLocation
+    guard loc.fix == .fix, let lat = loc.latitude, let lon = loc.longitude else { return }
+    // loc.horizontalAccuracy (m), altitudeMSL, speed, heading, time, satellitesUsed
+}
+qmid.onSatellites = { sats in            // QMIDSatellites: every 5 s, or when one is gained / lost / used
+    for s in sats.summary { print(s.system, s.tracking, s.used) }
+}
+qmid.startLocation(interval: 1, satellites: true)
+// …
+qmid.stopLocation()
+```
+
+| `QMIDLocation` | |
+|---|---|
+| `fix` | `.fix`; `.intermediate` while searching: coarse, often cell based (±1–10 km) at first, then from the first satellites; `.failed` (no position) |
+| `latitude`, `longitude` | degrees, WGS-84 |
+| `horizontalAccuracy`, `verticalAccuracy` | m |
+| `altitude`, `altitudeMSL` | m above the WGS-84 ellipsoid / mean sea level |
+| `speed`, `verticalSpeed`, `heading` | m/s, m/s, degrees from true north (when moving) |
+| `time` | UTC of the fix |
+| `satellitesUsed` | satellites (not signals) in the fix |
+| `technology` | `["satellite"]`, `["cellular"]`, … |
+
+`QMIDSatellites.satellites` lists each **signal** the engine searches or tracks: a
+dual-frequency modem lists a satellite once per signal (`signal` `"L1"`, `"L5"`, `"B1I"`,
+`"B2a"`, …). Each has `system` (`"gps"`, `"beidou"`, `"galileo"`, `"glonass"`, `"qzss"`, …),
+`id`, `tracking`, `elevation`, `azimuth`, `cn0` (dB-Hz) and `used` (in the last fix);
+`summary` counts per system.
+
+- **Privacy:** `location`, `satellites` and `nmea` events go only to the connection that called
+  `startLocation`, never to other subscribers. qmid publishes no position in SCDynamicStore or
+  in its log (only accuracy and satellite counts). The QMI message trace at debug level holds
+  the raw messages, positions included.
+- **Power:** the GNSS engine runs while at least one client wants location, at the shortest
+  interval asked for (at least 1 s). It turns off when the last one stops or goes away (quits
+  or crashes).
+- `startLocation` is kept like `subscribe()`: across qmid restarts, modem restarts (the
+  modem drops its session; qmid starts a new one) and sleep. Calling it again changes this
+  client's options. `nmea: true` adds the modem's NMEA sentences (`onNMEA`).
+- GNSS works in airplane mode. A first fix outdoors takes about 5 s with valid XTRA data
+  (see "GNSS assistance (XTRA)"), about 1–3 s right after an earlier fix, and about 15–20 s
+  right after a modem restart (qmid gives the modem the time from the Mac's clock).
+- `gnss()` / `onGNSS` (`QMIDGNSS`): `engine` (`"on"`, `"off"`, `"unknown"`), `running`,
+  `interval`, `clients`, `lastFix` (time only). Also in `status()` as `gnss`.
+
 ## Dedicated bearers and QoS
 
 Besides its default bearer, a PDN can have **dedicated EPS bearers** that the network sets up
@@ -771,6 +826,8 @@ qmictl bands set lte 1,3 nsa 41     # restrict (until the modem restarts; --pers
 qmictl bands reset                  # back to the setting before
 qmictl modes set lte                # LTE only (bands unchanged; --persistent to store)
 qmictl modes reset                  # back to the modes before
+qmictl gnss                         # GNSS engine / session, XTRA
+qmictl gnss watch --sats            # positions and satellites through qmid (-v: each signal; Ctrl-C ends)
 qmictl xtra                         # GNSS assistance data: validity, servers
 qmictl xtra load xtra3.bin          # load an XTRA file
 ```

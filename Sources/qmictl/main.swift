@@ -36,6 +36,9 @@ usage (through qmid):
   qmictl modes set lte[,nr,...] [--persistent]
                                             allowed technologies (bands unchanged); lte = LTE only
   qmictl modes reset [--persistent]         back to the modes before qmid changed them
+  qmictl gnss                               GNSS engine / session, XTRA
+  qmictl gnss watch [--sats] [-v] [--nmea] [--interval S] [--for S]
+                                            run GNSS through qmid: positions, satellites (-v: each)
   qmictl xtra                               GNSS assistance data (XTRA): validity, servers
   qmictl xtra load FILE                     load an XTRA file (as downloaded from a server above)
 
@@ -665,6 +668,7 @@ func printStatus(_ d: NSDictionary) {
     }
     if let i = st.imei { print("imei: \(i)") }
     if let p = st.plmn { print("operator: \(describe(p))") }
+    if let g = st.gnss, g.running || g.engine == "on" { printGNSS(g) }
     for case let p as NSDictionary in (d[QMIDKey.pdns] as? NSArray) ?? [] {
         guard let q = QMIDPDN(p) else { continue }
         var line = "\(q.name): \(q.stateName)"
@@ -767,6 +771,7 @@ func streamEvents() -> Never {
     fmt.dateFormat = "HH:mm:ss"
     let client = QMIDClient(queue: .main)
     client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
+    client.onGNSS = { g in print("\(fmt.string(from: Date())) ", terminator: ""); printGNSS(g) }
     client.onEvent = { e in
         let t = fmt.string(from: Date())
         switch e {
@@ -777,6 +782,7 @@ func streamEvents() -> Never {
         case .unknown(let type) where type == QMIDEventType.sim: break    // onSIM
         case .unknown(let type) where type == QMIDEventType.plmn: break   // onPLMN
         case .unknown(let type) where type == QMIDEventType.bearers: break   // onBearers
+        case .unknown(let type) where type == QMIDEventType.gnss: break      // onGNSS
         case .unknown(let type): print("\(t) event \(type)")
         }
     }
@@ -946,6 +952,18 @@ func daemonCommand(_ args: [String]) -> Bool {
         withDaemon { d, done in d.setModePreference(modes, persistent: args.contains("--persistent")) { reportResult($0); done() } }
     case "modes" where args.count >= 2 && args[1] == "reset":
         withDaemon { d, done in d.resetModePreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
+    case "gnss" where args.count >= 2 && args[1] == "watch":
+        gnssWatch(Array(args.dropFirst(2)))
+    case "gnss" where args.count == 1:
+        withDaemon { d, done in
+            d.gnss { dict in
+                printGNSS(QMIDGNSS(dict))
+                d.xtra { x, _ in
+                    if let x { printXTRA(QMIDXTRA(x)) }
+                    done()
+                }
+            }
+        }
     case "xtra" where args.count == 3 && args[1] == "load":
         guard let data = FileManager.default.contents(atPath: args[2]) else { fail("cannot read \(args[2])") }
         withDaemon { d, done in
@@ -970,6 +988,74 @@ func daemonCommand(_ args: [String]) -> Bool {
         return false
     }
     return true
+}
+
+func printGNSS(_ g: QMIDGNSS) {
+    var line = "gnss: engine \(g.engine), session \(g.running ? "running (\(g.interval ?? 0) ms)" : "idle")"
+    line += ", \(g.clients) client\(g.clients == 1 ? "" : "s")"
+    if let f = g.lastFix { line += ", last fix \(Int(-f.timeIntervalSinceNow)) s ago" }
+    print(line)
+}
+
+// Starts location through qmid and prints what comes; Ctrl-C (or --for) ends it, and qmid
+// stops the session when this connection closes.
+func gnssWatch(_ args: [String]) -> Never {
+    var sats = false, nmea = false, verbose = false
+    var interval: TimeInterval = 1, duration: TimeInterval?
+    var a = args[...]
+    while let x = a.popFirst() {
+        switch x {
+        case "--sats": sats = true
+        case "--nmea": nmea = true
+        case "-v": verbose = true; sats = true
+        case "--interval": interval = a.popFirst().flatMap(Double.init) ?? 1
+        case "--for": duration = a.popFirst().flatMap(Double.init)
+        default: fail("usage: qmictl gnss watch [--sats] [--nmea] [-v] [--interval S] [--for S]")
+        }
+    }
+    let fmt = DateFormatter()
+    fmt.dateFormat = "HH:mm:ss"
+    let started = Date()
+    var first = true
+    let client = QMIDClient(queue: .main)
+    client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
+    client.onGNSS = { printGNSS($0) }
+    client.onLocation = { l in
+        var s = "\(fmt.string(from: Date())) \(l.fixName)"
+        if let la = l.latitude, let lo = l.longitude { s += String(format: " %.6f, %.6f", la, lo) }
+        if let h = l.horizontalAccuracy { s += String(format: " ±%.0f m", h) }
+        if let alt = l.altitudeMSL ?? l.altitude { s += String(format: ", alt %.0f m", alt) }
+        if let v = l.speed, v > 0.5 { s += String(format: ", %.1f m/s", v) }
+        if let h = l.heading { s += String(format: ", heading %.0f°", h) }
+        if let n = l.satellitesUsed { s += ", \(n) satellites" }
+        if !l.technology.isEmpty { s += " [\(l.technology.joined(separator: ","))]" }
+        if first, l.fix == .fix {
+            first = false
+            s += String(format: "  (first fix after %.1f s)", Date().timeIntervalSince(started))
+        }
+        print(s)
+    }
+    client.onSatellites = { s in
+        let parts = s.summary.map { "\($0.system) \($0.tracking)" + ($0.used > 0 ? "/\($0.used) used" : "") }
+        print("\(fmt.string(from: s.time)) satellites: tracking " + (parts.isEmpty ? "none" : parts.joined(separator: ", "))
+              + ", searching \(s.satellites.count - s.tracking.count)")
+        guard verbose else { return }
+        for x in s.tracking.sorted(by: { ($0.system, $0.id) < ($1.system, $1.id) }) {
+            print(String(format: "    %-7@ %3d %-4@ el %4.0f° az %4.0f° C/N0 %4.1f%@", x.system, x.id, x.signal ?? "?",
+                         x.elevation ?? .nan, x.azimuth ?? .nan, x.cn0 ?? .nan, x.used ? "  used" : ""))
+        }
+    }
+    client.onNMEA = { print($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    client.subscribe()
+    client.startLocation(interval: interval, satellites: sats, nmea: nmea) { r in
+        if case .failure(let e) = r { fail("startLocation: \(e)") }
+    }
+    if let duration {
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            client.stopLocation { _ in exit(0) }
+        }
+    }
+    withExtendedLifetime(client) { dispatchMain() }
 }
 
 func printXTRA(_ x: QMIDXTRA) {

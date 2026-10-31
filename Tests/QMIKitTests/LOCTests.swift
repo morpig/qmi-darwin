@@ -81,4 +81,79 @@ final class LOCTests: XCTestCase {
         XCTAssertEqual(tlvs[0], TLV(0x01, [0x83, 0x01, 0, 0, 0x01, 0, 0, 0]))
         XCTAssertEqual(tlvs[1], TLV(0x11, [1, 0, 0, 0]))               // client type 1: required on the RM551E
     }
+
+    // MARK: - Sessions
+
+    private func le<T>(_ v: T) -> String { withUnsafeBytes(of: v) { Array($0) }.hex }
+
+    func testSessionRequests() {
+        XCTAssertEqual(LOC.startRequest(intervalMs: 1000),
+                       [.u8(0x01, 1), .u32(0x10, 1), .u32(0x12, 1), .u32(0x13, 1000)])
+        XCTAssertEqual(LOC.stopRequest(), [.u8(0x01, 1)])
+        XCTAssertEqual(LOC.injectUTCTimeRequest(Date(timeIntervalSince1970: 1_793_439_462.5), uncertaintyMs: 500),
+                       [TLV(0x01, [UInt8](hex: le(UInt64(1_793_439_462_500)))!), .u32(0x02, 500)])
+        let mask: LOC.EventMask = [.position, .satellites, .engineState, .fixSessionState]
+        XCTAssertEqual(mask.rawValue, 0x183)
+        XCTAssertEqual(LOC.registerEventsRequest(mask), LOC.registerEventsRequest(0x183))
+    }
+
+    // Test coordinates; layout as the RM551E reports a fix.
+    func testPosition() throws {
+        let m = try indication(LOC.positionReport, [
+            (0x01, "00 00 00 00"), (0x02, "01"),
+            (0x10, le(Double(1.5))), (0x11, le(Double(-2.25))),
+            (0x12, le(Float(7.5))), (0x18, le(Float(0))), (0x1A, le(Float(38))), (0x1B, le(Float(35.5))),
+            (0x1C, le(Float(10.875))), (0x1F, le(Float(0))), (0x23, "01 00 00 00"),
+            (0x25, le(UInt64(1_793_439_462_000))),
+            // 5 used, once per signal: GPS 1 (L1, L5), BeiDou 201 (B1I, B2a), QZSS 195 (L1).
+            (0x2C, "05 01 00 01 00 c9 00 c9 00 c3 00"),
+            (0x37, "05" + le(UInt64(0x1)) + le(UInt64(0x8)) + le(UInt64(0x200)) + le(UInt64(0x80000)) + le(UInt64(0x2000))),
+        ])
+        let p = try XCTUnwrap(LOC.parsePosition(m))
+        XCTAssertEqual(p.status, 0)
+        XCTAssertEqual(p.latitude, 1.5)
+        XCTAssertEqual(p.longitude, -2.25)
+        XCTAssertEqual(p.horizontalAccuracy, 7.5)
+        XCTAssertEqual(p.altitude, 38)
+        XCTAssertEqual(p.altitudeMSL, 35.5)
+        XCTAssertNil(p.heading)
+        XCTAssertEqual(p.time, Date(timeIntervalSince1970: 1_793_439_462))
+        XCTAssertEqual(p.used.map(\.id), [1, 1, 201, 201, 195])
+        XCTAssertEqual(p.used.map(\.signal), [0x1, 0x8, 0x200, 0x80000, 0x2000])
+        XCTAssertNil(LOC.parsePosition(try indication(LOC.positionReport, [])))
+    }
+
+    private func entry(valid: UInt32 = 0xfb, system: UInt32, id: UInt16, status: UInt32,
+                       el: Float = 40, az: Float = 90, cn0: Float = 30) -> String {
+        le(valid) + le(system) + le(id) + " 00 " + le(status) + " 03 " + le(el) + " " + le(az) + " " + le(cn0) + " 00"
+    }
+
+    func testSatellites() throws {
+        let list = "04" + entry(system: 1, id: 1, status: 3) + entry(system: 6, id: 201, status: 3, cn0: 33)
+            + entry(system: 7, id: 195, status: 2) + entry(system: 1, id: 9, status: 1)
+        let types = "04" + le(UInt64(0x1)) + le(UInt64(0x200)) + le(UInt64(0x2000)) + le(UInt64(0x1))
+        let sats = LOC.parseSatellites(try indication(LOC.satelliteInfo, [(0x01, "00"), (0x11, list), (0x12, types)]))
+        XCTAssertEqual(sats.count, 3)                                       // idle (status 1) left out
+        XCTAssertEqual(sats.map(\.id), [1, 201, 195])
+        XCTAssertEqual(sats.map(\.tracking), [true, true, false])
+        XCTAssertEqual(sats.map { $0.signal.flatMap(LOC.signalName) }, ["L1", "B1I", "L1"])
+        XCTAssertEqual(sats.map { LOC.systemName($0.system) }, ["gps", "beidou", "qzss"])
+        XCTAssertEqual(sats[1].cn0, 33)
+        XCTAssertEqual(sats[0].elevation, 40)
+        // Values the valid mask leaves out are nil.
+        let bare = LOC.parseSatellites(try indication(0x25, [(0x11, "01" + entry(valid: 0x1f, system: 1, id: 3, status: 3))]))
+        XCTAssertNil(bare.first?.cn0)
+        XCTAssertNil(bare.first?.signal)
+        // libqmi's layout: TLV 0x10, 28-byte entries.
+        let old = "01" + String(entry(system: 5, id: 70, status: 3).dropLast(3))
+        XCTAssertEqual(LOC.parseSatellites(try indication(0x25, [(0x10, old)])).map(\.id), [70])
+        XCTAssertEqual(LOC.signalName(0x80000), "B2a")
+        XCTAssertNil(LOC.systemName(4))
+    }
+
+    func testEngineAndNMEA() throws {
+        XCTAssertEqual(LOC.parseEngineOn(try indication(LOC.engineState, [(0x01, "01 00 00 00")])), true)
+        XCTAssertEqual(LOC.parseEngineOn(try indication(LOC.engineState, [(0x01, "02 00 00 00")])), false)
+        XCTAssertEqual(LOC.parseNMEA(try indication(LOC.nmea, [(0x01, Array("$GPGGA,1*00\r\n".utf8).hex + " 00")])), "$GPGGA,1*00\r\n")
+    }
 }

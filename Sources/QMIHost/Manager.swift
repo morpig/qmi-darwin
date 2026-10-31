@@ -163,6 +163,20 @@ public final class Manager {
     private var dmsWatch: QMIClient?         // DMS operating mode indications
     private var gnss: GNSSAssist?            // XTRA on the open modem; its calls run on gnssQueue
     private let gnssQueue = DispatchQueue(label: "qmid.gnss")
+    // Location (startLocation): per XPC connection, what it wants and where its events go.
+    // Positions go only to these sinks, never to onEvent subscribers or the log.
+    private struct LocationClient {
+        var want: GNSSSession.Want
+        let sink: (NSDictionary) -> Void
+    }
+    private var locationClients: [AnyHashable: LocationClient] = [:]
+    private var gnssSession: GNSSSession?     // while a session is wanted and the modem is open
+    private var gnssApplied: GNSSSession.Want?  // what gnssSession was last asked for
+    private var gnssEngine: Bool?
+    private var gnssStarted: Date?            // the session's start, for the time to first fix
+    private var lastFix: Date?
+    private var gnssRetry: DispatchWorkItem?
+    private var lastGNSSEvent: NSDictionary?
     private var airplane = false             // the radio is off: setAirplaneMode, or someone's AT+CFUN=4
     private var restarting = false           // restartModem: its offline step isn't airplane mode
     private var imei: String?
@@ -405,6 +419,7 @@ public final class Manager {
         readAttach()
         startProfileCheck()
         for p in pdns where p.wanted { dial(p) }
+        applyLocation()                             // a session doesn't survive a modem reset: start anew
     }
 
     private func openFailed(_ error: Error) {
@@ -455,6 +470,7 @@ public final class Manager {
         uimWatch = nil
         dmsWatch = nil
         gnss = nil
+        dropLocationSession()                       // its client went with the modem; startLocation clients stay
         airplane = false                            // read again when it comes back
         restarting = false
         imei = nil
@@ -823,6 +839,10 @@ public final class Manager {
     }
 
     private func indication(_ m: QMIMessage, receivedAt: UInt64) {
+        if m.service == .loc {
+            if let s = gnssSession, s.owns(m.clientID) { s.handle(m) }
+            return
+        }
         if m.service == .ctl, m.messageID == CTL.sync {
             // The modem announces a (re)started QMI stack; under an open device that means the
             // client IDs qmid holds may be gone, and with them the registration indications.
@@ -1356,6 +1376,10 @@ public final class Manager {
 
     // A client's XPC connection went away (quit, crash): its prepare ends with it.
     public func clientGone(_ owner: AnyHashable) {
+        if locationClients.removeValue(forKey: owner) != nil {
+            log("location: a client went away (\(locationClients.count) left)")
+            applyLocation()
+        }
         guard pendingSIM != nil, pendingOwner == owner else { return }
         revertPendingSIM("dropped: the client went away")
     }
@@ -1541,7 +1565,7 @@ public final class Manager {
     }
 
     private func wakeCheck() {
-        checkHealth(reason: "wake")
+        if checkHealth(reason: "wake"), gnssSession != nil { applyLocation(restart: true) }
         log("wake check done")
     }
 
@@ -2009,6 +2033,132 @@ public final class Manager {
         }
     }
 
+    // MARK: - Location (GNSS sessions for client apps)
+
+    // `owner`: the XPC connection; ends with stopLocation or clientGone.
+    public func startLocation(owner: AnyHashable, interval: Int, satellites: Bool, nmea: Bool,
+                              sink: @escaping (NSDictionary) -> Void) -> String? {
+        let want = GNSSSession.Want(interval: max(1000, interval), satellites: satellites, nmea: nmea)
+        let isNew = locationClients[owner] == nil
+        locationClients[owner] = LocationClient(want: want, sink: sink)
+        log("location: \(isNew ? "started" : "changed") by a client (interval \(want.interval) ms\(satellites ? ", satellites" : "")\(nmea ? ", nmea" : ""); \(locationClients.count) client\(locationClients.count == 1 ? "" : "s"))")
+        applyLocation()
+        return nil
+    }
+
+    public func stopLocation(owner: AnyHashable) -> String? {
+        guard locationClients.removeValue(forKey: owner) != nil else { return nil }
+        log("location: stopped by a client (\(locationClients.count) left)")
+        applyLocation()
+        return nil
+    }
+
+    public func gnssStatus() -> NSDictionary { gnssInfo(withLastFix: true).dictionary }
+
+    // The fastest interval any client asked for; satellites / NMEA if any wants them.
+    private var wantedLocation: GNSSSession.Want? {
+        guard !locationClients.isEmpty else { return nil }
+        let w = locationClients.values.map(\.want)
+        return GNSSSession.Want(interval: w.map(\.interval).min() ?? 1000, satellites: w.contains { $0.satellites },
+                                nmea: w.contains { $0.nmea })
+    }
+
+    // Brings the modem's session to what the clients want. Without a modem nothing runs; the
+    // next open applies it. Airplane mode doesn't matter: GNSS works with the radio off.
+    private func applyLocation(restart: Bool = false) {
+        gnssRetry?.cancel()
+        gnssRetry = nil
+        let want = wantedLocation
+        guard let dev = device, want != nil || gnssSession != nil else { return emitGNSS() }
+        guard restart || want != gnssApplied || gnssSession == nil else { return }
+        let session = gnssSession ?? makeLocationSession(dev)
+        gnssSession = session
+        if gnssApplied == nil, want != nil { gnssStarted = Date() }
+        gnssApplied = want
+        session.apply(want, restart: restart) { [weak self] err in
+            self?.queue.async {
+                guard let self, self.gnssSession === session else { return }
+                if let err {
+                    self.log("location: \(err)", level: .error)
+                    self.gnssApplied = nil
+                    self.gnssSession = nil          // a new client next time
+                    if self.wantedLocation != nil {
+                        let retry = DispatchWorkItem { [weak self] in self?.applyLocation() }
+                        self.gnssRetry = retry
+                        self.queue.asyncAfter(deadline: .now() + 10, execute: retry)
+                    }
+                } else if want == nil, self.wantedLocation == nil {
+                    self.gnssSession = nil
+                    self.gnssEngine = false
+                    self.gnssStarted = nil
+                    self.log("location: session stopped")
+                } else if let want, restart || self.gnssEngine != true {
+                    self.log("location: session running (\(want.interval) ms)")
+                }
+                self.emitGNSS()
+            }
+        }
+    }
+
+    private func makeLocationSession(_ dev: QMIDevice) -> GNSSSession {
+        let s = GNSSSession(device: dev) { [weak self] line, level in self?.queue.async { self?.log(line, level: level) } }
+        s.onLocation = { [weak self] l in
+            guard let self else { return }
+            if l.fix == .fix {
+                if self.lastFix == nil || (self.gnssStarted.map { self.lastFix! < $0 } ?? false), let t0 = self.gnssStarted {
+                    // No position in the log: accuracy and satellites only.
+                    self.log(String(format: "location: first fix after %.1f s (±%.0f m, %d satellites)", Date().timeIntervalSince(t0),
+                                    l.horizontalAccuracy ?? -1, l.satellitesUsed ?? 0), level: .notice)
+                }
+                self.lastFix = Date()
+            }
+            let ev: NSDictionary = [QMIDKey.type: QMIDEventType.location, QMIDKey.location: l.dictionary]
+            self.locationClients.values.forEach { $0.sink(ev) }
+        }
+        s.onSatellites = { [weak self] sats in
+            guard let self else { return }
+            let ev = NSMutableDictionary(dictionary: sats.dictionary)
+            ev[QMIDKey.type] = QMIDEventType.satellites
+            self.locationClients.values.filter(\.want.satellites).forEach { $0.sink(ev) }
+        }
+        s.onNMEA = { [weak self] n in
+            let ev: NSDictionary = [QMIDKey.type: QMIDEventType.nmea, QMIDKey.nmea: n]
+            self?.locationClients.values.filter(\.want.nmea).forEach { $0.sink(ev) }
+        }
+        s.onEngine = { [weak self] on in
+            guard let self, self.gnssEngine != on else { return }
+            self.gnssEngine = on
+            self.log("location: GNSS engine \(on ? "on" : "off")")
+            self.emitGNSS()
+        }
+        return s
+    }
+
+    // The modem went away: its LOC client with it. Clients stay; the next open starts again.
+    private func dropLocationSession() {
+        gnssRetry?.cancel()
+        gnssRetry = nil
+        gnssSession = nil
+        gnssApplied = nil
+        gnssEngine = nil
+        gnssStarted = nil
+        emitGNSS()
+    }
+
+    private func gnssInfo(withLastFix: Bool) -> QMIDGNSS {
+        let running = gnssSession != nil && gnssApplied != nil
+        return QMIDGNSS(engine: gnssEngine.map { $0 ? "on" : "off" } ?? "unknown", running: running,
+                        interval: running ? gnssApplied?.interval : nil, lastFix: withLastFix ? lastFix : nil,
+                        clients: locationClients.count)
+    }
+
+    // Without lastFix, which changes every second while running.
+    private func gnssEvent() -> NSDictionary {
+        [QMIDKey.type: QMIDEventType.gnss, QMIDKey.gnss: gnssInfo(withLastFix: false).dictionary]
+    }
+
+    private func emitGNSS() { emitIfChanged(gnssEvent(), &lastGNSSEvent) }
+
     // MARK: - Airplane mode, restart, bands
 
     public func setAirplaneMode(_ on: Bool) -> String? {
@@ -2462,7 +2612,7 @@ public final class Manager {
 
     // Current state as events, for a new subscriber.
     public func snapshotEvents() -> [NSDictionary] {
-        [modemEvent(), simEvent(), plmnEvent()] + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
+        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
     }
 
     private func publishModem() {
@@ -2531,6 +2681,7 @@ public final class Manager {
         if let g = stats[0] { out[QMIDKey.datapath] = g }
         out[QMIDKey.sim] = simInfo()?.dictionary
         out[QMIDKey.plmn] = plmnInfo()?.dictionary
+        out[QMIDKey.gnss] = gnssInfo(withLastFix: true).dictionary
         let d = out as NSDictionary
         lastStatusLock.lock()
         lastStatus = d
@@ -2683,6 +2834,7 @@ public final class Manager {
         device?.close()
         device = nil
         gnss = nil
+        gnssSession = nil
         publisher.removeAll()
         proxyMirror = nil
         LinkAnchor.down()

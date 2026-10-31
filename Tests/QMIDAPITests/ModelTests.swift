@@ -331,4 +331,29 @@ final class ModelTests: XCTestCase {
         XCTAssertFalse(none.isValid())
         XCTAssertFalse(QMIDXTRA(NSDictionary()).supported)
     }
+
+    func testLocationModels() {
+        var l = QMIDLocation(fix: .fix)
+        l.latitude = 1.5; l.longitude = -2.25; l.horizontalAccuracy = 7.5; l.altitudeMSL = 35.5
+        l.time = Date(timeIntervalSince1970: 1_793_439_462); l.satellitesUsed = 3; l.technology = ["satellite"]
+        XCTAssertEqual(QMIDLocation(l.dictionary), l)
+        XCTAssertNil(QMIDLocation(["fix": "later"] as NSDictionary).fix)
+
+        let sats = QMIDSatellites(satellites: [
+            QMIDSatellite(system: "gps", id: 1, signal: "L1", tracking: true, cn0: 30, used: true),
+            QMIDSatellite(system: "gps", id: 1, signal: "L5", tracking: true, cn0: 24, used: true),
+            QMIDSatellite(system: "beidou", id: 201, signal: "B1I", tracking: true),
+            QMIDSatellite(system: "qzss", id: 195, signal: "L1", tracking: false),
+        ], time: Date(timeIntervalSince1970: 1_793_439_462))
+        let back = QMIDSatellites(sats.dictionary)
+        XCTAssertEqual(back, sats)
+        XCTAssertEqual(back.tracking.count, 3)
+        // GPS: 2 signals tracked, 1 satellite used.
+        XCTAssertEqual(back.summary.map { "\($0.system) \($0.tracking) \($0.used)" }, ["beidou 1 0", "gps 2 1", "qzss 0 0"])
+
+        let g = QMIDGNSS(engine: "on", running: true, interval: 1000, lastFix: Date(timeIntervalSince1970: 1_793_439_462), clients: 2)
+        XCTAssertEqual(QMIDGNSS(g.dictionary), g)
+        XCTAssertEqual(QMIDStatus([QMIDKey.gnss: g.dictionary] as NSDictionary).gnss, g)
+        XCTAssertNil(QMIDStatus(NSDictionary()).gnss)
+    }
 }
