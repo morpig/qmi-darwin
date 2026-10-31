@@ -158,6 +158,30 @@ final class ServiceEntityTests: XCTestCase {
         XCTAssertEqual(e[ServicePublisher.serviceKey(id, "IPv4")]?["Router"] as? String, "10.0.0.206")
     }
 
+    func testProxiesEntity() throws {
+        let id = ServicePublisher.serviceID(for: "x")
+        let p: [String: Any] = ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 9090]
+        let e = ServicePublisher.entities(pdnName: "x", interface: "utun9", settings: settings, policy: .preferWifi, proxies: p)
+        XCTAssertEqual(e[ServicePublisher.serviceKey(id, "Proxies")]?["HTTPPort"] as? Int, 9090)
+        XCTAssertNil(ServicePublisher.entities(pdnName: "x", interface: "utun9", settings: settings, policy: .preferWifi)[ServicePublisher.serviceKey(id, "Proxies")])
+    }
+
+    func testProxySource() {
+        let off: [String: Any] = ["HTTPEnable": 0, "ExceptionsList": ["*.local"]]
+        let a: [String: Any] = ["HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 9090]
+        let b: [String: Any] = ["ProxyAutoConfigEnable": 1, "ProxyAutoConfigURLString": "http://192.0.2.1/proxy.pac"]
+        XCTAssertFalse(ProxyMirror.isOn(off))
+        XCTAssertTrue(ProxyMirror.isOn(a))
+        XCTAssertTrue(ProxyMirror.isOn(b))
+        // The first in ServiceOrder with a proxy on; one with every proxy off is skipped.
+        XCTAssertTrue(ProxyMirror.same(ProxyMirror.select(order: ["W", "E", "T"], proxies: ["W": off, "E": b, "T": a], inactive: []), b))
+        // A disabled service is skipped; one missing from ServiceOrder still counts, last.
+        XCTAssertTrue(ProxyMirror.same(ProxyMirror.select(order: ["E"], proxies: ["E": b, "Z": a], inactive: ["E"]), a))
+        XCTAssertNil(ProxyMirror.select(order: ["W"], proxies: ["W": off], inactive: []))
+        XCTAssertFalse(ProxyMirror.same(a, b))
+        XCTAssertFalse(ProxyMirror.same(a, nil))
+    }
+
     func testUtunBatchSwitch() throws {
         func decode(_ json: String) throws -> QMIDConfig { try JSONDecoder().decode(QMIDConfig.self, from: Data(json.utf8)) }
         XCTAssertNil(try decode(#"{ "pdns": [] }"#).utunBatch)

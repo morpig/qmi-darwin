@@ -98,6 +98,9 @@ public struct QMIDConfig: Codable, Equatable {
     // Stand-in feth interface while internet is up, for apps that ignore utun interfaces
     // (LinkAnchor.swift). Default on.
     public var linkAnchor: Bool? = nil
+    // Copy the proxy settings of the Mac's other services onto internet PDNs (ProxyMirror.swift),
+    // so a system proxy still applies while cellular is primary. Default on.
+    public var mirrorProxies: Bool? = nil
     public var pdns: [PDN]
     public var carriers: [Carrier]? = nil
 

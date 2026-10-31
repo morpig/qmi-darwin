@@ -559,6 +559,16 @@ IN, bulk OUT), or a vendor-specific interface named "RmNet" or "QMI". AT/serial 
 Only Quectel modems are tested. `qmictl probe --vendor 1234 --iface 4` tries the same with
 qmid stopped.
 
+### System proxy (`mirrorProxies`)
+
+macOS keeps proxy settings per network service, and proxy tools write them to every service
+in System Settings (`networksetup -setwebproxy`). qmid's services aren't among them, so while
+cellular is primary the global proxy settings (`scutil --proxy`) would come out empty. qmid
+therefore copies the settings of the first enabled service in the service order that has a
+proxy turned on (HTTP, HTTPS, SOCKS, PAC or auto-discovery) onto each **internet** PDN's service, and
+follows changes: turning a proxy tool on or off applies at once, without a reconnect. IMS and
+other PDNs get none. `"mirrorProxies": false` (top level) turns this off.
+
 ### Per-SIM default bearer (`carriers`)
 
 `carriers` (optional, top level) sets the **attach PDN's** APN per SIM, i.e. the default

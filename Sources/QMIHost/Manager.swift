@@ -33,6 +33,7 @@ public final class Manager {
     private let configPath: String
     private var config: QMIDConfig
     private let publisher: ServicePublisher
+    private var proxyMirror: ProxyMirror?
 
     private var device: QMIDevice?
     private var wda: QMIClient?
@@ -245,6 +246,7 @@ public final class Manager {
         queue.async {
             _ = self.status()                       // the answer while `queue` is busy, from the start
             LinkAnchor.down()                       // left over by a crashed qmid
+            self.proxyMirror = ProxyMirror(queue: self.queue) { [weak self] in self?.proxiesChanged() }
             self.watchArrivals()
             self.watchPower()
             self.openDevice()
@@ -2182,9 +2184,22 @@ public final class Manager {
         guard let s = p.session, let u = p.utun else { return }
         let id = ServicePublisher.serviceID(for: p.config.name)
         try publisher.publish(ServicePublisher.entities(pdnName: p.config.name, interface: u.name,
-                                                        settings: s.merged, policy: p.policy),
+                                                        settings: s.merged, policy: p.policy,
+                                                        proxies: proxies(for: p)),
                               replacingPrefix: ServicePublisher.serviceKey(id))
         publishStatus(p)
+    }
+
+    // Internet PDNs only: an IMS or other PDN is never primary, and its apps bind to it
+    // directly, where a proxy on this Mac's loopback would only get in the way.
+    private func proxies(for p: PDNState) -> [String: Any]? {
+        guard config.mirrorProxies ?? true, p.config.effectiveRole == "internet" else { return nil }
+        return proxyMirror?.current
+    }
+
+    private func proxiesChanged() {
+        log("system proxy settings \(proxyMirror?.current == nil ? "off" : "on"): republishing")
+        for p in pdns where p.state == .connected { try? publishService(p) }
     }
 
     private func publishStatus(_ p: PDNState) {
@@ -2568,6 +2583,7 @@ public final class Manager {
         do { c = try QMIDConfig.load(path: configPath) } catch { return "\(error)" }
         // As dialed: checkSIM below may already resolve the old states against the new config.
         let before = Dictionary(uniqueKeysWithValues: pdns.map { ($0.config.name, ($0, $0.config)) })
+        let mirrorChanged = (config.mirrorProxies ?? true) != (c.mirrorProxies ?? true)
         config = c
         if device != nil { checkSIM() }             // resolve against the SIM in the modem now
         let resolved = c.resolvedPDNs(for: pendingSIM ?? sim, prepared: pendingSIM != nil)
@@ -2578,8 +2594,8 @@ public final class Manager {
             p.config = q
             if old.policy != q.policy {
                 p.policy = q.policy.flatMap(QMIDPolicy.init(rawValue:)) ?? .preferWifi
-                if p.state == .connected { try? publishService(p) }
             }
+            if old.policy != q.policy || mirrorChanged, p.state == .connected { try? publishService(p) }
             p.blocked.removeAll()
             kept[q.name] = p
         }
@@ -2638,6 +2654,7 @@ public final class Manager {
         device?.close()
         device = nil
         publisher.removeAll()
+        proxyMirror = nil
         LinkAnchor.down()
         linkAnchor = (false, false)
     }

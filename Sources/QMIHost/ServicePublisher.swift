@@ -42,7 +42,7 @@ public final class ServicePublisher {
 
     // Builds the service's entities from WDS runtime settings.
     public static func entities(pdnName: String, interface: String, settings s: WDS.RuntimeSettings,
-                                policy: QMIDPolicy) -> [String: [String: Any]] {
+                                policy: QMIDPolicy, proxies: [String: Any]? = nil) -> [String: [String: Any]] {
         let id = serviceID(for: pdnName)
         var out: [String: [String: Any]] = [:]
 
@@ -76,6 +76,8 @@ public final class ServicePublisher {
         if !dns.isEmpty {
             out[serviceKey(id, "DNS")] = ["ServerAddresses": dns, "InterfaceName": interface]
         }
+        // Copied from Setup: by ProxyMirror; used for the global proxies while this is primary.
+        if let proxies { out[serviceKey(id, "Proxies")] = proxies }
         return out
     }
 
