@@ -67,6 +67,10 @@ interval asked for. An interval change is Stop + Start. When no client wants it:
 client is released. After a modem reset or reopen a new session starts; after wake it
 registers and starts again. As observed:
 
+- A 4 s Mac sleep: the modem's GNSS kept running (every UTC second of fixes present; delivery
+  paused ~1 s), and the Register + Start again after wake caused no gap. A longer sleep, where
+  macOS may suspend the modem's USB, is not checked yet.
+
 - Start 0x0022: 0x01 session ID, 0x10 recurrence (1 periodic), 0x12 intermediate reports
   (1 on), 0x13 minimum interval in ms. Stop 0x0023: 0x01 session ID.
 - Register Events mask 0x183 (position, satellites, engine state, fix session state) gives

@@ -495,7 +495,8 @@ dual-frequency modem lists a satellite once per signal (`signal` `"L1"`, `"L5"`,
   interval asked for (at least 1 s). It turns off when the last one stops or goes away (quits
   or crashes).
 - `startLocation` is kept like `subscribe()`: across qmid restarts, modem restarts (the
-  modem drops its session; qmid starts a new one) and sleep. Calling it again changes this
+  modem drops its session; qmid starts a new one) and sleep (qmid starts it again on wake;
+  checked with a short sleep only). Calling it again changes this
   client's options. `nmea: true` adds the modem's NMEA sentences (`onNMEA`).
 - GNSS works in airplane mode. A first fix outdoors takes about 5 s with valid XTRA data
   (see "GNSS assistance (XTRA)"), about 1–3 s right after an earlier fix. Right after a
