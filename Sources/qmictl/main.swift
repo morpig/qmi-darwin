@@ -44,6 +44,13 @@ usage (direct to the modem; stop qmid first):
   qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
   qmictl nas-survey   [--iface N] [-v]     raw TLVs of the NAS cell, signal, band and CA messages
   qmictl reattach     [--iface N] [-v]     low power, then online: attach again with the attach profile
+  qmictl loc-survey   [--register HEX] [--reg-tlv T:HEX] [--listen S] [-v]
+                                           LOC: XTRA source / validity, engine lock, raw indications
+  qmictl loc-inject FILE [--msg 35|a7] [--part-size N] [--stop-after N] [--listen S] [-v]
+                                           LOC: load an XTRA file part by part, timing each ack
+  qmictl loc-fix      [--timeout S] [--after-fix S] [--log FILE] [--no-register]
+                      [--release-test S] [--no-stop] [-v]
+                                           LOC: 1 Hz session, satellites, time to first fix
   qmictl profile-write INDEX|new KEY=VALUE...   create/modify a profile; keys: apn, pdp
                       (ipv4|ipv6|ipv4v6), user, pass, auth (none|pap|chap|pap-chap),
                       pcscf-pco, pcscf-dhcp, imcn, disabled (0|1), type (default,ims,...)
@@ -1026,6 +1033,9 @@ func prepareSIM(_ args: [String]) -> Never {
 }
 
 if daemonCommand(Array(CommandLine.arguments.dropFirst())) { exit(0) }
+if CommandLine.arguments.dropFirst().first == "loc-survey" { locSurvey(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
+if CommandLine.arguments.dropFirst().first == "loc-fix" { locFix(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
+if CommandLine.arguments.dropFirst().first == "loc-inject" { locInject(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
 if CommandLine.arguments.dropFirst().first == "profile-write" {
     profileWrite(Array(CommandLine.arguments.dropFirst(2)).filter { $0 != "-v" })
     exit(0)
