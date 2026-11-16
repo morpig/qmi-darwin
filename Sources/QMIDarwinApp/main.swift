@@ -68,6 +68,19 @@ func withQMID<T>(timeout: TimeInterval = 5,
     return out
 }
 
+// Asks qmid to remove what it added to the network preferences (the Internet Sharing source
+// service) before it is unregistered. A warning when it couldn't; nothing to do when qmid
+// doesn't answer (it adds nothing while stopped).
+func prepareUninstall() -> String? {
+    guard service.status == .enabled else { return nil }
+    let r: Result<Void, QMIDError>? = withQMID { c, done in c.prepareUninstall { done($0) } }
+    switch r {
+    case .failure(let e)?: return "couldn't remove the Internet Sharing source service: \(e.message)"
+    case nil: return "qmid didn't answer; an Internet Sharing source service it added may remain"
+    default: return nil
+    }
+}
+
 func fetchStatus() -> QMIDStatus? {
     withQMID { c, done in c.status { done(try? $0.get()) } }
 }
@@ -107,6 +120,7 @@ if let command = args.first {
         if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
         if let note = restartIfOutdated() { print(note) }
     case "unregister":
+        if let e = prepareUninstall() { print("warning: \(e)") }
         do { try service.unregister() } catch { print("unregister: \(error.localizedDescription)"); exit(1) }
         print("qmid: \(describe(service.status))")
     case "status":
@@ -157,6 +171,7 @@ case .enabled:
     let r = alert("qmid is running", [note, state].compactMap { $0 }.joined(separator: "\n\n"),
                   buttons: ["OK", "Unregister qmid"])
     if r == .alertSecondButtonReturn {
+        if let e = prepareUninstall() { _ = alert("qmid", e, buttons: ["OK"]) }
         do { try service.unregister() } catch {
             _ = alert("Couldn't unregister qmid", error.localizedDescription, buttons: ["OK"])
         }

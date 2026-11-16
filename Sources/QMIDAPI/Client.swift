@@ -40,6 +40,8 @@ public final class QMIDClient: NSObject, QMIDEvents {
     public var onNMEA: ((String) -> Void)?
     // The GNSS engine / session (after subscribe(), to every subscriber); no position.
     public var onGNSS: ((QMIDGNSS) -> Void)?
+    // Internet Sharing over a PDN (config "sharing"): after subscribe() and whenever it changes.
+    public var onSharing: ((QMIDSharing) -> Void)?
 
     private let queue: DispatchQueue
     private let lock = NSLock()
@@ -216,6 +218,10 @@ public final class QMIDClient: NSObject, QMIDEvents {
                 let g = QMIDGNSS(d)
                 queue.async { self.onGNSS?(g) }
             }
+        case QMIDEventType.sharing?:
+            if let s = (event[QMIDKey.sharing] as? NSDictionary).flatMap(QMIDSharing.init) {
+                queue.async { self.onSharing?(s) }
+            }
         default:
             break
         }
@@ -365,6 +371,11 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.loadXTRA(data) { self.finish($0, $1, "loadXTRA failed", QMIDXTRA.init, completion) }
     }
 
+    // Before unregistering qmid: removes the Internet Sharing source service it added.
+    public func prepareUninstall(_ completion: @escaping (Result<Void, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.prepareUninstall { self.finish($0, completion) }
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -410,6 +421,7 @@ public extension QMIDClient {
     }
     func stopLocation() async throws { try await bridge { self.stopLocation($0) } }
     func gnss() async throws -> QMIDGNSS { try await bridge { self.gnss($0) } }
+    func prepareUninstall() async throws { try await bridge { self.prepareUninstall($0) } }
 
     private func bridge<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) async throws -> T {
         try await withCheckedThrowingContinuation { cont in call { cont.resume(with: $0) } }

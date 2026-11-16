@@ -125,6 +125,7 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `startLocation(interval:satellites:nmea:)` | the modem's GNSS on for this client: positions to `onLocation` (see "Location") | until `stopLocation` or the client goes; kept across qmid and modem restarts |
 | `stopLocation` | this client no longer wants positions; GNSS off when no client does | – |
 | `gnss` | the GNSS engine and session (`QMIDGNSS`); no position | – |
+| `prepareUninstall` | removes the Internet Sharing source service qmid added (see "Internet Sharing"); call before unregistering qmid | until qmid starts again with `sharing` in its config |
 
 `connect` completes once the dial attempt is over: successfully when the PDN is connected,
 with an error when it isn't (rejected, not attached, no profile, or cancelled by `disconnect`).
@@ -390,6 +391,44 @@ try await qmid.restartModem()            // the modem resets: modem "absent", th
   `airplaneMode` on and off too. While it is on, an attach APN change waits for the radio.
 - `restartModem` replies once the reset is sent; the modem then goes away (`.modem` event
   "absent") and comes back (re-enumeration takes about 30 s, its QMI stack another 20 s).
+
+## Internet Sharing (`QMIDSharing`)
+
+With `"sharing": { "pdn": "internet" }` in the config (see "Internet Sharing source"), the
+PDN can be the source of macOS Internet Sharing, e.g. to share it over Wi-Fi as a hotspot.
+qmid adds a network service "Cellular (internet)" that Internet Sharing offers as its source
+(System Settings › General › Sharing › Internet Sharing ⓘ › Share your connection from). The
+user chooses it and turns Internet Sharing on there; qmid doesn't turn it on by itself.
+
+```swift
+let s = try await qmid.status()
+if let sh = s.sharing, sh.state == .on { print("\(sh.clients) devices on \(sh.bridge ?? "?")") }
+qmid.onSharing = { sh in … }             // after subscribe(); state changes
+```
+
+| Field | Meaning |
+|---|---|
+| `pdn` | the PDN shared (config `sharing.pdn`) |
+| `state` | `not-selected`: Internet Sharing's source is another service. `off`: Internet Sharing is turned off. `waiting`: on (or to be turned back on, below) once the PDN is up. `on`: sharing runs over the PDN |
+| `interface` | the PDN's utun, while `on` |
+| `bridge` | the shared network's interface (`bridge100`), while `on` |
+| `sharedTo` | the interfaces Internet Sharing shares to (`en0` for Wi-Fi) |
+| `clients` | devices on the shared network (IPv4 neighbours); in `status()` only, events carry 0 |
+
+- Internet Sharing does the rest: the Wi-Fi access point, DHCP (192.168.2.0/24 by default), a
+  DNS proxy, and NAT on the PDN's utun. Clients get IPv6 through NAT66 behind a ULA prefix;
+  macOS Internet Sharing can't hand out the PDN's own /64 (plans/hotspot.md).
+- Clients' traffic follows the Mac's default route. While Wi-Fi is the access point the PDN
+  is usually primary anyway; a VPN that takes the default route (e.g. an exit node) carries
+  the clients' traffic too.
+- When the PDN goes down for more than a few seconds, Internet Sharing turns itself off. qmid
+  turns it back on once the PDN is up again (`state` is `waiting` meanwhile), unless it was
+  turned off while the PDN was up, or another source was chosen. Turning it off in System
+  Settings while the PDN is down is taken as the outage's doing.
+- The service stays while qmid is stopped, so Internet Sharing keeps it selected. It goes when
+  `sharing` is removed from the config, or with `prepareUninstall` (the app's `unregister`
+  calls it). It is not shown in System Settings › Network.
+- Carriers may detect or restrict tethering (TTL, separate APN); qmid does nothing about it.
 
 ## Band preference (`QMIDBandPreference`)
 
@@ -687,6 +726,18 @@ therefore copies the settings of the first enabled service in the service order 
 proxy turned on (HTTP, HTTPS, SOCKS, PAC or auto-discovery) onto each **internet** PDN's service, and
 follows changes: turning a proxy tool on or off applies at once, without a reconnect. IMS and
 other PDNs get none. `"mirrorProxies": false` (top level) turns this off.
+
+### Internet Sharing source (`sharing`)
+
+```json
+"sharing": { "pdn": "internet" }
+```
+
+Top level, optional; absent by default. `pdn` names a PDN with role `internet`. qmid adds the
+network service "Cellular (<pdn>)" for macOS Internet Sharing to use as its source, with the
+service ID of the PDN's State: entries; it is linked into the current network set but not
+into the service order, so it doesn't change how macOS ranks services. Removing the key
+removes the service. See "Internet Sharing".
 
 ### XTRA updates (`xtra`)
 

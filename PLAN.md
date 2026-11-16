@@ -38,7 +38,7 @@ What `en19` gives today and how `qmid` gives it:
 | MTU 1500 | Per-PDN MTU from WDS | IMS PDNs often smaller |
 | `netstat -I en19` counters | `netstat -I utunN` | Plus WDS packet statistics |
 | Shown in System Settings › Network | **Not shown** (State:-only service has no Setup: entry) | Gap. Client apps can show it (§5.4, §8) |
-| Usable as Internet Sharing source | **Not available** | Gap. Optional pf NAT in M10 |
+| Usable as Internet Sharing source | Config `sharing`: qmid adds a Setup: service for the PDN that Internet Sharing uses as its source (IPv6 to clients is NAT66) | plans/hotspot.md |
 | Interface type "Ethernet" to apps | Interface type "other" (utun) | Neither is "cellular". Some apps treat any utun as a VPN |
 | Works with no software running | Only while `qmid` runs | launchd `KeepAlive`; crash cleanup is automatic (§5.5) |
 | Kernel datapath | User-space datapath | Throughput gate after M4 |
@@ -541,5 +541,6 @@ Decided 2026-09-30:
 
 Open:
 1. RM520N-EU: when?
-2. Is M10 sharing (pf NAT) wanted at all?
+2. ~~Is M10 sharing (pf NAT) wanted at all?~~ Done without pf rules of qmid's own: config
+   `sharing` (plans/hotspot.md).
 3. Non-data profiles (not in qmid's config): leave them to AT, or manage them through the API?

@@ -105,6 +105,13 @@ public struct QMIDConfig: Codable, Equatable {
     // older than maxAgeHours (default 24), or missing. Default on.
     public var xtra: XTRA? = nil
     public var pdns: [PDN]
+    // macOS Internet Sharing with this PDN (an internet one) as its source (Sharing.swift).
+    public var sharing: SharingSettings? = nil
+
+    public struct SharingSettings: Codable, Equatable {
+        public var pdn: String
+    }
+
     public struct XTRA: Codable, Equatable {
         public var download: Bool?
         public var maxAgeHours: Int?
@@ -242,6 +249,14 @@ public struct QMIDConfig: Codable, Equatable {
         }
         for v in vendorIDs ?? [] where v.count != 4 || UInt16(v, radix: 16) == nil {
             throw QMIHostError.transport("config: vendorID \(v) is not 4 hex digits")
+        }
+        if let s = sharing {
+            guard let p = pdns.first(where: { $0.name == s.pdn }) else {
+                throw QMIHostError.transport("config: sharing pdn \(s.pdn) is not a PDN")
+            }
+            guard p.effectiveRole == "internet" else {
+                throw QMIHostError.transport("config: sharing pdn \(s.pdn) must have role internet")
+            }
         }
         var names = Set<String>()
         for p in pdns {

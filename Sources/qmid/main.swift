@@ -260,6 +260,9 @@ final class Control: NSObject, QMIDControl {
     func gnss(reply: @escaping (NSDictionary) -> Void) {
         manager.queue.async { reply(self.manager.gnssStatus()) }
     }
+    func prepareUninstall(reply: @escaping (String?) -> Void) {
+        manager.queue.async { reply(self.manager.prepareUninstall()) }
+    }
     func radio(_ raw: Bool, reply: @escaping (NSDictionary?, String?) -> Void) {
         manager.queue.async {
             let (d, err) = self.manager.radio(raw: raw)

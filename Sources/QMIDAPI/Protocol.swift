@@ -92,6 +92,10 @@ public let qmidAPIVersion = 1
     func stopLocation(reply: @escaping (String?) -> Void)
     // The GNSS engine and session (QMIDGNSS); no position.
     func gnss(reply: @escaping (NSDictionary) -> Void)
+    // Removes what qmid added to the network preferences (the Internet Sharing source service,
+    // config "sharing"), before qmid is unregistered. qmid adds it again at its next start if
+    // the config still asks for it.
+    func prepareUninstall(reply: @escaping (String?) -> Void)
 }
 
 // Implemented by the client (the connection's exportedObject) to receive events.
@@ -112,6 +116,15 @@ public enum QMIDKey {
     public static let plmn = "plmn"                   // PLMN dictionary, absent while not registered
     public static let imei = "imei"                   // the modem's IMEI (XPC only)
     public static let airplaneMode = "airplaneMode"   // Bool: the radio is off (setAirplaneMode, or AT+CFUN=4)
+    public static let sharing = "sharing"             // sharing dictionary; absent unless config "sharing" is set
+
+    // sharing dictionary (status() "sharing" and "sharing" events): macOS Internet Sharing with a PDN as source
+    // pdn                                            // the PDN name (config "sharing")
+    // state                                          // QMIDSharing.State
+    // interface                                      // the PDN's utun while sharing runs
+    public static let bridge = "bridge"               // the shared network's interface ("bridge100") while it runs
+    public static let sharedTo = "sharedTo"           // [String]: the interfaces shared to ("en0")
+    // clients                                        // Int: devices on the shared network (IPv4 neighbours)
 
     // SIM dictionary (status() "sim" and "sim" events)
     public static let mccmnc = "mccmnc"               // home PLMN, "00101" / "001001"
@@ -298,6 +311,7 @@ public enum QMIDEventType {
     public static let plmn = "plmn"                   // key QMIDKey.plmn, absent while not registered
     public static let bearers = "bearers"             // keys QMIDKey.pdn (name) and QMIDKey.bearers
     public static let gnss = "gnss"                   // key QMIDKey.gnss; to every subscriber
+    public static let sharing = "sharing"             // key QMIDKey.sharing; absent when config "sharing" is unset
     // Only to connections that called startLocation:
     public static let location = "location"           // key QMIDKey.location
     public static let satellites = "satellites"       // keys QMIDKey.satellites, QMIDKey.time

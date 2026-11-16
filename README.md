@@ -26,6 +26,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 - GNSS: positions and satellites (per constellation and signal) for client apps, with the
   engine on only while one asks (`qmictl gnss watch`); XTRA data kept fresh (downloaded
   and loaded once a day), and loading an XTRA file (`qmictl xtra`).
+- Wi-Fi hotspot: the internet PDN as the source of macOS Internet Sharing (config
+  `sharing`), turned back on by qmid after an outage.
 - An XPC API (`QMIDAPI`) and read-only SCDynamicStore keys for client apps.
 
 ## How it works
@@ -187,6 +189,7 @@ qmictl events                               stream qmid's events
 qmictl log [--level debug]                  recent log lines, then live
 qmictl config get | config set FILE
 qmictl sync                                 APN sync report: PDN ↔ modem profile
+qmictl sharing                              Internet Sharing over the PDN: state, clients
 qmictl reload | restart
 ```
 

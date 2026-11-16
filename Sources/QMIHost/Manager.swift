@@ -183,6 +183,13 @@ public final class Manager {
     private var suplAwaitingPLMN = false      // SUPL skipped for want of a PLMN: ask once registered
     private var gnssRetry: DispatchWorkItem?
     private var lastGNSSEvent: NSDictionary?
+    // Internet Sharing over a PDN (config "sharing", Sharing.swift).
+    private var sharing: Sharing?
+    private var sharingWasOn = false          // seen on with the PDN up; kept in state.json "sharingOn"
+    private var sharingLastNAT: Sharing.NAT?  // as last read, to tell what changed
+    private var sharingRestoredFor: Date?     // the PDN connection Internet Sharing was turned back on for
+    private var sharingRecheck: DispatchWorkItem?
+    private var lastSharingEvent: NSDictionary?
     private var xtraState = XTRAState()       // qmid's own XTRA updates (state.json "xtra")
     private var xtraCheck: DispatchWorkItem?
     private var xtraNext: Date?
@@ -251,6 +258,7 @@ public final class Manager {
             bandsBefore = j["bandsBefore"] as? [String: [Int]]
             modesBefore = j["modesBefore"] as? [String]
             xtraState = XTRAState(j["xtra"] as? [String: Any])
+            sharingWasOn = j["sharingOn"] as? Bool ?? false
         }
     }
 
@@ -259,6 +267,7 @@ public final class Manager {
         j["bandsBefore"] = bandsBefore
         j["modesBefore"] = modesBefore
         j["xtra"] = xtraState.json
+        j["sharingOn"] = sharingWasOn
         if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: URL(fileURLWithPath: statePath))
         }
@@ -275,6 +284,7 @@ public final class Manager {
             _ = self.status()                       // the answer while `queue` is busy, from the start
             LinkAnchor.down()                       // left over by a crashed qmid
             self.proxyMirror = ProxyMirror(queue: self.queue) { [weak self] in self?.proxiesChanged() }
+            self.setUpSharing(removeStale: true)
             self.watchArrivals()
             self.watchPower()
             self.openDevice()
@@ -2708,7 +2718,133 @@ public final class Manager {
         try? publisher.publish([QMIDStoreKey.pdn(p.config.name): d])
         emitPDN(p)
         updateLinkAnchor()
+        updateSharing()
         _ = status()                            // the answer while `queue` is busy
+    }
+
+    // MARK: - Internet Sharing
+
+    // Adds (or repairs) the source service for config "sharing" and watches Internet Sharing's
+    // settings; without "sharing", removes services qmid added (removeStale: at start, and when
+    // the setting changed).
+    private func setUpSharing(removeStale: Bool) {
+        guard let s = config.sharing else {
+            sharing = nil
+            sharingRecheck?.cancel()
+            lastSharingEvent = nil
+            if removeStale {
+                do {
+                    let n = try Sharing.removeAll()
+                    if n > 0 { log("sharing: removed the Internet Sharing source service (\(n))", level: .notice) }
+                } catch {
+                    log("sharing: removing the source service: \(error)", level: .error)
+                }
+            }
+            return
+        }
+        let device = pdns.first { $0.config.name == s.pdn }?.utun?.name ?? "utun"
+        do {
+            if let what = try Sharing.ensureService(id: ServicePublisher.serviceID(for: s.pdn), pdn: s.pdn, device: device) {
+                log("sharing: source service \"Cellular (\(s.pdn))\" \(what); choose it under Internet Sharing", level: .notice)
+            }
+        } catch {
+            log("sharing: source service: \(error)", level: .error)
+        }
+        if sharing == nil {
+            do {
+                sharing = try Sharing(queue: queue) { [weak self] in self?.updateSharing() }
+            } catch {
+                log("sharing: \(error)", level: .error)
+            }
+        }
+        sharingLastNAT = nil
+        updateSharing()
+    }
+
+    // The PDN connection that counts for sharing: up, and since when.
+    private func sharingPDN() -> (name: String, utun: String?, upSince: Date?)? {
+        guard let s = config.sharing else { return nil }
+        let p = pdns.first { $0.config.name == s.pdn }
+        let up = p?.state == .connected
+        return (s.pdn, up ? p?.utun?.name : nil, up ? p?.connectedAt : nil)
+    }
+
+    // An outage turned Internet Sharing off while the PDN was down for long enough: its configd
+    // plugin switches it off when the source has no interface. Once the PDN is back, qmid turns
+    // it on again (once per connection). It stays off when it was turned off while the PDN was
+    // up (by the user) or when another source was chosen.
+    static let sharingUserOffAfter: TimeInterval = 15
+
+    private func updateSharing() {
+        guard let sharing, let (pdn, utun, upSince) = sharingPDN() else { return }
+        let nat = sharing.readNAT()
+        let last = sharingLastNAT
+        sharingLastNAT = nat
+        let selected = nat.source == ServicePublisher.serviceID(for: pdn)
+        let upFor = upSince.map { Date().timeIntervalSince($0) }
+        var wasOn = sharingWasOn
+        if !selected {
+            wasOn = false
+        } else if nat.enabled {
+            if upFor != nil { wasOn = true }
+        } else if last?.enabled == true, let upFor, upFor >= Self.sharingUserOffAfter {
+            wasOn = false
+            log("sharing: Internet Sharing turned off")
+        }
+        if wasOn != sharingWasOn {
+            sharingWasOn = wasOn
+            saveState()
+        }
+        if selected, !nat.enabled, wasOn, let upSince, sharingRestoredFor != upSince {
+            sharingRestoredFor = upSince
+            do {
+                try sharing.enableNAT()
+                log("sharing: Internet Sharing had turned itself off during an outage of \(pdn); turned it back on", level: .notice)
+            } catch {
+                log("sharing: turning Internet Sharing back on: \(error)", level: .error)
+            }
+        }
+        // The shared network shows up a few seconds after Internet Sharing starts: look again.
+        sharingRecheck?.cancel()
+        if selected, nat.enabled, utun != nil, Sharing.bridge(for: nat) == nil {
+            let item = DispatchWorkItem { [weak self] in self?.updateSharing() }
+            sharingRecheck = item
+            queue.asyncAfter(deadline: .now() + 5, execute: item)
+        }
+        emitIfChanged(sharingEvent() ?? [:], &lastSharingEvent)
+    }
+
+    private func sharingInfo(withClients: Bool) -> QMIDSharing? {
+        guard let sharing, let (pdn, utun, _) = sharingPDN() else { return nil }
+        let nat = sharingLastNAT ?? sharing.readNAT()
+        let bridge = Sharing.bridge(for: nat)
+        let state: QMIDSharing.State
+        if nat.source != ServicePublisher.serviceID(for: pdn) {
+            state = .notSelected
+        } else if nat.enabled {
+            state = utun != nil && bridge != nil ? .on : .waiting
+        } else {
+            state = sharingWasOn ? .waiting : .off
+        }
+        let on = state == .on
+        return QMIDSharing(pdn: pdn, state: state, interface: on ? utun : nil, bridge: on ? bridge : nil,
+                           sharedTo: nat.sharedTo, clients: on && withClients ? Sharing.clients(on: bridge!) : 0)
+    }
+
+    // Without clients, which change without qmid hearing of it (status() has them).
+    private func sharingEvent() -> NSDictionary? {
+        sharingInfo(withClients: false).map { [QMIDKey.type: QMIDEventType.sharing, QMIDKey.sharing: $0.dictionary] }
+    }
+
+    // Before qmid is unregistered: the source service goes (QMIDControl.prepareUninstall).
+    public func prepareUninstall() -> String? {
+        do {
+            let n = try Sharing.removeAll()
+            log("prepare uninstall: \(n == 0 ? "no source service to remove" : "removed the Internet Sharing source service")", level: .notice)
+            return nil
+        } catch {
+            return "\(error)"
+        }
     }
 
     // Keeps the stand-in interface up, with the families the connected internet PDN has.
@@ -2922,7 +3058,7 @@ public final class Manager {
 
     // Current state as events, for a new subscriber.
     public func snapshotEvents() -> [NSDictionary] {
-        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
+        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + [sharingEvent()].compactMap { $0 } + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
     }
 
     private func publishModem() {
@@ -2992,6 +3128,7 @@ public final class Manager {
         out[QMIDKey.sim] = simInfo()?.dictionary
         out[QMIDKey.plmn] = plmnInfo()?.dictionary
         out[QMIDKey.gnss] = gnssInfo(withLastFix: true).dictionary
+        out[QMIDKey.sharing] = sharingInfo(withClients: true)?.dictionary
         let d = out as NSDictionary
         lastStatusLock.lock()
         lastStatus = d
@@ -3075,7 +3212,9 @@ public final class Manager {
         let before = Dictionary(uniqueKeysWithValues: pdns.map { ($0.config.name, ($0, $0.config)) })
         let mirrorChanged = (config.mirrorProxies ?? true) != (c.mirrorProxies ?? true)
         let xtraChanged = config.xtraSettings != c.xtraSettings
+        let sharingChanged = config.sharing != c.sharing
         config = c
+        if sharingChanged { setUpSharing(removeStale: true) }
         if device != nil { checkSIM() }             // resolve against the SIM in the modem now
         if xtraChanged { scheduleXTRACheck(in: 5) }
         let resolved = c.resolvedPDNs(for: pendingSIM ?? sim, prepared: pendingSIM != nil)
@@ -3151,5 +3290,7 @@ public final class Manager {
         proxyMirror = nil
         LinkAnchor.down()
         linkAnchor = (false, false)
+        sharing = nil                               // the Setup: service stays (see Sharing.swift)
+        sharingRecheck?.cancel()
     }
 }

@@ -470,6 +470,7 @@ public struct QMIDStatus: Equatable {
     public var imei: String?
     public var airplaneMode: Bool
     public var gnss: QMIDGNSS?
+    public var sharing: QMIDSharing?          // nil unless config "sharing" is set
 
     public var modemState: QMIDModemState? { QMIDModemState(rawValue: modem) }
     public var isModemReady: Bool { modemState == .ready }
@@ -487,6 +488,7 @@ public struct QMIDStatus: Equatable {
         imei = d[QMIDKey.imei] as? String
         airplaneMode = d[QMIDKey.airplaneMode] as? Bool ?? false
         gnss = (d[QMIDKey.gnss] as? NSDictionary).map(QMIDGNSS.init)
+        sharing = (d[QMIDKey.sharing] as? NSDictionary).flatMap(QMIDSharing.init)
     }
 }
 
@@ -1028,6 +1030,54 @@ public struct QMIDGNSSAssist: Equatable {
         d[QMIDKey.error] = error
         d[QMIDKey.firstFixAfter] = firstFixAfter
         d[QMIDKey.firstFixDistance] = firstFixDistance
+        return d as NSDictionary
+    }
+}
+
+// macOS Internet Sharing with a PDN as its source (config "sharing"). qmid provides the source
+// service; Internet Sharing itself (System Settings › General › Sharing) is turned on by the
+// user, and qmid turns it back on after an outage of the PDN made it switch itself off.
+public struct QMIDSharing: Equatable {
+    public enum State: String {
+        case notSelected = "not-selected"     // Internet Sharing's source is another service
+        case off                              // turned off (by the user)
+        case waiting                          // on, or to be turned back on, once the PDN is up
+        case on                               // sharing runs over the PDN
+    }
+
+    public var pdn: String
+    public var state: State
+    public var interface: String?             // the PDN's utun, while on
+    public var bridge: String?                // the shared network's interface, while on
+    public var sharedTo: [String]             // interfaces shared to ("en0")
+    public var clients: Int                   // devices on the shared network
+
+    public init(pdn: String, state: State, interface: String? = nil, bridge: String? = nil,
+                sharedTo: [String] = [], clients: Int = 0) {
+        self.pdn = pdn
+        self.state = state
+        self.interface = interface
+        self.bridge = bridge
+        self.sharedTo = sharedTo
+        self.clients = clients
+    }
+
+    public init?(_ d: NSDictionary) {
+        guard let p = d[QMIDKey.pdn] as? String,
+              let s = (d[QMIDKey.state] as? String).flatMap(State.init(rawValue:)) else { return nil }
+        pdn = p
+        state = s
+        interface = d[QMIDKey.interface] as? String
+        bridge = d[QMIDKey.bridge] as? String
+        sharedTo = d[QMIDKey.sharedTo] as? [String] ?? []
+        clients = d[QMIDKey.clients] as? Int ?? 0
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.pdn: pdn, QMIDKey.state: state.rawValue, QMIDKey.sharedTo: sharedTo,
+                                QMIDKey.clients: clients]
+        d[QMIDKey.interface] = interface
+        d[QMIDKey.bridge] = bridge
         return d as NSDictionary
     }
 }

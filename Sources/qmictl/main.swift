@@ -41,6 +41,7 @@ usage (through qmid):
                                             run GNSS through qmid: positions, satellites (-v: each)
   qmictl xtra                               GNSS assistance data (XTRA): validity, servers
   qmictl xtra load FILE                     load an XTRA file (as downloaded from a server above)
+  qmictl sharing                            Internet Sharing over a PDN (config "sharing"): state, clients
 
 usage (direct to the modem; stop qmid first):
   qmictl probe        [--iface N] [--vendor HEX]... [-v]
@@ -735,6 +736,7 @@ func printStatus(_ d: NSDictionary) {
     if let i = st.imei { print("imei: \(i)") }
     if let p = st.plmn { print("operator: \(describe(p))") }
     if let g = st.gnss, g.running || g.engine == "on" { printGNSS(g) }
+    if let s = st.sharing { printSharing(s) }
     for case let p as NSDictionary in (d[QMIDKey.pdns] as? NSArray) ?? [] {
         guard let q = QMIDPDN(p) else { continue }
         var line = "\(q.name): \(q.stateName)"
@@ -838,6 +840,7 @@ func streamEvents() -> Never {
     let client = QMIDClient(queue: .main)
     client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
     client.onGNSS = { g in print("\(fmt.string(from: Date())) ", terminator: ""); printGNSS(g) }
+    client.onSharing = { s in print("\(fmt.string(from: Date())) ", terminator: ""); printSharing(s) }
     client.onEvent = { e in
         let t = fmt.string(from: Date())
         switch e {
@@ -849,6 +852,7 @@ func streamEvents() -> Never {
         case .unknown(let type) where type == QMIDEventType.plmn: break   // onPLMN
         case .unknown(let type) where type == QMIDEventType.bearers: break   // onBearers
         case .unknown(let type) where type == QMIDEventType.gnss: break      // onGNSS
+        case .unknown(let type) where type == QMIDEventType.sharing: break   // onSharing
         case .unknown(let type): print("\(t) event \(type)")
         }
     }
@@ -1018,6 +1022,15 @@ func daemonCommand(_ args: [String]) -> Bool {
         withDaemon { d, done in d.setModePreference(modes, persistent: args.contains("--persistent")) { reportResult($0); done() } }
     case "modes" where args.count >= 2 && args[1] == "reset":
         withDaemon { d, done in d.resetModePreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
+    case "sharing" where args.count == 1:
+        withDaemon { d, done in
+            d.status { dict in
+                if let s = QMIDStatus(dict).sharing { printSharing(s) } else {
+                    print("sharing: not configured (qmid.json \"sharing\": { \"pdn\": \"internet\" })")
+                }
+                done()
+            }
+        }
     case "gnss" where args.count >= 2 && args[1] == "watch":
         gnssWatch(Array(args.dropFirst(2)))
     case "gnss" where args.count == 1:
@@ -1054,6 +1067,17 @@ func daemonCommand(_ args: [String]) -> Bool {
         return false
     }
     return true
+}
+
+func printSharing(_ s: QMIDSharing) {
+    let to = s.sharedTo.isEmpty ? "" : " to \(s.sharedTo.joined(separator: ", "))"
+    switch s.state {
+    case .on:
+        print("sharing: on, \(s.pdn) (\(s.interface ?? "?"))\(to) via \(s.bridge ?? "?"), \(s.clients) client\(s.clients == 1 ? "" : "s")")
+    case .waiting: print("sharing: waiting for \(s.pdn)\(to)")
+    case .off: print("sharing: off (Internet Sharing is turned off)")
+    case .notSelected: print("sharing: Internet Sharing doesn't use \"Cellular (\(s.pdn))\" as its source")
+    }
 }
 
 func printGNSS(_ g: QMIDGNSS) {
