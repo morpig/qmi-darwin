@@ -86,6 +86,42 @@ final class LOCTests: XCTestCase {
 
     private func le<T>(_ v: T) -> String { withUnsafeBytes(of: v) { Array($0) }.hex }
 
+    func testInjectUTCTimeRequest() {
+        XCTAssertEqual(LOC.injectUTCTime, 0x0038)
+        XCTAssertEqual(LOC.injectUTCTimeRequest(Date(timeIntervalSince1970: 1_793_439_462.5), uncertaintyMs: 500),
+                       [TLV(0x01, [UInt8](hex: "64 74 52 91 a1 01 00 00")!), .u32(0x02, 500)])
+    }
+
+    // From a live RM551E report: a UTC 12 h off, source 13 (unknown), not yet a fix.
+    func testPositionTimeKnown() throws {
+        let utc = (0x25 as UInt8, "1f fe 70 94 a1 01 00 00")
+        func report(_ status: String, _ source: String?) throws -> LOC.Position {
+            var t: [(UInt8, String)] = [(0x01, status), utc]
+            if let source { t.append((0x29, source)) }
+            return try XCTUnwrap(LOC.parsePosition(try indication(LOC.positionReport, t)))
+        }
+        let waiting = try report("01 00 00 00", "0d 00 00 00")
+        XCTAssertEqual(waiting.timeSource, 13)
+        XCTAssertEqual(waiting.time?.timeIntervalSince1970, 1_793_491_795.487)
+        XCTAssertFalse(waiting.timeKnown)
+        XCTAssertFalse(try report("01 00 00 00", "00 00 00 00").timeKnown)
+        XCTAssertFalse(try report("01 00 00 00", nil).timeKnown)
+        XCTAssertTrue(try report("01 00 00 00", "07 00 00 00").timeKnown)
+        XCTAssertTrue(try report("00 00 00 00", "0d 00 00 00").timeKnown)   // a fix
+        XCTAssertTrue(try report("00 00 00 00", nil).timeKnown)
+    }
+
+    func testInjectPositionRequest() {
+        let tlvs = LOC.injectPositionRequest(latitude: 45.5, longitude: -90.25, uncertainty: 1500)
+        XCTAssertEqual(tlvs.map(\.type), [0x10, 0x11, 0x12, 0x13, 0x14, 0x1D])     // no timestamp
+        XCTAssertEqual(tlvs[0].value.hex, le(45.5))
+        XCTAssertEqual(tlvs[1].value.hex, le(-90.25))
+        XCTAssertEqual(tlvs[2].value.hex, le(Float(1500)))
+        XCTAssertEqual(tlvs[3].value, [68])
+        XCTAssertEqual(tlvs[4].value, [3, 0, 0, 0])                    // reliability medium
+        XCTAssertEqual(tlvs[5].value, [1, 0, 0, 0])                    // source: cell ID
+    }
+
     func testSessionRequests() {
         XCTAssertEqual(LOC.startRequest(intervalMs: 1000),
                        [.u8(0x01, 1), .u32(0x10, 1), .u32(0x12, 1), .u32(0x13, 1000)])

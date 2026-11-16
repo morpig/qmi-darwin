@@ -149,9 +149,22 @@ func locSurvey(_ args: [String]) {
     var regExtra: [TLV] = []                 // --reg-tlv TYPE:HEX, appended to Register Events
     var listen: TimeInterval = 0
     var verbose = false
+    var supl = false
+    var extra: [(UInt16, [TLV])] = []        // --call ID[:TT=HEX,...], read-only queries by hand
     var a = args[...]
     while let x = a.popFirst() {
         switch x {
+        case "--supl": supl = true
+        case "--call":
+            let parts = (a.popFirst() ?? "").split(separator: ":", maxSplits: 1).map(String.init)
+            guard let id = parts.first.flatMap({ UInt16($0.replacingOccurrences(of: "0x", with: ""), radix: 16) }) else { fail("--call ID[:TT=HEX,...]") }
+            var tlvs: [TLV] = []
+            for kv in (parts.count > 1 ? parts[1] : "").split(separator: ",") {
+                let p = kv.split(separator: "=").map(String.init)
+                guard p.count == 2, let t = UInt8(p[0], radix: 16), let v = [UInt8](hex: p[1]) else { fail("--call ID[:TT=HEX,...]") }
+                tlvs.append(TLV(t, v))
+            }
+            extra.append((id, tlvs))
         case "--register": register = a.popFirst().flatMap { UInt64($0.replacingOccurrences(of: "0x", with: ""), radix: 16) }
         case "--reg-tlv":
             let parts = (a.popFirst() ?? "").split(separator: ":", maxSplits: 1).map(String.init)
@@ -159,7 +172,7 @@ func locSurvey(_ args: [String]) {
             regExtra.append(TLV(t, v))
         case "--listen": listen = a.popFirst().flatMap(Double.init) ?? 0
         case "-v": verbose = true
-        default: fail("usage: qmictl loc-survey [--register HEXMASK] [--listen SECONDS] [-v]")
+        default: fail("usage: qmictl loc-survey [--register HEXMASK] [--listen SECONDS] [--supl] [--call ID[:TT=HEX,...]] [-v]")
         }
     }
     let (dev, c, inbox) = openLOC(verbose: verbose)
@@ -191,6 +204,17 @@ func locSurvey(_ args: [String]) {
     call(c, inbox, 0x004B, "Get Operation Mode")
     call(c, inbox, 0x003B, "Get Engine Lock")
     call(c, inbox, 0x003F, "Get NMEA Types")
+    if supl {
+        // Get Server: TLV 0x01 server type (1 CDMA PDE, 2 CDMA MPC, 3 UMTS SLP, 4 custom PDE),
+        // 0x10 address types wanted (1 IPv4, 2 IPv6, 4 URL).
+        for (type, name) in [(UInt32(3), "UMTS SLP"), (1, "CDMA PDE"), (4, "custom PDE")] {
+            call(c, inbox, 0x0043, "Get Server (\(name))", [.u32(0x01, type), .u8(0x10, 7)])
+        }
+        // Get Protocol Config Parameters: TLV 0x01 u64 mask of what to read.
+        var w = ByteWriter(); w.u32(0xffff); w.u32(0)
+        call(c, inbox, 0x0055, "Get Protocol Config Parameters", [TLV(0x01, w.bytes)])
+    }
+    for (id, tlvs) in extra { call(c, inbox, id, "by hand", tlvs) }
 
     if listen > 0 {
         print("listening \(Int(listen)) s for LOC indications…")
@@ -290,17 +314,21 @@ func locFix(_ args: [String]) {
     var noRegister = false                  // check: does a session report without Register Events?
     var releaseAfter: TimeInterval?         // check: release the client without Stop; watch engine state on a 2nd client
     var noStop = false
+    var mask: UInt32 = 0x183                 // position, SV info, engine state, fix session state
+    var injectFile: String?                  // "lat lon uncertainty_m": Inject Position (0x0039) before Start
     var a = args[...]
     while let x = a.popFirst() {
         switch x {
         case "--no-register": noRegister = true
         case "--release-test": releaseAfter = a.popFirst().flatMap(Double.init)
         case "--no-stop": noStop = true
+        case "--mask": mask = a.popFirst().flatMap { UInt32($0.replacingOccurrences(of: "0x", with: ""), radix: 16) } ?? mask
+        case "--inject-file": injectFile = a.popFirst()
         case "--timeout": timeout = a.popFirst().flatMap(Double.init) ?? timeout
         case "--after-fix": afterFix = a.popFirst().flatMap(Double.init) ?? afterFix
         case "--log": logPath = a.popFirst()
         case "-v": verbose = true
-        default: fail("usage: qmictl loc-fix [--timeout S] [--after-fix S] [--log FILE] [--no-register] [--release-test S] [--no-stop] [-v]")
+        default: fail("usage: qmictl loc-fix [--timeout S] [--after-fix S] [--log FILE] [--no-register] [--release-test S] [--no-stop] [--mask HEX] [--inject-file F] [-v]")
         }
     }
     FileManager.default.createFile(atPath: logPath ?? "/dev/null", contents: nil)
@@ -389,7 +417,18 @@ func locFix(_ args: [String]) {
         call(cl, inbox, 0x0021, String(format: "Register Events 0x%x on client %d", mask, cl.id), [TLV(0x01, w.bytes), .u32(0x11, 1)], wait: 0)
     }
     if noRegister { print("(no Register Events: session reports should not arrive)") }
-    else { register(c, 0x183) }                     // position, SV info, engine state, fix session state
+    else { register(c, mask) }
+    if let injectFile {
+        // Coordinates stay off the screen: only the uncertainty and the modem's answer are printed.
+        let f = ((try? String(contentsOfFile: injectFile, encoding: .utf8)) ?? "").split(whereSeparator: \.isWhitespace).compactMap { Double($0) }
+        guard f.count == 3 else { fail("--inject-file: want \"lat lon uncertainty\"") }
+        func d(_ type: UInt8, _ v: Double) -> TLV { var w = ByteWriter(); w.u32(UInt32(v.bitPattern & 0xffff_ffff)); w.u32(UInt32(v.bitPattern >> 32)); return TLV(type, w.bytes) }
+        func fl(_ type: UInt8, _ v: Float) -> TLV { .u32(type, v.bitPattern) }
+        let ind = call(c, inbox, 0x0039, String(format: "Inject Position (±%.0f m, cell ID source)", f[2]),
+                       [d(0x10, f[0]), d(0x11, f[1]), fl(0x12, Float(f[2])), .u8(0x13, 68), .u32(0x14, 3), .u32(0x1D, 1)], quiet: true)
+        let st = ind?[tlv: 0x01].flatMap { u32v($0) }
+        print("inject position: " + (ind == nil ? "no answer" : "status \(st.map(String.init) ?? "?")") + (st == 0 ? " (accepted)" : ""))
+    }
     started = Date()
     // Start: session 1, periodic fixes, intermediate reports on, 1000 ms between reports.
     call(c, inbox, 0x0022, "Start", [.u8(0x01, 1), .u32(0x10, 1), .u32(0x12, 1), .u32(0x13, 1000)], wait: 0)

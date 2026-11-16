@@ -266,6 +266,14 @@ public enum QMIDKey {
     public static let nmea = "nmea"                   // "nmea" events: the sentence; startLocation option (Bool)
     public static let location = "location"           // "location" events: the location dictionary
     public static let gnss = "gnss"                   // status() and "gnss" events
+    public static let assist = "assist"               // GNSS dictionary: the last starting position qmid gave the modem
+    public static let result = "result"               // assist: "injected" | "rejected" | "failed" | "skipped"
+    public static let server = "server"               // assist: "host:port"
+    public static let cell = "cell"                   // assist: the serving cell asked about ("510-10 tac … cell …")
+    public static let uncertainty = "uncertainty"     // assist: m, as injected
+    public static let duration = "duration"           // assist: s the server took
+    public static let firstFixAfter = "firstFixAfter" // assist: s from the session's start to its first fix
+    public static let firstFixDistance = "firstFixDistance" // assist: m between the injected position and the first fix
 
     // events
     public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"

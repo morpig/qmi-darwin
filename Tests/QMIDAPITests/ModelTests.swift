@@ -353,6 +353,13 @@ final class ModelTests: XCTestCase {
 
         let g = QMIDGNSS(engine: "on", running: true, interval: 1000, lastFix: Date(timeIntervalSince1970: 1_793_439_462), clients: 2)
         XCTAssertEqual(QMIDGNSS(g.dictionary), g)
+        var a = QMIDGNSSAssist(time: Date(timeIntervalSince1970: 1_793_460_000), result: .injected, server: "supl.example.com:7275",
+                               cell: "001-01 tac 258 cell 19088743 pci 301", uncertainty: 1500, duration: 0.35)
+        a.firstFixAfter = 7.6
+        a.firstFixDistance = 34
+        let ga = QMIDGNSS(engine: "on", running: true, interval: 1000, clients: 1, assist: a)
+        XCTAssertEqual(QMIDGNSS(ga.dictionary), ga)
+        XCTAssertEqual(QMIDGNSSAssist(QMIDGNSSAssist(time: Date(timeIntervalSince1970: 1), result: .failed, error: "x").dictionary).error, "x")
         XCTAssertEqual(QMIDStatus([QMIDKey.gnss: g.dictionary] as NSDictionary).gnss, g)
         XCTAssertNil(QMIDStatus(NSDictionary()).gnss)
     }

@@ -105,16 +105,37 @@ public struct QMIDConfig: Codable, Equatable {
     // older than maxAgeHours (default 24), or missing. Default on.
     public var xtra: XTRA? = nil
     public var pdns: [PDN]
-
     public struct XTRA: Codable, Equatable {
         public var download: Bool?
         public var maxAgeHours: Int?
+        public var servers: [String]?           // https URLs; default: what the modem names
 
         public var downloads: Bool { download ?? true }
         public var maxAge: TimeInterval { TimeInterval(maxAgeHours ?? 24) * 3600 }
     }
 
     public var xtraSettings: XTRA { xtra ?? XTRA() }
+    // Give the modem the Mac's time before a location session starts (Mac to modem only; the
+    // Mac's clock is never set). Default on.
+    public var injectTime: Bool? = nil
+    // A starting position for the GNSS engine: each time a client starts location, qmid asks a
+    // SUPL server for the serving LTE cell's position over the Mac's default route and injects
+    // it (once registered, if it isn't yet). Default on, supl.google.com:7275.
+    public var supl: SUPLSettings? = nil
+
+    public struct SUPLSettings: Codable, Equatable {
+        public var enabled: Bool?
+        public var server: String?              // "host:port"
+
+        public var on: Bool { enabled ?? true }
+        public var endpoint: (host: String, port: UInt16)? {
+            let s = server ?? "supl.google.com:7275"
+            guard let i = s.lastIndex(of: ":"), let port = UInt16(s[s.index(after: i)...]), i > s.startIndex else { return nil }
+            return (String(s[..<i]), port)
+        }
+    }
+
+    public var suplSettings: SUPLSettings { supl ?? SUPLSettings() }
     public var carriers: [Carrier]? = nil
 
     public struct Carrier: Codable, Equatable {
@@ -210,8 +231,14 @@ public struct QMIDConfig: Codable, Equatable {
     }
 
     public func validate() throws {
+        if supl?.server != nil, supl?.endpoint == nil {
+            throw QMIHostError.transport("config: supl server must be \"host:port\"")
+        }
         if let h = xtra?.maxAgeHours, !(1...167).contains(h) {
             throw QMIHostError.transport("config: xtra maxAgeHours must be 1–167 (a file lasts 168 h)")
+        }
+        for s in xtra?.servers ?? [] where URL(string: s)?.scheme != "https" {
+            throw QMIHostError.transport("config: xtra server \(s) is not an https URL")
         }
         for v in vendorIDs ?? [] where v.count != 4 || UInt16(v, radix: 16) == nil {
             throw QMIHostError.transport("config: vendorID \(v) is not 4 hex digits")

@@ -360,6 +360,8 @@ r.endcAvailable                          // the LTE cell offers EN-DC
 | `active` | secondary LTE cell: activated (carrying data) or only configured |
 | `scellIndex` | secondary LTE cell: the RRC sCellIndex (1–7), the number the network and modem logs use for it |
 
+Steps: LTE `rsrp`, `rsrq` and `rssi` 0.1 dB for every LTE cell, the PCell included; NR `rsrp` and `rsrq` 1 dB; `snr` 0.1 dB.
+
 What the modem reports varies by firmware. On a Quectel RM551E in EN-DC, the LTE cells are
 complete and SCells turn `active` within seconds of traffic; the NR leg comes with its
 `channel`, `band`, `pci`, `bandwidth` and signal but without `cellID`, and only one NR carrier
@@ -434,7 +436,7 @@ keeps one file; `xtra()` reads what it holds:
 |---|---|
 | `supported` | the modem takes XTRA over QMI |
 | `validFrom`, `validHours`, `expires` | the data's window (typically 168 h); nil without data. `isValid()`: covers now |
-| `servers` | the URLs the modem names for its XTRA file |
+| `servers` | where qmid gets the XTRA file: config `xtra.servers`, else what the modem names, else a built-in list |
 | `age()` | how old the data is (since `validFrom`) |
 | `autoUpdate`, `lastDownload`, `nextCheck`, `lastError` | qmid's own updates (below) |
 
@@ -450,8 +452,8 @@ if !x.isValid(), let url = x.servers.first.flatMap(URL.init(string:)) {
   `maxAgeHours` (24), or missing or unreadable, qmid downloads the file from the first of
   `servers` that answers, over the Mac's default route (HTTPS, `If-Modified-Since`, ~60 KB),
   and loads it. It loads only a file newer than the modem's data (by `Last-Modified`). It looks
-  60 s after the modem opens, at least every 6 h, and after wake when a look was due; after a
-  failure it waits 15 min, 1 h, then 6 h. The modem has not been seen fetching XTRA by itself
+  60 s after the modem opens (5 s if a client wants location), when a new location session
+  starts, at least every 6 h, and after wake when a look was due; after a failure it waits 15 min, 1 h, then 6 h. The modem has not been seen fetching XTRA by itself
   (`AT+QGPSXTRA=1`).
 - `loadXTRA` loads a file a client brings. A file older than the modem's still loads, and
   replaces it.
@@ -508,9 +510,31 @@ dual-frequency modem lists a satellite once per signal (`signal` `"L1"`, `"L5"`,
   client's options. `nmea: true` adds the modem's NMEA sentences (`onNMEA`).
 - GNSS works in airplane mode. A first fix outdoors takes about 5 s with valid XTRA data
   (see "GNSS assistance (XTRA)"), about 1–3 s right after an earlier fix. Right after a
-  modem restart it was usually about as fast, once 99 s. `time` is the modem's UTC of the fix.
+  modem restart it was usually about as fast, once 99 s. `time` is the modem's UTC of the fix;
+  on a report before the first fix it is nil while the modem's time is unknown.
+- **Time.** qmid gives the modem the Mac's time before a new session starts (LOC Inject UTC
+  Time; config `injectTime`, default on). It only goes from Mac to modem: qmid never sets the
+  Mac's clock.
+- A session keeps running for 45 s after its last client stops, so a client that starts again
+  keeps the search it had. `gnss()` then shows `running` with `clients` 0.
+- **Starting position (SUPL).** Each time a client calls `startLocation`, qmid asks a SUPL
+  server (default `supl.google.com:7275`, config `supl`) for the serving LTE cell's position,
+  over the Mac's default route, and injects it (LOC Inject Position, at least ±1.5 km): before
+  Start for a new session, or straight into a session that is already running (another
+  client, or the 45 s hold). Not registered yet (no PLMN, e.g. just after the modem reopened):
+  the session starts without it, and qmid asks once the modem registers. The modem then searches from the right
+  place instead of a country-wide guess. In one live pair after a modem reset: first fix 7.6 s
+  with it, 31.5 s without. What the server gets: the serving cell (MCC/MNC, TAC, cell ID, PCI)
+  and a fixed test identity (IMSI 001-01…), not the SIM's. It waits at most 8 s (also for a
+  route, while the modem's own data connection comes up); without an answer the session starts
+  anyway. Only the reference location is asked for.
 - `gnss()` / `onGNSS` (`QMIDGNSS`): `engine` (`"on"`, `"off"`, `"unknown"`), `running`,
-  `interval`, `clients`, `lastFix` (time only). Also in `status()` as `gnss`.
+  `interval`, `clients`, `lastFix` (time only), and `assist` (`QMIDGNSSAssist`, the last
+  starting position, never the position itself): `result` (`.injected`, `.rejected`,
+  `.failed`, `.skipped`), `time`, `server`, `cell`, `uncertainty` (m), `duration` (s the
+  server took), `error`, and once the session has its first fix, `firstFixAfter` (s) and
+  `firstFixDistance` (m between the starting position and the fix). Also in `status()` as
+  `gnss`. `engine` turns `"on"` as soon as reports arrive.
 
 ## Dedicated bearers and QoS
 
@@ -667,12 +691,31 @@ other PDNs get none. `"mirrorProxies": false` (top level) turns this off.
 ### XTRA updates (`xtra`)
 
 ```json
-"xtra": { "download": true, "maxAgeHours": 24 }
+"xtra": { "download": true, "maxAgeHours": 24, "servers": ["https://…"] }
 ```
 
-Top level, optional; these are the defaults. `download: false` stops qmid's own downloads
-(`loadXTRA` still works). `maxAgeHours` (1–167): how old the modem's data may get before qmid
-loads a fresh file. See "GNSS assistance (XTRA)".
+Top level, optional. `download` and `maxAgeHours` show their defaults. `download: false` stops
+qmid's own downloads (`loadXTRA` still works). `maxAgeHours` (1–167): how old the modem's data
+may get before qmid loads a fresh file. `servers` (https URLs, tried in order): by default what
+the modem names, or a built-in list when it names none. See "GNSS assistance (XTRA)".
+
+### Time for the GNSS engine (`injectTime`)
+
+```json
+"injectTime": true
+```
+
+Top level, optional; this is the default. `false`: qmid gives the modem no time before a location
+session starts. See "Location".
+
+### SUPL starting position (`supl`)
+
+```json
+"supl": { "enabled": true, "server": "supl.google.com:7275" }
+```
+
+Top level, optional; these are the defaults. `enabled: false` stops qmid asking. `server`:
+any SUPL 2.0 server that answers LTE cells with LPP (TLS). See "Location".
 
 ### Per-SIM default bearer (`carriers`)
 

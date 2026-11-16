@@ -837,17 +837,25 @@ public enum NAS {
                 }
             }
         }
-        // Get Signal Info 0x14: LTE RSSI, RSRQ (1 dB, signed bytes), RSRP (1 dB), SNR.
+        // The PCell's RSRP, RSRQ and RSSI from its own Cell Location Info entry (0.1 dB, the
+        // source the SCells and neighbours use too). Get Signal Info 0x14 (LTE RSSI, RSRQ as
+        // signed bytes, RSRP, SNR; 1 dB) gives the SNR, and the others only when that entry is
+        // missing: it is whole dB and was seen to hold one value for a minute while the cell's
+        // RSRP moved by more than 1 dB. Int16.min taken as "no value", as in NR's 0x17.
         if var c = lte {
             if let own = measured.first(where: { $0.channel == c.channel && $0.cell.pci == c.pci })?.cell {
                 c.rsrp = own.rsrp; c.rsrq = own.rsrq; c.rssi = own.rssi
             }
             if let v = signal?[tlv: 0x14], v.count >= 6 {
                 var r = ByteReader(v)
-                c.rssi = Double(Int8(bitPattern: try! r.u8()))
-                c.rsrq = Double(Int8(bitPattern: try! r.u8()))
-                c.rsrp = s16(&r).map(Double.init)
-                c.snr = tenths(s16(&r))
+                let rssi = Int8(bitPattern: try! r.u8()), rsrq = Int8(bitPattern: try! r.u8())
+                let rsrp = s16(&r), snr = s16(&r)
+                if c.rsrp == nil {
+                    c.rssi = Double(rssi)
+                    c.rsrq = Double(rsrq)
+                    c.rsrp = rsrp.flatMap { $0 == Int16.min ? nil : Double($0) }
+                }
+                c.snr = snr.flatMap { $0 == Int16.min ? nil : tenths($0) }
             }
             lte = c
         }

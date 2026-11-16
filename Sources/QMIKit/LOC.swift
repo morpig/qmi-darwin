@@ -62,10 +62,17 @@ public enum LOC {
         public var maxFileSize: Int?
         public var maxPartSize: Int?
         public var servers: [String]
+
+        public init(maxFileSize: Int? = nil, maxPartSize: Int? = nil, servers: [String]) {
+            self.maxFileSize = maxFileSize
+            self.maxPartSize = maxPartSize
+            self.servers = servers
+        }
     }
 
     // Get Predicted Orbits Data Source indication: 0x10 max file and part size (u32, u32; the
-    // RM551E leaves it out), 0x11 servers (u8 count, then u8 length + URL each).
+    // RM551E leaves it out), 0x11 servers (u8 count, then u8 length + URL each). The RM520N
+    // accepts the request and never sends this indication.
     public static func parseSource(_ m: QMIMessage) -> XTRASource {
         var s = XTRASource(servers: [])
         if let v = m[tlv: 0x10], v.count >= 8 {
@@ -105,7 +112,7 @@ public enum LOC {
     }
 
     // Inject indication: the status, 0x10 the part it answers. The last part's also carries
-    // 0x11 (u64; 0x1F on the RM551E, apparently the constellations the data covers).
+    // 0x11 (u64; 0x1F on the RM551E, 0x1B on the RM520N: apparently the constellations used).
     public static func injectedPart(_ m: QMIMessage) -> Int? {
         guard let v = m[tlv: 0x10], v.count >= 2 else { return nil }
         return Int(UInt16(v[0]) | UInt16(v[1]) << 8)
@@ -138,6 +145,36 @@ public enum LOC {
     }
 
     public static func stopRequest(session: UInt8 = 1) -> [TLV] { [.u8(0x01, session)] }
+
+    // Inject UTC Time: 0x01 UTC (u64 ms), 0x02 its uncertainty (u32 ms). Answered by an
+    // indication. The modem can hold a wrong clock, flagged unknown in the position reports,
+    // and can't use XTRA until it has the right one.
+    public static let injectUTCTime: UInt16 = 0x0038
+
+    public static func injectUTCTimeRequest(_ date: Date, uncertaintyMs: UInt32) -> [TLV] {
+        var w = ByteWriter()
+        let ms = UInt64(max(0, date.timeIntervalSince1970 * 1000))
+        w.u32(UInt32(truncatingIfNeeded: ms))
+        w.u32(UInt32(truncatingIfNeeded: ms >> 32))
+        return [TLV(0x01, w.bytes), .u32(0x02, uncertaintyMs)]
+    }
+
+    // Inject Position: a rough position for the engine to start its search from. Accepted on
+    // the RM551E (indication status 0); the position reports don't show it, the search uses it.
+    // No timestamp TLV: the time goes in with Inject UTC Time.
+    public static let injectPosition: UInt16 = 0x0039
+
+    public enum PositionSource: UInt32 { case gnss = 0, cellID = 1, enhancedCellID = 2, wifi = 3, terrestrial = 4, hybrid = 5, other = 6 }
+
+    // `uncertainty`: circular, m; `confidence`: % (1–99); reliability "medium" (3).
+    public static func injectPositionRequest(latitude: Double, longitude: Double, uncertainty: Float,
+                                             confidence: UInt8 = 68, source: PositionSource = .cellID) -> [TLV] {
+        func f64(_ type: UInt8, _ v: Double) -> TLV {
+            var w = ByteWriter(); w.u32(UInt32(v.bitPattern & 0xffff_ffff)); w.u32(UInt32(v.bitPattern >> 32)); return TLV(type, w.bytes)
+        }
+        return [f64(0x10, latitude), f64(0x11, longitude), .u32(0x12, uncertainty.bitPattern),
+                .u8(0x13, confidence), .u32(0x14, 3), .u32(0x1D, source.rawValue)]
+    }
 
     // Engine State: TLV 0x01 is the state (1 on, 2 off), not a status.
     public static func parseEngineOn(_ m: QMIMessage) -> Bool? {
@@ -216,16 +253,23 @@ public enum LOC {
         public var speed: Float?              // m/s, horizontal
         public var verticalSpeed: Float?
         public var heading: Float?            // degrees from true north
-        public var time: Date?                // UTC of the fix
+        public var time: Date?                // the modem's UTC; see timeKnown
+        public var timeSource: UInt32?        // 0 invalid, 13 unknown, 7 navigation solution, …
         public var technology: UInt32?        // mask: 1 satellite, 2 cellular, 4 Wi-Fi, 8 sensors, …
         public var used: [(id: UInt16, signal: UInt64?)] = []
+
+        // Whether `time` can be believed. Before its first fix a modem reported a UTC 12 h off,
+        // source "unknown"; a fix's own time is always good.
+        public var timeKnown: Bool {
+            status == 0 || (timeSource.map { $0 != 0 && $0 != 13 } ?? false)
+        }
 
         public static func == (a: Position, b: Position) -> Bool {
             a.status == b.status && a.latitude == b.latitude && a.longitude == b.longitude
                 && a.horizontalAccuracy == b.horizontalAccuracy && a.altitude == b.altitude
                 && a.altitudeMSL == b.altitudeMSL && a.verticalAccuracy == b.verticalAccuracy
                 && a.speed == b.speed && a.verticalSpeed == b.verticalSpeed && a.heading == b.heading
-                && a.time == b.time && a.technology == b.technology
+                && a.time == b.time && a.timeSource == b.timeSource && a.technology == b.technology
                 && a.used.map(\.id) == b.used.map(\.id) && a.used.map(\.signal) == b.used.map(\.signal)
         }
     }
@@ -233,7 +277,7 @@ public enum LOC {
     // Position Report: 0x01 session status, 0x10 latitude, 0x11 longitude (doubles), 0x12
     // horizontal uncertainty, 0x18 speed, 0x1A / 0x1B altitude (ellipsoid / sea level), 0x1C
     // vertical uncertainty, 0x1F vertical speed, 0x20 heading (floats), 0x23 technology mask,
-    // 0x25 UTC (u64 ms), 0x2C satellites used (u8 count, u16 IDs; once per signal), 0x37 their
+    // 0x25 UTC (u64 ms), 0x29 time source, 0x2C satellites used (u8 count, u16 IDs; once per signal), 0x37 their
     // signal types (u8 count, u64 each).
     public static func parsePosition(_ m: QMIMessage) -> Position? {
         guard let status = u32(m[tlv: 0x01]) else { return nil }
@@ -251,6 +295,7 @@ public enum LOC {
         p.heading = f(0x20)
         p.technology = u32(m[tlv: 0x23])
         p.time = m[tlv: 0x25].flatMap { $0.count >= 8 ? Date(timeIntervalSince1970: TimeInterval(u64($0)) / 1000) : nil }
+        p.timeSource = u32(m[tlv: 0x29])
         if let v = m[tlv: 0x2C], let n = v.first {
             let types = u64s(m[tlv: 0x37])
             var r = ByteReader(v, offset: 1)

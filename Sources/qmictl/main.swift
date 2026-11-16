@@ -48,6 +48,7 @@ usage (direct to the modem; stop qmid first):
   qmictl profiles     [--iface N] [-v]     modem profiles, autoconnect, LTE attach PDN list
   qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
   qmictl nas-survey   [--iface N] [-v]     raw TLVs of the NAS cell, signal, band and CA messages
+  qmictl ambr-survey  [--iface N] [-v]     raw TLVs of WDS/QoS messages that may carry the APN-AMBR (profile 1)
   qmictl reattach     [--iface N] [-v]     low power, then online: attach again with the attach profile
   qmictl loc-survey   [--register HEX] [--reg-tlv T:HEX] [--listen S] [-v]
                                            LOC: XTRA source / validity, engine lock, raw indications
@@ -344,6 +345,71 @@ func nasSurvey(_ o: Options) {
         }
     } catch {
         print("  coex: \(error)")
+    }
+}
+
+// MARK: - ambr-survey
+
+// Raw TLVs of the WDS and QoS messages that may carry the APN-AMBR, on a call of our own
+// (qmid stopped), to find where a modem reports it whole. `--find` lists values to look for
+// (e.g. 500000000,500000): any u16/u32/u64 equal to one is flagged, as bps, kbps or Mbps.
+func ambrSurvey(_ o: Options, profile: UInt8, find: [UInt64]) {
+    let dev = openDevice(o)
+    defer { dev.close() }
+    let muxID: UInt8 = 0x81
+    func dump(_ name: String, _ r: QMIMessage) {
+        print("\(name):")
+        for t in r.tlvs where t.type != 0x02 {
+            print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
+            for w in [2, 4, 8] where t.value.count >= w {
+                for off in 0...(t.value.count - w) {
+                    let v = (0..<w).reduce(UInt64(0)) { $0 | UInt64(t.value[off + $1]) << (8 * UInt64($1)) }
+                    if v != 0, find.contains(v) { print("     ^ \(v) at offset \(off) as u\(w * 8)") }
+                }
+            }
+        }
+    }
+    func ask(_ c: QMIClient, _ id: UInt16, _ name: String, _ tlvs: [TLV] = []) {
+        do { dump(String(format: "0x%04x %@", id, name), try c.request(id, tlvs, timeout: 5)) }
+        catch { print(String(format: "0x%04x %@: %@", id, name, "\(error)")) }
+    }
+    do {
+        let wds = try dev.allocateClient(.wds)
+        defer { wds.release() }
+        try wds.request(WDS.bindMuxDataPort, WDS.bindMuxDataPortRequest(interface: UInt32(dev.modem.interfaceNumber), muxID: muxID))
+        try wds.request(WDS.setIPFamily, [.u8(0x01, 4)])
+        let s = try wds.request(WDS.startNetworkInterface, WDS.startRequest(profile: profile, apn: nil, family: 4),
+                                timeout: 60, accept: [.noEffect, .callFailed])
+        print("start: \(s.result.map { "\($0)" } ?? "?")")
+        ask(wds, WDS.getAMBRInfo, "Get AMBR Info")
+        ask(wds, WDS.getRuntimeSettings, "Get Runtime Settings", WDS.runtimeSettingsRequest())
+        ask(wds, 0x0085, "Get LTE Attach Params")
+        ask(wds, 0x0091, "Get Data Bearer Tech Ex")
+        ask(wds, 0x00F3, "Get Data Bearer Type")
+        ask(wds, 0x0023, "Get Channel Rates")
+        ask(wds, 0x0041, "Get Current Channel Rate")
+        ask(wds, 0x0052, "Get Data Bearer Tech")
+        // Get Supported Messages: the WDS IDs this firmware answers.
+        if let r = try? wds.request(0x001E, timeout: 2), let v = r[tlv: 0x10], v.count >= 2 {
+            let bits = Array(v.dropFirst(2))
+            let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
+            print("WDS supported (\(ids.count)): " + ids.map { String(format: "%04x", $0) }.joined(separator: " "))
+        }
+        let qos = try dev.allocateClient(.qos)
+        defer { qos.release() }
+        try qos.request(QoS.bindDataPort, QoS.bindDataPortRequest(interface: UInt32(dev.modem.interfaceNumber), muxID: muxID))
+        try qos.request(QoS.setClientIPPref, QoS.clientIPPrefRequest(family: 4))
+        ask(qos, QoS.getQoSInfo, "Get QoS Info (QoS ID 0)", QoS.qosIDRequest(0))
+        ask(qos, QoS.getGrantedQoS, "Get Granted QoS (QoS ID 0)", QoS.qosIDRequest(0))
+        ask(qos, QoS.getQoSIDs, "Get QoS IDs")
+        ask(qos, 0x0031, "Get QoS Network Status / Global Flow")
+        if let r = try? qos.request(0x001E, timeout: 2), let v = r[tlv: 0x10], v.count >= 2 {
+            let bits = Array(v.dropFirst(2))
+            let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
+            print("QoS supported (\(ids.count)): " + ids.map { String(format: "%04x", $0) }.joined(separator: " "))
+        }
+    } catch {
+        fail("\(error)")
     }
 }
 
@@ -995,6 +1061,24 @@ func printGNSS(_ g: QMIDGNSS) {
     line += ", \(g.clients) client\(g.clients == 1 ? "" : "s")"
     if let f = g.lastFix { line += ", last fix \(Int(-f.timeIntervalSinceNow)) s ago" }
     print(line)
+    if let a = g.assist {
+        var s = "  start position: \(a.result.rawValue) \(ago(a.time))"
+        if let srv = a.server { s += " from \(a.source.uppercased()) \(srv)" }
+        if let u = a.uncertainty { s += String(format: ", ±%.0f m", u) }
+        if let d = a.duration { s += String(format: ", server %.2f s", d) }
+        if let c = a.cell { s += ", cell \(c)" }
+        print(s)
+        if let after = a.firstFixAfter {
+            print(String(format: "    first fix %.1f s after start%@", after,
+                         a.firstFixDistance.map { String(format: ", %.0f m from the starting position", $0) } ?? ""))
+        }
+        if let e = a.error { print("    \(e)") }
+    }
+}
+
+private func ago(_ d: Date) -> String {
+    let s = Int(-d.timeIntervalSinceNow)
+    return s < 120 ? "\(s) s ago" : s < 7200 ? "\(s / 60) min ago" : "\(s / 3600) h ago"
 }
 
 // Starts location through qmid and prints what comes; Ctrl-C (or --for) ends it, and qmid
@@ -1183,6 +1267,7 @@ case "modem-status": status(options)
 case "profiles": profiles(options)
 case "plmn-name": plmnName(options)
 case "nas-survey": nasSurvey(options)
+case "ambr-survey": ambrSurvey(options, profile: 1, find: [500_000_000, 500_000, 256_000_000, 256_000, 244_000_000, 244_000, 508_640, 508_640_000])
 case "reattach": reattach(options)
 case "run": connect(options)
 default: print(usage); exit(2)

@@ -175,6 +175,12 @@ public final class Manager {
     private var gnssEngine: Bool?
     private var gnssStarted: Date?            // the session's start, for the time to first fix
     private var lastFix: Date?
+    private var gnssHold: DispatchWorkItem?   // the session outlives its last client this long
+    static let gnssHoldTime: TimeInterval = 45
+    private var gnssOpened: Date?             // when this modem was opened: it may have lost its position then
+    private var gnssAssist: QMIDGNSSAssist?   // the last SUPL starting position (status; never the position)
+    private var assistPosition: (latitude: Double, longitude: Double)?  // memory only: for the first fix's distance
+    private var suplAwaitingPLMN = false      // SUPL skipped for want of a PLMN: ask once registered
     private var gnssRetry: DispatchWorkItem?
     private var lastGNSSEvent: NSDictionary?
     private var xtraState = XTRAState()       // qmid's own XTRA updates (state.json "xtra")
@@ -425,8 +431,10 @@ public final class Manager {
         readAttach()
         startProfileCheck()
         for p in pdns where p.wanted { dial(p) }
+        gnssOpened = Date()
         applyLocation()                             // a session doesn't survive a modem reset: start anew
-        scheduleXTRACheck(in: 60)                   // once the modem has settled
+        // Once the modem has settled; sooner if a client is waiting for a fix.
+        scheduleXTRACheck(in: wantedLocation != nil ? 5 : 60)
     }
 
     private func openFailed(_ error: Error) {
@@ -1016,6 +1024,7 @@ public final class Manager {
             plmn = current
             resetPLMNNames()
             readPLMNName()
+            if current != nil { suplAfterRegistration() }
         }
         // Indications may leave out the roaming indicator when it hasn't changed.
         let roam = s.registration != 1 ? nil : s.roaming ?? roaming
@@ -2036,9 +2045,10 @@ public final class Manager {
 
     // qmid's update state onto a QMIDXTRA (captured on `queue`).
     private var xtraAnnotate: (QMIDXTRA) -> QMIDXTRA {
-        let st = xtraState, next = xtraNext, on = config.xtraSettings.downloads
+        let st = xtraState, next = xtraNext, on = config.xtraSettings.downloads, configured = config.xtraSettings.servers
         return { x in
             var x = x
+            x.servers = XTRADownload.servers(configured: configured, modem: x.servers)
             x.autoUpdate = on
             x.lastDownload = st.lastDownload
             x.nextCheck = on ? next : nil
@@ -2050,11 +2060,12 @@ public final class Manager {
     public func loadXTRA(_ data: Data, _ reply: @escaping (NSDictionary?, String?) -> Void) {
         guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
         log("XTRA: loading \(data.count) bytes (client request)")
+        let add = xtraAnnotate
         gnssQueue.async {
             do {
                 let x = try g.load([UInt8](data))
                 self.queue.async { self.xtraState.failures = 0; self.xtraState.lastError = nil; self.xtraState.notBefore = nil }
-                reply(x.dictionary, nil)
+                reply(add(x).dictionary, nil)
             } catch {
                 self.queue.async { self.log("XTRA: load failed: \(error)", level: .error) }
                 reply(nil, "\(error)")
@@ -2088,7 +2099,8 @@ public final class Manager {
     private func runXTRACheck() {
         guard let g = gnss, !xtraRunning else { return }
         xtraRunning = true
-        let st = xtraState, maxAge = config.xtraSettings.maxAge
+        xtraState.use(modem: imei)
+        let st = xtraState, maxAge = config.xtraSettings.maxAge, configured = config.xtraSettings.servers
         gnssQueue.async {
             let outcome: XTRAOutcome
             do {
@@ -2103,7 +2115,7 @@ public final class Manager {
                 } else {
                     // Without usable data, any file will do: no If-Modified-Since.
                     let since = snap.validity == nil ? nil : st.lastModified
-                    switch try XTRADownload.fetch(snap.servers, since: since) {
+                    switch try XTRADownload.fetch(XTRADownload.servers(configured: configured, modem: snap.servers), since: since) {
                     case .notModified(let host):
                         outcome = .notNewer("not modified on \(host)")
                     case .file(let bytes, let lm, let host):
@@ -2163,9 +2175,15 @@ public final class Manager {
                               sink: @escaping (NSDictionary) -> Void) -> String? {
         let want = GNSSSession.Want(interval: max(1000, interval), satellites: satellites, nmea: nmea)
         let isNew = locationClients[owner] == nil
+        // A session already running (another client, or the hold after the last one) gets no
+        // new Start, so no beforeStart: the SUPL position goes to it directly below.
+        let joining = isNew && device != nil && gnssSession != nil && gnssApplied != nil
         locationClients[owner] = LocationClient(want: want, sink: sink)
         log("location: \(isNew ? "started" : "changed") by a client (interval \(want.interval) ms\(satellites ? ", satellites" : "")\(nmea ? ", nmea" : ""); \(locationClients.count) client\(locationClients.count == 1 ? "" : "s"))")
         applyLocation()
+        if joining, let session = gnssSession, let step = startingPosition(running: true) {
+            session.withClient(step)
+        }
         return nil
     }
 
@@ -2188,17 +2206,33 @@ public final class Manager {
 
     // Brings the modem's session to what the clients want. Without a modem nothing runs; the
     // next open applies it. Airplane mode doesn't matter: GNSS works with the radio off.
-    private func applyLocation(restart: Bool = false) {
+    // `release`: the hold is over. A session whose last client left keeps running for a while:
+    // a client that stops and starts again (seen: 1 s apart) would otherwise lose the search.
+    private func applyLocation(restart: Bool = false, release: Bool = false) {
         gnssRetry?.cancel()
         gnssRetry = nil
         let want = wantedLocation
+        if want != nil || release {
+            gnssHold?.cancel()
+            gnssHold = nil
+        } else if device != nil, gnssSession != nil, gnssApplied != nil {
+            if gnssHold == nil {
+                log(String(format: "location: no clients; keeping the session for %.0f s", Self.gnssHoldTime))
+                let hold = DispatchWorkItem { [weak self] in self?.applyLocation(release: true) }
+                gnssHold = hold
+                queue.asyncAfter(deadline: .now() + Self.gnssHoldTime, execute: hold)
+            }
+            return emitGNSS()
+        }
         guard let dev = device, want != nil || gnssSession != nil else { return emitGNSS() }
         guard restart || want != gnssApplied || gnssSession == nil else { return }
         let session = gnssSession ?? makeLocationSession(dev)
         gnssSession = session
+        let fresh = gnssApplied == nil && want != nil && !restart
         if gnssApplied == nil, want != nil { gnssStarted = Date() }
         gnssApplied = want
-        session.apply(want, restart: restart) { [weak self] err in
+        if fresh { scheduleXTRACheck(in: 0) }           // old or missing data would slow this search
+        session.apply(want, restart: restart, beforeStart: fresh ? beforeStart() : nil) { [weak self] err in
             self?.queue.async {
                 guard let self, self.gnssSession === session else { return }
                 if let err {
@@ -2214,6 +2248,7 @@ public final class Manager {
                     self.gnssSession = nil
                     self.gnssEngine = false
                     self.gnssStarted = nil
+                    self.suplAwaitingPLMN = false
                     self.log("location: session stopped")
                 } else if let want, restart || self.gnssEngine != true {
                     self.log("location: session running (\(want.interval) ms)")
@@ -2229,17 +2264,29 @@ public final class Manager {
             guard let self else { return }
             if l.fix == .fix {
                 if self.lastFix == nil || (self.gnssStarted.map { self.lastFix! < $0 } ?? false), let t0 = self.gnssStarted {
-                    // No position in the log: accuracy and satellites only.
-                    self.log(String(format: "location: first fix after %.1f s (±%.0f m, %d satellites)", Date().timeIntervalSince(t0),
-                                    l.horizontalAccuracy ?? -1, l.satellitesUsed ?? 0), level: .notice)
+                    // No position in the log: accuracy, satellites, and how far the SUPL starting position was.
+                    let after = Date().timeIntervalSince(t0)
+                    var off = ""
+                    if let a = self.assistPosition, let lat = l.latitude, let lon = l.longitude {
+                        let d = Self.distance(a.latitude, a.longitude, lat, lon)
+                        off = String(format: ", %.0f m from the SUPL starting position", d)
+                        self.gnssAssist?.firstFixDistance = d.rounded()
+                        self.gnssAssist?.firstFixAfter = (after * 10).rounded() / 10
+                        self.assistPosition = nil
+                    }
+                    self.log(String(format: "location: first fix after %.1f s (±%.0f m, %d satellites%@)", after,
+                                    l.horizontalAccuracy ?? -1, l.satellitesUsed ?? 0, off), level: .notice)
+                    self.emitGNSS()
                 }
                 self.lastFix = Date()
             }
+            self.engineSeen()
             let ev: NSDictionary = [QMIDKey.type: QMIDEventType.location, QMIDKey.location: l.dictionary]
             self.locationClients.values.forEach { $0.sink(ev) }
         }
         s.onSatellites = { [weak self] sats in
             guard let self else { return }
+            self.engineSeen()
             let ev = NSMutableDictionary(dictionary: sats.dictionary)
             ev[QMIDKey.type] = QMIDEventType.satellites
             self.locationClients.values.filter(\.want.satellites).forEach { $0.sink(ev) }
@@ -2257,14 +2304,154 @@ public final class Manager {
         return s
     }
 
+    // Reports flow, so the engine runs, whatever its last state event said: a session started
+    // right after the previous client's release gets no "engine on" (the engine never stopped).
+    private func engineSeen() {
+        guard gnssEngine != true else { return }
+        gnssEngine = true
+        log("location: GNSS engine on (reports arriving)")
+        emitGNSS()
+    }
+
+    // MARK: Before a new session's Start
+
+    // Decided on the manager queue; runs on the session's queue: the time first (no network
+    // needed), then the position, which can take seconds.
+    private func beforeStart() -> (QMIClient) -> Void {
+        let injectTime = config.injectTime ?? true
+        let position = startingPosition()
+        let sink = logSink
+        return { client in
+            if injectTime { Self.injectTime(client, log: sink) }
+            position?(client)
+        }
+    }
+
+    // The Mac's clock to the modem. Its own clock can be hours off (seen: 12 h, flagged unknown),
+    // and it then searches without using XTRA. The engine is free to keep a better time.
+    private static func injectTime(_ client: QMIClient, log: (QMIDLogLevel, String) -> Void) {
+        do {
+            let ind = try client.requestIndication(LOC.injectUTCTime, LOC.injectUTCTimeRequest(Date(), uncertaintyMs: 500),
+                                                   timeout: 5, indicationTimeout: 5)
+            let status = LOC.indicationStatus(ind) ?? .success
+            log(status == .success ? .notice : .error,
+                status == .success ? "location: gave the modem the Mac's time before Start" : "location: the modem refused the time: \(status)")
+        } catch {
+            log(.error, "location: time not given: \(error)")
+        }
+    }
+
+    // MARK: Starting position from SUPL
+
+    // Decided on the manager queue each time a client starts location: for a new session the
+    // returned step runs on the session's queue right before Start; for a session already
+    // running (`running`), on that queue as soon as it's free. It reads the serving LTE cell,
+    // asks the SUPL server over the Mac's default route and injects the answer. Any failure:
+    // the session goes on without it.
+    private func startingPosition(running: Bool = false) -> ((QMIClient) -> Void)? {
+        let s = config.suplSettings
+        guard s.on else {
+            log("location: SUPL starting position off (config supl.enabled false)")
+            return nil
+        }
+        guard let ep = s.endpoint else { return nil }
+        let server = "\(ep.host):\(ep.port)"
+        let when = running ? "into the running session" : "before Start"
+        let without = running ? "the session goes on without it" : "starting without it"
+        func skip(_ why: String) -> ((QMIClient) -> Void)? {
+            log("location: no SUPL starting position: \(why)")
+            gnssAssist = QMIDGNSSAssist(time: Date(), result: .skipped, server: server, error: why)
+            emitGNSS()
+            return nil
+        }
+        guard let p = plmn else {
+            suplAwaitingPLMN = true
+            return skip("not registered (no PLMN); asking once registered")
+        }
+        suplAwaitingPLMN = false
+        guard let nas else { return skip("no NAS client") }
+        let mm = mccmnc(p)
+        let mcc = String(mm.prefix(3)), mnc = String(mm.dropFirst(3))
+        return { [weak self] client in
+            let started = Date()
+            // Straight to the log sink (thread-safe, as the QMI trace): times as they happen.
+            let sink = self?.logSink
+            func log(_ s: String, _ level: QMIDLogLevel = .info) { sink?(level, s) }
+            func done(_ a: QMIDGNSSAssist, _ position: (Double, Double)? = nil) {
+                self?.queue.async {
+                    guard let self else { return }
+                    self.gnssAssist = a
+                    self.assistPosition = position.map { (latitude: $0.0, longitude: $0.1) }
+                    self.emitGNSS()
+                }
+            }
+            let reply = try? nas.request(NAS.getCellLocationInfo, timeout: 2)
+            let serving = NAS.radioCells(sysInfo: nil, cellLocation: reply, signal: nil, rfBand: nil, ca: nil)
+                .cells.first { $0.rat == .lte && $0.role == .primary }
+            guard let c = serving, let eci = c.cellID, eci < 1 << 28, let tac = c.tac, let pci = c.pci else {
+                log("location: no SUPL starting position: no LTE serving cell (SUPL here knows LTE cells only)")
+                return done(QMIDGNSSAssist(time: started, result: .skipped, server: server, error: "no LTE serving cell"))
+            }
+            let cell = SUPL.Cell(mcc: mcc, mnc: mnc, cellID: UInt32(eci), tac: UInt16(truncatingIfNeeded: tac), pci: pci)
+            log("location: asking \(server) for a starting position (cell \(cell.description))")
+            do {
+                let ref = try SUPL.query(host: ep.host, port: ep.port, cell: cell, timeout: 8) { log($0) }
+                let took = Date().timeIntervalSince(started)
+                // At least 1.5 km: the server's figure is for the cell, and the Mac may be moving.
+                let unc = max(ref.semiMajor, 1500).rounded()
+                log(String(format: "SUPL: reference location ±%.0f m × ±%.0f m (%d%%)%@, in %.2f s", ref.semiMajor, ref.semiMinor,
+                           ref.confidence, ref.altitude.map { String(format: ", altitude %.0f m", $0) } ?? "", took))
+                let ind = try client.requestIndication(LOC.injectPosition,
+                                                       LOC.injectPositionRequest(latitude: ref.latitude, longitude: ref.longitude,
+                                                                                 uncertainty: Float(unc)), timeout: 5, indicationTimeout: 5)
+                let st = LOC.indicationStatus(ind)
+                var a = QMIDGNSSAssist(time: started, result: st == .success ? .injected : .rejected, server: server,
+                                       cell: cell.description, uncertainty: unc, duration: (took * 100).rounded() / 100)
+                if st == .success {
+                    log(String(format: "location: injected the SUPL starting position (±%.0f m) %@", unc, when), .notice)
+                    done(a, (ref.latitude, ref.longitude))
+                } else {
+                    a.error = "modem: \(st.map { "\($0)" } ?? "no status")"
+                    log("location: the modem refused the SUPL position (\(a.error!)); \(without)", .error)
+                    done(a)
+                }
+            } catch {
+                let took = Date().timeIntervalSince(started)
+                log(String(format: "location: SUPL failed after %.1f s: %@; %@", took, "\(error)", without), .error)
+                done(QMIDGNSSAssist(time: started, result: .failed, server: server, cell: cell.description,
+                                    duration: (took * 100).rounded() / 100, error: "\(error)"))
+            }
+        }
+    }
+
+    // The modem registered after a client started location without a PLMN (seen: a session
+    // started 9 s before registration, right after the modem reopened): the SUPL position now.
+    private func suplAfterRegistration() {
+        guard suplAwaitingPLMN else { return }
+        suplAwaitingPLMN = false
+        guard device != nil, let session = gnssSession, gnssApplied != nil else { return }
+        log("location: registered; asking for the SUPL starting position now")
+        if let step = startingPosition(running: true) { session.withClient(step) }
+    }
+
+    static func distance(_ lat1: Double, _ lon1: Double, _ lat2: Double, _ lon2: Double) -> Double {
+        let r = 6_371_000.0, p1 = lat1 * .pi / 180, p2 = lat2 * .pi / 180
+        let dp = p2 - p1, dl = (lon2 - lon1) * .pi / 180
+        let h = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2)
+        return 2 * r * asin(min(1, sqrt(h)))
+    }
+
     // The modem went away: its LOC client with it. Clients stay; the next open starts again.
     private func dropLocationSession() {
         gnssRetry?.cancel()
         gnssRetry = nil
+        gnssHold?.cancel()
+        gnssHold = nil
         gnssSession = nil
         gnssApplied = nil
         gnssEngine = nil
         gnssStarted = nil
+        suplAwaitingPLMN = false
         emitGNSS()
     }
 
@@ -2272,7 +2459,7 @@ public final class Manager {
         let running = gnssSession != nil && gnssApplied != nil
         return QMIDGNSS(engine: gnssEngine.map { $0 ? "on" : "off" } ?? "unknown", running: running,
                         interval: running ? gnssApplied?.interval : nil, lastFix: withLastFix ? lastFix : nil,
-                        clients: locationClients.count)
+                        clients: locationClients.count, assist: gnssAssist)
     }
 
     // Without lastFix, which changes every second while running.

@@ -46,11 +46,14 @@ final class GNSSSession {
     }
 
     // Brings the modem to `want` (nil: no session, client released). `restart`: register and
-    // Start again although nothing changed (after wake). `done` runs on `work`.
-    func apply(_ want: Want?, restart: Bool = false, done: @escaping (String?) -> Void) {
+    // Start again although nothing changed (after wake). `beforeStart` runs on `work` with the
+    // LOC client right before a new session's Start (not on a restart or interval change): the
+    // place for Inject UTC Time and Inject Position. `done` runs on `work`.
+    func apply(_ want: Want?, restart: Bool = false, beforeStart: ((QMIClient) -> Void)? = nil,
+               done: @escaping (String?) -> Void) {
         work.async {
             do {
-                try self.bring(want, restart: restart)
+                try self.bring(want, restart: restart, beforeStart: beforeStart)
                 done(nil)
             } catch {
                 done("\(error)")
@@ -58,7 +61,16 @@ final class GNSSSession {
         }
     }
 
-    private func bring(_ want: Want?, restart: Bool) throws {
+    // Runs `step` on `work` with the LOC client, after any pending apply; not at all if the
+    // session has no client by then (stopped, or its Start failed).
+    func withClient(_ step: @escaping (QMIClient) -> Void) {
+        work.async {
+            guard let c = self.client else { return }
+            step(c)
+        }
+    }
+
+    private func bring(_ want: Want?, restart: Bool, beforeStart: ((QMIClient) -> Void)?) throws {
         guard let want else {
             if let c = client {
                 _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3)
@@ -88,6 +100,7 @@ final class GNSSSession {
         }
         if before?.interval != want.interval {
             if before != nil { _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3) }
+            if before == nil, !restart { beforeStart?(c) }
             try c.request(LOC.start, LOC.startRequest(intervalMs: UInt32(want.interval)), timeout: 5)
         }
         applied = want
@@ -149,7 +162,7 @@ final class GNSSSession {
         l.speed = p.speed.map(Double.init)
         l.verticalSpeed = p.verticalSpeed.map(Double.init)
         l.heading = p.heading.map(Double.init)
-        l.time = p.time
+        l.time = p.timeKnown ? p.time : nil
         l.satellitesUsed = p.used.isEmpty ? nil : Set(p.used.map(\.id)).count
         l.technology = p.technology.map { t in technologies.filter { t & $0.bit != 0 }.map(\.name) } ?? []
         return l

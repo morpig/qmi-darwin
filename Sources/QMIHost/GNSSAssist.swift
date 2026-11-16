@@ -4,8 +4,8 @@ import QMIKit
 
 // GNSS assistance data (XTRA) on one modem: reading what it holds and loading a file. Each call
 // uses a LOC client of its own (the replies need no event registration) and blocks while the
-// modem answers, so callers run it off the manager queue. Behaviour as checked on the RM551E;
-// see docs/QMI-loc.md.
+// modem answers, so callers run it off the manager queue. Behaviour as checked on the RM551E
+// and RM520N; see docs/QMI-loc.md.
 final class GNSSAssist {
     enum Failure: Error, CustomStringConvertible {
         case empty
@@ -33,6 +33,10 @@ final class GNSSAssist {
     private let log: (String, QMIDLogLevel) -> Void
     // The inject message this modem takes; 0x00A7 until it answers NotSupported.
     private var injectMessage = LOC.injectXTRAData
+    // Get Data Source only gives server URLs and size limits, and the RM520N never answers it.
+    // Once it has stayed silent on this modem, don't wait for it again.
+    private var sourceSilent = false
+    static let sourceTimeout: TimeInterval = 2     // it answers in ~30 ms, when it answers
 
     init(device: QMIDevice, log: @escaping (String, QMIDLogLevel) -> Void) {
         self.device = device
@@ -51,7 +55,7 @@ final class GNSSAssist {
         try withClient { c in
             let source: LOC.XTRASource
             do {
-                source = LOC.parseSource(try reply(c, LOC.getPredictedOrbitsDataSource))
+                source = try self.source(c)
             } catch QMIHostError.protocolError(.notSupported, _) {
                 return Snapshot(supported: false)
             }
@@ -79,7 +83,7 @@ final class GNSSAssist {
     func load(_ data: [UInt8]) throws -> QMIDXTRA {
         guard !data.isEmpty else { throw Failure.empty }
         return try withClient { c in
-            let source = LOC.parseSource(try reply(c, LOC.getPredictedOrbitsDataSource))
+            let source = try self.source(c)
             if let max = source.maxFileSize, max > 0, data.count > max { throw Failure.tooLarge(data.count, max) }
             let partSize = min(source.maxPartSize.flatMap { $0 > 0 ? $0 : nil } ?? LOC.maxPartSize, LOC.maxPartSize)
             let started = Date()
@@ -139,6 +143,21 @@ final class GNSSAssist {
             }
             busy = 0
             i += 1
+        }
+    }
+
+    // Servers and limits, or none of them if the modem doesn't answer. NotSupported is thrown:
+    // that's a modem without XTRA over QMI.
+    private func source(_ c: QMIClient) throws -> LOC.XTRASource {
+        guard !sourceSilent else { return LOC.XTRASource(servers: []) }
+        do {
+            let ind = try c.requestIndication(LOC.getPredictedOrbitsDataSource, [], timeout: 5,
+                                              indicationTimeout: Self.sourceTimeout)
+            return LOC.parseSource(ind)
+        } catch QMIHostError.timeout {
+            sourceSilent = true
+            log("XTRA: the modem doesn't answer Get Data Source; going on without its server list", .info)
+            return LOC.XTRASource(servers: [])
         }
     }
 

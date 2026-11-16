@@ -2,7 +2,7 @@ import Foundation
 import QMIKit
 
 // Keeping the modem's XTRA data fresh. The modem has not been seen fetching it by itself
-// under qmid, so qmid downloads the file from the servers the modem names and loads it
+// under qmid, so qmid downloads the file (XTRADownload.servers) and loads it
 // (GNSSAssist.load) once the data is older than maxAge, or missing / unreadable. The download
 // goes over the Mac's default route. See docs/API.md, "GNSS assistance (XTRA)".
 
@@ -46,6 +46,7 @@ enum XTRASchedule {
 
 // The persisted part (state.json "xtra").
 struct XTRAState: Equatable {
+    var modem: String?                      // the IMEI all this is about
     var lastModified: String?               // of the last file loaded, for If-Modified-Since
     var lastDownload: Date?
     var failures = 0
@@ -56,6 +57,7 @@ struct XTRAState: Equatable {
 
     init(_ j: [String: Any]?) {
         guard let j else { return }
+        modem = j["modem"] as? String
         lastModified = j["lastModified"] as? String
         lastDownload = (j["lastDownload"] as? Double).map(Date.init(timeIntervalSince1970:))
         failures = j["failures"] as? Int ?? 0
@@ -63,8 +65,17 @@ struct XTRAState: Equatable {
         notBefore = (j["notBefore"] as? Double).map(Date.init(timeIntervalSince1970:))
     }
 
+    // Another modem holds other data, and its failures aren't this one's: start over. Nil (not
+    // known yet) changes nothing.
+    mutating func use(modem imei: String?) {
+        guard let imei, imei != modem else { return }
+        self = XTRAState()
+        modem = imei
+    }
+
     var json: [String: Any] {
         var j: [String: Any] = ["failures": failures]
+        j["modem"] = modem
         j["lastModified"] = lastModified
         j["lastDownload"] = lastDownload?.timeIntervalSince1970
         j["lastError"] = lastError
@@ -75,13 +86,23 @@ struct XTRAState: Equatable {
 
 enum XTRADownload {
     static let maxSize = 1 << 20            // the real file is ~60 KB
+    // What the RM551E names. For a modem that names none; the RM520N took the same file.
+    static let builtInServers = ["https://path1.xtracloud.net/xtra3Mgrbej.bin",
+                                 "https://path2.xtracloud.net/xtra3Mgrbej.bin",
+                                 "https://path3.xtracloud.net/xtra3Mgrbej.bin"]
+
+    // Config first, then what the modem names, then the built-in list.
+    static func servers(configured: [String]?, modem: [String]) -> [String] {
+        if let configured, !configured.isEmpty { return configured }
+        return modem.isEmpty ? builtInServers : modem
+    }
 
     enum Result {
         case file([UInt8], lastModified: String?, from: String)
         case notModified(from: String)
     }
 
-    // The first server that answers, in the modem's order. Blocks (up to ~60 s per server); run
+    // The first server that answers, in order. Blocks (up to ~60 s per server); run
     // it off the manager queue. `since`: If-Modified-Since.
     static func fetch(_ servers: [String], since: String?) throws -> Result {
         var errors: [String] = []
@@ -100,6 +121,7 @@ enum XTRADownload {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 30
         cfg.timeoutIntervalForResource = 60
+        cfg.waitsForConnectivity = true         // the modem's own data connection may be coming up
         let session = URLSession(configuration: cfg)
         defer { session.finishTasksAndInvalidate() }
         var req = URLRequest(url: url)

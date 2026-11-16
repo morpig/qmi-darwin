@@ -947,13 +947,16 @@ public struct QMIDGNSS: Equatable {
     public var interval: Int?                 // ms between reports while running
     public var lastFix: Date?
     public var clients: Int
+    public var assist: QMIDGNSSAssist?        // the last starting position qmid gave the modem
 
-    public init(engine: String = "unknown", running: Bool = false, interval: Int? = nil, lastFix: Date? = nil, clients: Int = 0) {
+    public init(engine: String = "unknown", running: Bool = false, interval: Int? = nil, lastFix: Date? = nil, clients: Int = 0,
+                assist: QMIDGNSSAssist? = nil) {
         self.engine = engine
         self.running = running
         self.interval = interval
         self.lastFix = lastFix
         self.clients = clients
+        self.assist = assist
     }
 
     public init(_ d: NSDictionary) {
@@ -962,6 +965,7 @@ public struct QMIDGNSS: Equatable {
         interval = d[QMIDKey.interval] as? Int
         lastFix = (d[QMIDKey.lastFix] as? Double).map(Date.init(timeIntervalSince1970:))
         clients = d[QMIDKey.clients] as? Int ?? 0
+        assist = (d[QMIDKey.assist] as? NSDictionary).map(QMIDGNSSAssist.init)
     }
 
     public var dictionary: NSDictionary {
@@ -969,6 +973,61 @@ public struct QMIDGNSS: Equatable {
                                 QMIDKey.clients: clients]
         d[QMIDKey.interval] = interval
         d[QMIDKey.lastFix] = lastFix?.timeIntervalSince1970
+        d[QMIDKey.assist] = assist?.dictionary
+        return d as NSDictionary
+    }
+}
+
+// A starting position qmid gave (or tried to give) the modem before a session: from a SUPL
+// server, for the serving cell. Never the position itself.
+public struct QMIDGNSSAssist: Equatable {
+    public enum Result: String { case injected, rejected, failed, skipped }
+
+    public var time: Date
+    public var result: Result
+    public var source: String                 // "supl"
+    public var server: String?                // "host:port"
+    public var cell: String?
+    public var uncertainty: Double?           // m, as injected
+    public var duration: Double?              // s the server took
+    public var error: String?                 // failed / rejected / skipped: why
+    public var firstFixAfter: Double?         // s from the session's start
+    public var firstFixDistance: Double?      // m between the injected position and the first fix
+
+    public init(time: Date, result: Result, source: String = "supl", server: String? = nil, cell: String? = nil,
+                uncertainty: Double? = nil, duration: Double? = nil, error: String? = nil) {
+        self.time = time
+        self.result = result
+        self.source = source
+        self.server = server
+        self.cell = cell
+        self.uncertainty = uncertainty
+        self.duration = duration
+        self.error = error
+    }
+
+    public init(_ d: NSDictionary) {
+        time = Date(timeIntervalSince1970: d[QMIDKey.time] as? Double ?? 0)
+        result = (d[QMIDKey.result] as? String).flatMap(Result.init) ?? .failed
+        source = d[QMIDKey.source] as? String ?? "supl"
+        server = d[QMIDKey.server] as? String
+        cell = d[QMIDKey.cell] as? String
+        uncertainty = d[QMIDKey.uncertainty] as? Double
+        duration = d[QMIDKey.duration] as? Double
+        error = d[QMIDKey.error] as? String
+        firstFixAfter = d[QMIDKey.firstFixAfter] as? Double
+        firstFixDistance = d[QMIDKey.firstFixDistance] as? Double
+    }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.time: time.timeIntervalSince1970, QMIDKey.result: result.rawValue, QMIDKey.source: source]
+        d[QMIDKey.server] = server
+        d[QMIDKey.cell] = cell
+        d[QMIDKey.uncertainty] = uncertainty
+        d[QMIDKey.duration] = duration
+        d[QMIDKey.error] = error
+        d[QMIDKey.firstFixAfter] = firstFixAfter
+        d[QMIDKey.firstFixDistance] = firstFixDistance
         return d as NSDictionary
     }
 }

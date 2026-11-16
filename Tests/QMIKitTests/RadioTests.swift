@@ -30,7 +30,7 @@ final class RadioTests: XCTestCase {
 
         var pcell = NAS.Cell(rat: .lte, role: .primary)
         pcell.channel = 1313; pcell.pci = 272; pcell.cellID = 0x01234504; pcell.tac = 0x1234
-        pcell.bandwidthMHz = 20; pcell.band = 3; pcell.rssi = -67; pcell.rsrq = -14; pcell.rsrp = -96; pcell.snr = 13
+        pcell.bandwidthMHz = 20; pcell.band = 3; pcell.rssi = -66.2; pcell.rsrq = -15.5; pcell.rsrp = -97.5; pcell.snr = 13
         XCTAssertEqual(info.cells[0], pcell)
 
         var nr = NAS.Cell(rat: .nr, role: .secondary)
@@ -44,6 +44,22 @@ final class RadioTests: XCTestCase {
 
         XCTAssertEqual(info.cells[3...].map { "\($0.channel!)/\($0.pci!)/\($0.role)" }, ["1313/239/neighbor", "325/239/neighbor"])
         XCTAssertEqual(info.cells[3].rsrp, -100.4)
+    }
+
+    // PCell missing from Cell Location Info's measured cells: RSRP, RSRQ, RSSI from Get Signal
+    // Info 0x14 (whole dB); an RSRP of Int16.min is no value.
+    func testLTEPCellSignalFallback() throws {
+        let loc = try response(NAS.getCellLocationInfo, [
+            (0x13, "00 00 f1 10 34 12 04 45 23 01 21 05 10 01 00 00 00 00 00"),
+        ])
+        let sig = try response(NAS.getSignalInfo, [(0x14, "bd f2 a0 ff 82 00")])
+        let c = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: sig, rfBand: nil, ca: nil).cells[0]
+        XCTAssertEqual([c.rssi, c.rsrq, c.rsrp, c.snr], [-67, -14, -96, 13])
+
+        let none = try response(NAS.getSignalInfo, [(0x14, "bd f2 00 80 00 80")])
+        let d = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: none, rfBand: nil, ca: nil).cells[0]
+        XCTAssertNil(d.rsrp)
+        XCTAssertNil(d.snr)
     }
 
     // COEX Get WWAN State on n41: SSB at NR-ARFCN 531870 (2659.35 MHz) inside the 60 MHz DL
