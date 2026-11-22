@@ -762,6 +762,15 @@ public enum NAS {
     public static let getSignalInfo: UInt16 = 0x004F
     public static let getRFBandInfo: UInt16 = 0x0031
     public static let getLTECPHYCAInfo: UInt16 = 0x00AC
+    // NR serving cells beyond libqmi, IDs from Qualcomm's NAS IDL, layouts checked on an RM551E
+    // against AT+QCAINFO (2026-11-22). Get ARFCN List 0x1C: the NR serving cells' NR-ARFCNs,
+    // read on each call. NR5G RRC BWP Info: every NR serving cell of the RRC configuration with
+    // PCI and bandwidth, configured SCells included; sent when registered (Register
+    // Indications TLV 0x5D) and on each reconfiguration. Neither says whether an SCell is
+    // activated: COEX does.
+    public static let getARFCNList: UInt16 = 0x00D2
+    public static let nrBWPInfoIndication: UInt16 = 0x013F
+    public static let nrBWPInfoEvents: TLV = .u8(0x5D, 1)
     // COEX (service 0x22) Get WWAN State: the carriers' centre frequencies and bandwidths, the
     // only source of the NR bandwidth (TLV 0x22; checked against AT+QCAINFO on an RM551E).
     public static let coexService = QMIService(rawValue: 0x22)
@@ -783,12 +792,72 @@ public enum NAS {
         public var snr: Double?             // dB
         public var active: Bool?            // secondary cell: activated (false: configured only)
         public var scellIndex: UInt8?       // LTE secondary cell: the RRC sCellIndex
+        public var pscell: Bool?            // NR: true on the NR leg of EN-DC (the PSCell)
         public var band: Int?               // 3GPP band number, when the modem names it
 
         public init(rat: RAT, role: Role) {
             self.rat = rat
             self.role = role
         }
+    }
+
+    // One NR serving cell of the NR5G RRC BWP Info indication.
+    public struct NRServingCell: Equatable {
+        public var pci: UInt16
+        public var ssbARFCN: UInt32         // the SSB's NR-ARFCN, as Get Cell Location Info and AT+QCAINFO give it
+        public var band: Int?
+        public var bandwidthMHz: Double?    // downlink, from its PRB count and subcarrier spacing
+        public var uplink: Bool
+        public init(pci: UInt16, ssbARFCN: UInt32, band: Int? = nil, bandwidthMHz: Double? = nil, uplink: Bool = false) {
+            self.pci = pci; self.ssbARFCN = ssbARFCN; self.band = band; self.bandwidthMHz = bandwidthMHz; self.uplink = uplink
+        }
+    }
+
+    // TLV 0x10: count, then per cell PCI (2), SSB NR-ARFCN (4), DL point A (4), DL band (2, QMI
+    // enum), DL carriers (count, then offset 2, SCS 4, PRBs 2), DL bandwidth parts (count, then
+    // ID 1, SCS 4, location and bandwidth 4), then the same for the uplink from point A on; an
+    // uplink band of 0xFFFF: no uplink. SCS: 0 15 kHz … 4 240 kHz.
+    public static func parseNRBWPInfo(_ m: QMIMessage) -> [NRServingCell] {
+        guard let v = m[tlv: 0x10] else { return [] }
+        var r = ByteReader(v)
+        var cells: [NRServingCell] = []
+        func carriers(_ r: inout ByteReader) throws -> [(scs: UInt32, prbs: UInt16)] {
+            try (0..<Int(r.u8())).map { _ in _ = try r.u16(); return (try r.u32(), try r.u16()) }
+        }
+        func skipBWPs(_ r: inout ByteReader) throws { _ = try r.take(Int(r.u8()) * 9) }
+        do {
+            for _ in 0..<Int(try r.u8()) {
+                let pci = try r.u16(), ssb = try r.u32()
+                _ = try r.u32()
+                let band = try r.u16()
+                let dl = try carriers(&r)
+                try skipBWPs(&r)
+                _ = try r.u32()
+                let ulBand = try r.u16()
+                let ul = try carriers(&r)
+                try skipBWPs(&r)
+                cells.append(NRServingCell(pci: pci, ssbARFCN: ssb, band: activeBand(band)?.band,
+                                           bandwidthMHz: dl.first.flatMap { nrBandwidth(scs: $0.scs, prbs: $0.prbs) },
+                                           uplink: ulBand != 0xFFFF && !ul.isEmpty))
+            }
+        } catch {
+            return cells
+        }
+        return cells
+    }
+
+    // NR channel bandwidth from the transmission bandwidth in PRBs (TS 38.101-1 table 5.3.2-1,
+    // 38.101-2 table 5.3.2-1); SCS as the QMI enum (0 15 kHz … 3 120 kHz).
+    static func nrBandwidth(scs: UInt32, prbs: UInt16) -> Double? {
+        let tables: [UInt32: [UInt16: Double]] = [
+            0: [25: 5, 52: 10, 79: 15, 106: 20, 133: 25, 160: 30, 188: 35, 216: 40, 242: 45, 270: 50],
+            1: [11: 5, 24: 10, 38: 15, 51: 20, 65: 25, 78: 30, 92: 35, 106: 40, 119: 45, 133: 50, 162: 60,
+                189: 70, 217: 80, 245: 90, 273: 100],
+            2: [11: 10, 18: 15, 24: 20, 31: 25, 38: 30, 44: 35, 51: 40, 58: 45, 65: 50, 79: 60, 93: 70, 107: 80,
+                121: 90, 135: 100, 66: 50, 132: 100, 264: 200],
+            3: [32: 50, 66: 100, 132: 200, 264: 400],
+        ]
+        return tables[scs]?[prbs]
     }
 
     public struct RadioInfo: Equatable {
@@ -798,7 +867,8 @@ public enum NAS {
     }
 
     public static func radioCells(sysInfo: QMIMessage?, cellLocation: QMIMessage?, signal: QMIMessage?,
-                                  rfBand: QMIMessage?, ca: QMIMessage?, coex: QMIMessage? = nil) -> RadioInfo {
+                                  rfBand: QMIMessage?, ca: QMIMessage?, coex: QMIMessage? = nil,
+                                  arfcnList: QMIMessage? = nil, nrServing: [NRServingCell] = []) -> RadioInfo {
         var info = RadioInfo()
         func s16(_ r: inout ByteReader) -> Int16? { (try? r.u16()).map { Int16(bitPattern: $0) } }
         func tenths(_ v: Int16?) -> Double? { v.map { Double($0) / 10 } }
@@ -962,23 +1032,69 @@ public enum NAS {
         nr.bandwidthMHz = nrBandwidth
         nr.band = nrBand
         // COEX Get WWAN State 0x22, NR carriers: count, then per entry centre frequency (kHz),
-        // bandwidth (Hz), direction (4 bytes: 1 UL, 2 DL), 4 bytes unknown. The DL carrier whose
-        // span holds the cell's NR-ARFCN (its SSB) is the cell's.
+        // bandwidth (Hz), direction (8 bytes: 1 UL, 2 DL). The DL carrier whose
+        // span holds the cell's NR-ARFCN (its SSB) is the cell's; the other DL carriers are NR
+        // SCells. The modem lists a carrier only while it is activated (an RM551E's configured
+        // n1 SCell came and went within seconds as traffic did).
+        var otherCarriers: [(centre: Double, width: Double)] = []      // kHz
         if let v = coex?[tlv: 0x22], let ssb = nr.channel.flatMap(nrFrequencyKHz) {
             var r = ByteReader(v)
             for _ in 0..<((try? r.u8()) ?? 0) {
                 guard let e = try? r.take(16) else { break }
                 var x = ByteReader(e)
                 let centre = Double(try! x.u32()), width = Double(try! x.u32()) / 1000, dir = try! x.u32()
-                if dir == 2, abs(ssb - centre) <= width / 2 { nr.bandwidthMHz = width / 1000; break }
+                guard dir == 2, width > 0, !otherCarriers.contains(where: { $0.centre == centre }) else { continue }
+                if abs(ssb - centre) <= width / 2 { nr.bandwidthMHz = width / 1000 } else { otherCarriers.append((centre, width)) }
+            }
+        }
+        // The NR cell's PCI, band and bandwidth from the RRC's serving cells when NAS left them out.
+        if let ch = nr.channel, let own = nrServing.first(where: { $0.ssbARFCN == ch }) {
+            nr.pci = nr.pci ?? own.pci
+            nr.band = nr.band ?? own.band
+            nr.bandwidthMHz = nr.bandwidthMHz ?? own.bandwidthMHz
+        }
+        // NR SCells: the serving NR-ARFCNs of Get ARFCN List 0x1C (count, then 4 bytes each) other
+        // than the NR cell's, with PCI, band and bandwidth from the RRC's serving cells; activated
+        // when a COEX carrier holds its SSB. COEX carriers left over (no ARFCN list) are activated
+        // SCells known by their centre only.
+        var nrSCells: [Cell] = []
+        if nrSeen, let own = nr.channel {
+            var configured: [UInt32] = []
+            if let v = arfcnList?[tlv: 0x1C] {
+                var r = ByteReader(v)
+                for _ in 0..<((try? r.u8()) ?? 0) { if let a = try? r.u32() { configured.append(a) } }
+            }
+            for ch in configured where ch != own {
+                var c = Cell(rat: .nr, role: .secondary)
+                c.channel = ch
+                if let s = nrServing.first(where: { $0.ssbARFCN == ch }) { c.pci = s.pci; c.band = s.band; c.bandwidthMHz = s.bandwidthMHz }
+                c.active = false
+                if let f = nrFrequencyKHz(ch), let i = otherCarriers.firstIndex(where: { abs(f - $0.centre) <= $0.width / 2 }) {
+                    c.active = true
+                    c.bandwidthMHz = c.bandwidthMHz ?? otherCarriers[i].width / 1000
+                    otherCarriers.remove(at: i)
+                }
+                nrSCells.append(c)
+            }
+            for o in otherCarriers {
+                var c = Cell(rat: .nr, role: .secondary)
+                c.channel = nrARFCN(kHz: o.centre)
+                c.bandwidthMHz = o.width / 1000
+                c.active = true
+                nrSCells.append(c)
             }
         }
         if let v = sysInfo?[tlv: 0x4A], v.first == 2 { nr.role = .primary }
         if let v = sysInfo?[tlv: 0x4E], let b = v.first { info.endcAvailable = b != 0 }
 
         if let lte { info.cells.append(lte) }
-        if nrSeen, nr.role == .primary { info.cells.insert(nr, at: 0) } else if nrSeen { secondaries.append(nr) }
-        info.cells += secondaries
+        if nrSeen, nr.role == .primary {
+            info.cells.insert(nr, at: 0)
+        } else if nrSeen {
+            nr.pscell = true
+            secondaries.append(nr)
+        }
+        info.cells += secondaries + nrSCells
         // Neighbours: the measured LTE cells that aren't serving.
         for (channel, var c) in measured {
             let serving = info.cells.contains { $0.rat == .lte && $0.channel == channel && $0.pci == c.pci }
@@ -995,6 +1111,16 @@ public enum NAS {
         case 0..<600_000: return Double(n) * 5
         case 600_000..<2_016_667: return 3_000_000 + Double(n - 600_000) * 15
         case 2_016_667...3_279_165: return 24_250_080 + Double(n - 2_016_667) * 60
+        default: return nil
+        }
+    }
+
+    // Frequency in kHz to the NR-ARFCN (TS 38.104 5.4.2.1), rounded to the nearest one.
+    static func nrARFCN(kHz f: Double) -> UInt32? {
+        switch f {
+        case 0..<3_000_000: return UInt32((f / 5).rounded())
+        case 3_000_000..<24_250_080: return 600_000 + UInt32(((f - 3_000_000) / 15).rounded())
+        case 24_250_080...: let n = 2_016_667 + ((f - 24_250_080) / 60).rounded(); return n <= 3_279_165 ? UInt32(n) : nil
         default: return nil
         }
     }

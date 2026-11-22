@@ -34,7 +34,7 @@ final class RadioTests: XCTestCase {
         XCTAssertEqual(info.cells[0], pcell)
 
         var nr = NAS.Cell(rat: .nr, role: .secondary)
-        nr.channel = 504990; nr.pci = 185; nr.rsrp = -90; nr.snr = 10.5; nr.rsrq = -11
+        nr.channel = 504990; nr.pci = 185; nr.rsrp = -90; nr.snr = 10.5; nr.rsrq = -11; nr.pscell = true
         XCTAssertEqual(info.cells[2], nr)
 
         var scell = NAS.Cell(rat: .lte, role: .secondary)
@@ -72,6 +72,94 @@ final class RadioTests: XCTestCase {
         let info = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: coex)
         XCTAssertEqual(info.cells.first?.channel, 531870)
         XCTAssertEqual(info.cells.first?.bandwidthMHz, 60)
+    }
+
+    // RM551E in EN-DC with NR carrier aggregation (AT+QCAINFO: SCC n41 531870 PCI 101, SCC n1
+    // 423500 bandwidth code 2): COEX lists the n41 DL and UL carriers and, while the n1 SCell is
+    // activated, a third, DL-only carrier centred on 2117.5 MHz, 15 MHz wide.
+    func testNRSCellFromCOEX() throws {
+        let loc = try response(NAS.getCellLocationInfo, [(0x2E, "9e 1d 08 00")])
+        let coex = try response(NAS.coexGetWWANState, [
+            (0x22, "03 aa 96 28 00 00 87 93 03 02 00 00 00 00 00 00 00 aa 96 28 00 00 87 93 03 01 00 00 00 00 00 00 00"
+                 + " 7c 4f 20 00 c0 e1 e4 00 02 00 00 00 00 00 00 00"),
+        ])
+        let info = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: coex)
+        XCTAssertEqual(info.cells.count, 2)
+
+        var pscell = NAS.Cell(rat: .nr, role: .secondary)
+        pscell.channel = 531870; pscell.bandwidthMHz = 60; pscell.pscell = true
+        XCTAssertEqual(info.cells[0], pscell)
+
+        var scell = NAS.Cell(rat: .nr, role: .secondary)
+        scell.channel = 423500; scell.bandwidthMHz = 15; scell.active = true
+        XCTAssertEqual(info.cells[1], scell)
+
+        // Without the PSCell's SSB the carriers can't be told apart: no SCells.
+        let none = NAS.radioCells(sysInfo: nil, cellLocation: nil, signal: nil, rfBand: nil, ca: nil, coex: coex)
+        XCTAssertEqual(none.cells, [])
+    }
+
+    // RM551E, n41 PSCell + n1 SCell (AT+QCAINFO: SCC 531870 n41 PCI 942; SCC 423500 n1 PCI 68,
+    // no uplink). NR5G RRC BWP Info as sent, Get ARFCN List 0x1C: both serving NR-ARFCNs.
+    static let bwpInfo = "02 ae 03 9e 1d 08 00 5a 07 08 00 03 01 01 00 00 01 00 00 00 a2 00 02 00 01 00 00 00 88 7b 00 00"
+        + " 01 01 00 00 00 88 7b 00 00 5a 07 08 00 03 01 01 00 00 01 00 00 00 a2 00 02 00 01 00 00 00 88 7b 00 00"
+        + " 01 01 00 00 00 88 7b 00 00 44 00 4c 76 06 00 be 70 06 00 fa 00 01 00 00 00 00 00 00 4f 00 02 00 00 00"
+        + " 00 00 ca 53 00 00 01 00 00 00 00 ca 53 00 00 00 00 00 00 ff ff 00 00"
+
+    func testNRBWPInfo() throws {
+        let m = QMIMessage(service: .nas, clientID: 1, kind: .indication, transactionID: 1,
+                           messageID: NAS.nrBWPInfoIndication, tlvs: [TLV(0x10, [UInt8](hex: Self.bwpInfo)!)])
+        XCTAssertEqual(NAS.parseNRBWPInfo(try QMIMessage.decode(m.encoded())), [
+            NAS.NRServingCell(pci: 942, ssbARFCN: 531870, band: 41, bandwidthMHz: 60, uplink: true),
+            NAS.NRServingCell(pci: 68, ssbARFCN: 423500, band: 1, bandwidthMHz: 15, uplink: false),
+        ])
+        // Cut short: the cells read before the cut.
+        let short = QMIMessage(service: .nas, clientID: 1, kind: .indication, transactionID: 1,
+                               messageID: NAS.nrBWPInfoIndication, tlvs: [TLV(0x10, Array([UInt8](hex: Self.bwpInfo)!.prefix(90)))])
+        XCTAssertEqual(NAS.parseNRBWPInfo(short).map(\.pci), [942])
+        XCTAssertEqual(NAS.nrBandwidth(scs: 1, prbs: 273), 100)
+        XCTAssertNil(NAS.nrBandwidth(scs: 0, prbs: 100))
+    }
+
+    // The n1 SCell configured (COEX: n41 only), then activated (COEX: n1's 15 MHz carrier too).
+    func testNRSCellConfiguredAndActive() throws {
+        let loc = try response(NAS.getCellLocationInfo, [(0x2E, "9e 1d 08 00")])
+        let arfcn = try response(NAS.getARFCNList, [(0x1B, "01 00 00 00"), (0x1C, "02 9e 1d 08 00 4c 76 06 00")])
+        let serving = NAS.parseNRBWPInfo(QMIMessage(service: .nas, clientID: 1, kind: .indication, transactionID: 1,
+                                                    messageID: NAS.nrBWPInfoIndication,
+                                                    tlvs: [TLV(0x10, [UInt8](hex: Self.bwpInfo)!)]))
+        let n41 = "aa 96 28 00 00 87 93 03 02 00 00 00 00 00 00 00 aa 96 28 00 00 87 93 03 01 00 00 00 00 00 00 00"
+        let idle = try response(NAS.coexGetWWANState, [(0x22, "02 " + n41)])
+        let busy = try response(NAS.coexGetWWANState, [(0x22, "03 " + n41 + " 7c 4f 20 00 c0 e1 e4 00 02 00 00 00 00 00 00 00")])
+
+        var pscell = NAS.Cell(rat: .nr, role: .secondary)
+        pscell.channel = 531870; pscell.pci = 942; pscell.band = 41; pscell.bandwidthMHz = 60; pscell.pscell = true
+        var scell = NAS.Cell(rat: .nr, role: .secondary)
+        scell.channel = 423500; scell.pci = 68; scell.band = 1; scell.bandwidthMHz = 15; scell.active = false
+
+        let a = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: idle,
+                               arfcnList: arfcn, nrServing: serving)
+        XCTAssertEqual(a.cells, [pscell, scell])
+
+        scell.active = true
+        let b = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: busy,
+                               arfcnList: arfcn, nrServing: serving)
+        XCTAssertEqual(b.cells, [pscell, scell])
+
+        // No RRC serving cells yet (indication not seen): the SCell by its NR-ARFCN alone.
+        let c = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: idle, arfcnList: arfcn)
+        XCTAssertEqual(c.cells.last?.channel, 423500)
+        XCTAssertEqual(c.cells.last?.active, false)
+        XCTAssertNil(c.cells.last?.pci)
+    }
+
+    func testNRARFCN() {
+        XCTAssertEqual(NAS.nrARFCN(kHz: 2_117_500), 423500)
+        XCTAssertEqual(NAS.nrARFCN(kHz: 3_600_000), 640000)
+        XCTAssertEqual(NAS.nrARFCN(kHz: 28_000_080), 2_079_167)
+        for n: UInt32 in [123400, 531870, 650000, 2_100_000] {
+            XCTAssertEqual(NAS.nrFrequencyKHz(n).flatMap { NAS.nrARFCN(kHz: $0) }, n)
+        }
     }
 
     // NR5G Cell Information (0x2F): PLMN 001-01, TAC 0x000102 (most significant byte first),

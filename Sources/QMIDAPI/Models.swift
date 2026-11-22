@@ -576,7 +576,7 @@ public enum QMIDLogLevel: Int, Comparable, CaseIterable {
 }
 
 // radio(): the cells the modem is using and sees. Serving cells first (primary, then
-// secondary: LTE carrier aggregation and the NR leg of EN-DC), then neighbours. A snapshot
+// secondary: LTE carrier aggregation, the NR leg of EN-DC, NR SCells), then neighbours. A snapshot
 // read when asked; values the modem didn't report are nil.
 public struct QMIDRadio: Equatable {
     public var cells: [QMIDCell]
@@ -624,6 +624,7 @@ public struct QMIDCell: Equatable {
     public var snr: Double?               // dB
     public var active: Bool?              // secondary cell: activated; false = configured only
     public var scellIndex: Int?           // LTE secondary cell: the RRC sCellIndex (1–7)
+    public var pscell: Bool?              // NR: true on the NR leg of EN-DC (the PSCell); nil on NR SCells
 
     public init(rat: RAT, role: Role) {
         self.rat = rat
@@ -647,6 +648,7 @@ public struct QMIDCell: Equatable {
         snr = d[QMIDKey.snr] as? Double
         active = d[QMIDKey.active] as? Bool
         scellIndex = d[QMIDKey.scellIndex] as? Int
+        pscell = d[QMIDKey.pscell] as? Bool
     }
 
     public var dictionary: NSDictionary {
@@ -663,6 +665,7 @@ public struct QMIDCell: Equatable {
         d[QMIDKey.snr] = snr
         d[QMIDKey.active] = active
         d[QMIDKey.scellIndex] = scellIndex
+        d[QMIDKey.pscell] = pscell
         return d as NSDictionary
     }
 

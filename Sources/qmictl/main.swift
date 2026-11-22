@@ -1206,12 +1206,13 @@ func printBands(_ b: QMIDBandPreference) {
     if !b.supportedNRBands.isEmpty { print("supported nr:   \(list(b.supportedNRBands, "n"))") }
 }
 
-// PCell, SCell n (LTE carrier aggregation), PSCell (the NR leg of EN-DC; the PCell on SA).
+// PCell, SCell n (LTE carrier aggregation), PSCell (the NR leg of EN-DC; the PCell on SA),
+// SCell (NR carrier aggregation).
 func cellRole(_ c: QMIDCell) -> String {
     switch (c.rat, c.role) {
     case (_, .primary): return "pcell"
     case (.lte, .secondary): return "scell\(c.scellIndex.map { " \($0)" } ?? "")"
-    case (.nr, .secondary): return "pscell"
+    case (.nr, .secondary): return c.pscell == true ? "pscell" : "scell"
     case (_, .neighbor): return "neighbour"
     }
 }
@@ -1236,7 +1237,7 @@ func printRadio(_ r: QMIDRadio) {
         }
         return parts.joined(separator: "  ")
     }
-    // Summary: "pcell B3 + scell B1 (configured) + pscell n41, 3 neighbours".
+    // Summary: "pcell B3 + scell B1 (configured) + pscell n41 + scell n1, 3 neighbours".
     func name(_ c: QMIDCell) -> String {
         "\(cellRole(c).split(separator: " ").first ?? "") \(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "?")"
             + (c.active.map { $0 ? "" : " (configured)" } ?? "")

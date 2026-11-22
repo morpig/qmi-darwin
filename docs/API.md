@@ -341,7 +341,7 @@ r.endcAvailable                          // the LTE cell offers EN-DC
 | Role | Cells |
 |---|---|
 | `primary` | the LTE PCell; the NR cell on 5G SA |
-| `secondary` | LTE carrier aggregation SCells (`active`: activated, `false`: configured only), and the NR leg of EN-DC |
+| `secondary` | carrier aggregation SCells, LTE and NR (`active`: activated, `false`: configured only), and the NR leg of EN-DC (`pscell`) |
 | `neighbor` | other LTE cells the modem measures, on the serving and the inter-frequency carriers |
 
 `QMIDCell` fields, each `nil` when the modem didn't report it:
@@ -358,16 +358,23 @@ r.endcAvailable                          // the LTE cell offers EN-DC
 | `bandwidth` | downlink bandwidth in MHz |
 | `rsrp`, `rssi` | dBm |
 | `rsrq`, `snr` | dB |
-| `active` | secondary LTE cell: activated (carrying data) or only configured |
+| `active` | secondary cell (LTE or NR SCell): activated (carrying data) or only configured |
 | `scellIndex` | secondary LTE cell: the RRC sCellIndex (1–7), the number the network and modem logs use for it |
+| `pscell` | `true` on the NR leg of EN-DC (the PSCell); `nil` on NR SCells and other cells. A secondary NR cell without it is an NR SCell |
 
 Steps: LTE `rsrp`, `rsrq` and `rssi` 0.1 dB for every LTE cell, the PCell included; NR `rsrp` and `rsrq` 1 dB; `snr` 0.1 dB.
 
 What the modem reports varies by firmware. On a Quectel RM551E in EN-DC, the LTE cells are
 complete and SCells turn `active` within seconds of traffic; the NR leg comes with its
-`channel`, `band`, `pci`, `bandwidth` and signal but without `cellID`, and only one NR carrier
-is reported. The NR `channel` is the SSB's NR-ARFCN, not the carrier centre; the NR
-`bandwidth` comes from the modem's coexistence service (QMI COEX), not NAS. The NR cell stays in the list while the modem is idle (its last measured
+`channel`, `band`, `pci`, `bandwidth` and signal but without `cellID`. The PSCell's `channel`
+is the SSB's NR-ARFCN, not the carrier centre; NR `bandwidth` comes from the modem's
+coexistence service (QMI COEX), not NAS. NR SCells come with `channel` (the SSB's
+NR-ARFCN), `pci`, `band`, `bandwidth` and `active`, but no signal: QMI reports none for
+them, and neither does `AT+QCAINFO`. An n1 SCell stayed configured throughout and was
+activated for 1–18 s at a time during traffic, 21 times in 15 minutes. qmid reads the
+configured NR cells from NAS (Get ARFCN List and the NR5G RRC BWP Info indication, beyond
+libqmi) and the activated ones from COEX. Get NR5G CA Sig Info (NAS 0x015C), which would
+give their RSRP, is answered NotSupported by the RM551E. The NR cell stays in the list while the modem is idle (its last measured
 cell), so its presence doesn't mean NR carries data. `radio(raw: true)` adds the modem's TLVs (`raw`) for diagnostics.
 
 Neighbours are LTE only: QMI has no NR neighbour list. On Quectel modems the AT port (which
@@ -916,6 +923,10 @@ Added in qmid 0.16 (API still 1): `setBandPreference`, `resetBandPreference`,
 
 Added in qmid 0.17 (API still 1): `setModePreference`, `resetModePreference`,
 `QMIDBandPreference.supportedModes`, `QMIDPDN.rat`.
+
+Added in qmid 0.25 (API still 1): `QMIDCell.pscell`, and NR SCells (configured or
+activated) in `radio()`. An older qmid reports at most one secondary NR cell, the PSCell,
+without `pscell`.
 
 ## Testing from the command line
 

@@ -224,6 +224,7 @@ public enum QMIDKey {
     public static let snr = "snr"                     // dB
     public static let active = "active"               // Bool: secondary cell activated
     public static let scellIndex = "scellIndex"       // LTE secondary cell: RRC sCellIndex
+    public static let pscell = "pscell"               // Bool: NR leg of EN-DC
 
     // band preference dictionary (bandPreference())
     public static let modes = "modes"                 // [String]: "lte", "nr", "umts", "gsm", …

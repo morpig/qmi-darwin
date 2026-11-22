@@ -159,6 +159,7 @@ public final class Manager {
     private var profileCheck: DispatchSourceTimer?
     private var linkAnchor: (v4: Bool, v6: Bool) = (false, false)
     private var nas: QMIClient?              // Serving System indications (registration gate)
+    private var nrServingCells: [NAS.NRServingCell] = []   // the last NR5G RRC BWP Info indication
     private var uimWatch: QMIClient?         // UIM card status indications
     private var dmsWatch: QMIClient?         // DMS operating mode indications
     private var gnss: GNSSAssist?            // XTRA on the open modem; its calls run on gnssQueue
@@ -492,6 +493,7 @@ public final class Manager {
         wda = nil
         control = nil
         nas = nil
+        nrServingCells = []
         uimWatch = nil
         dmsWatch = nil
         gnss = nil
@@ -894,6 +896,10 @@ public final class Manager {
             if let n = NAS.parseNITZName(m), plmn != nil { setNITZName(n) } else { readPLMNName() }
             return
         }
+        if m.service == .nas, m.messageID == NAS.nrBWPInfoIndication {
+            nrServingCells = NAS.parseNRBWPInfo(m)
+            return
+        }
         if m.service == .nas, m.messageID == NAS.sysInfoIndication {
             if plmn != nil { setLTEEmergency(NAS.parseLTEEmergency(m), replace: false) }
             return
@@ -979,7 +985,7 @@ public final class Manager {
             let n = try dev.allocateClient(.nas)
             nas = n
             try n.request(NAS.registerIndications, [NAS.servingSystemEvents])
-            for t in [NAS.networkTimeEvents, NAS.operatorNameEvents, NAS.sysInfoEvents] {
+            for t in [NAS.networkTimeEvents, NAS.operatorNameEvents, NAS.sysInfoEvents, NAS.nrBWPInfoEvents] {
                 _ = try? n.request(NAS.registerIndications, [t])
             }
             if let s = try? NAS.parseServingSystem(try n.request(NAS.getServingSystem)) { servingChanged(s, initial: true) }
@@ -2021,7 +2027,7 @@ public final class Manager {
                 return nil
             }
         }
-        // COEX for the NR bandwidth; a client per call, as radio() is polled rarely.
+        // COEX for the NR bandwidth and the activated NR SCells; a client per call.
         var coexReply: QMIMessage?
         if let dev = device, let coex = try? dev.allocateClient(NAS.coexService) {
             do {
@@ -2035,7 +2041,8 @@ public final class Manager {
         }
         let info = NAS.radioCells(sysInfo: read(NAS.getSysInfo), cellLocation: read(NAS.getCellLocationInfo),
                                   signal: read(NAS.getSignalInfo), rfBand: read(NAS.getRFBandInfo),
-                                  ca: read(NAS.getLTECPHYCAInfo), coex: coexReply)
+                                  ca: read(NAS.getLTECPHYCAInfo), coex: coexReply,
+                                  arfcnList: read(NAS.getARFCNList), nrServing: nrServingCells)
         let radio = QMIDRadio(cells: info.cells.map(Self.cellInfo), endcAvailable: info.endcAvailable,
                               raw: raw ? lines : nil)
         return (radio.dictionary, nil)
@@ -2674,6 +2681,7 @@ public final class Manager {
         q.snr = c.snr
         q.active = c.active
         q.scellIndex = c.scellIndex.map(Int.init)
+        q.pscell = c.pscell
         return q
     }
 
