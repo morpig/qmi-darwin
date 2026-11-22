@@ -160,6 +160,11 @@ public final class Manager {
     private var linkAnchor: (v4: Bool, v6: Bool) = (false, false)
     private var nas: QMIClient?              // Serving System indications (registration gate)
     private var nrServingCells: [NAS.NRServingCell] = []   // the last NR5G RRC BWP Info indication
+    private var coexWatch: QMIClient?        // COEX WWAN State indications (radio events)
+    private var coexState: QMIMessage?       // the last WWAN State (indication or reply)
+    private var radioPending = false         // a radio event is due (debounce)
+    private var lastRadioKey: NSDictionary?  // what the last radio event is compared on
+    private var lastRadioEvent: NSDictionary?
     private var uimWatch: QMIClient?         // UIM card status indications
     private var dmsWatch: QMIClient?         // DMS operating mode indications
     private var gnss: GNSSAssist?            // XTRA on the open modem; its calls run on gnssQueue
@@ -494,6 +499,11 @@ public final class Manager {
         control = nil
         nas = nil
         nrServingCells = []
+        coexWatch = nil
+        coexState = nil
+        if lastRadioEvent != nil { onEvent?([QMIDKey.type: QMIDEventType.radio] as NSDictionary) }
+        lastRadioEvent = nil
+        lastRadioKey = nil
         uimWatch = nil
         dmsWatch = nil
         gnss = nil
@@ -898,9 +908,20 @@ public final class Manager {
         }
         if m.service == .nas, m.messageID == NAS.nrBWPInfoIndication {
             nrServingCells = NAS.parseNRBWPInfo(m)
+            scheduleRadioEvent()
+            return
+        }
+        if m.service == NAS.coexService, m.messageID == NAS.coexWWANStateIndication, let c = coexWatch, m.clientID == c.id {
+            coexState = m
+            scheduleRadioEvent()
+            return
+        }
+        if m.service == .nas, [NAS.lteCAIndication, NAS.lteCAAggregatedIndication, NAS.arfcnListIndication].contains(m.messageID) {
+            scheduleRadioEvent()
             return
         }
         if m.service == .nas, m.messageID == NAS.sysInfoIndication {
+            scheduleRadioEvent()
             if plmn != nil { setLTEEmergency(NAS.parseLTEEmergency(m), replace: false) }
             return
         }
@@ -985,7 +1006,7 @@ public final class Manager {
             let n = try dev.allocateClient(.nas)
             nas = n
             try n.request(NAS.registerIndications, [NAS.servingSystemEvents])
-            for t in [NAS.networkTimeEvents, NAS.operatorNameEvents, NAS.sysInfoEvents, NAS.nrBWPInfoEvents] {
+            for t in [NAS.networkTimeEvents, NAS.operatorNameEvents, NAS.sysInfoEvents, NAS.nrBWPInfoEvents] + NAS.radioChangeEvents {
                 _ = try? n.request(NAS.registerIndications, [t])
             }
             if let s = try? NAS.parseServingSystem(try n.request(NAS.getServingSystem)) { servingChanged(s, initial: true) }
@@ -993,6 +1014,18 @@ public final class Manager {
             log("NAS serving-system events unavailable (\(error)); dialing without a registration gate")
             psAttached = nil
         }
+        // COEX WWAN State indications: the carriers in use, NR SCell activation included.
+        // Without them radio() asks COEX on each call.
+        if let c = try? dev.allocateClient(NAS.coexService) {
+            if (try? c.request(NAS.coexIndicationRegister, [NAS.coexWWANStateEvents], timeout: 2)) != nil {
+                coexWatch = c
+                coexState = try? c.request(NAS.coexGetWWANState, timeout: 2)
+            } else {
+                log("COEX WWAN state events unavailable; radio events without NR SCell activation")
+                c.release()
+            }
+        }
+        scheduleRadioEvent()
         watchEvents(dev, "DMS operating mode", fallback: "airplane mode seen only when set through qmid",
                     { try Self.registered(dev, .dms, DMS.setEventReport, [DMS.operatingModeEvents]) },
                     { [weak self] in self?.dmsWatch = $0 })
@@ -2027,12 +2060,18 @@ public final class Manager {
                 return nil
             }
         }
-        // COEX for the NR bandwidth and the activated NR SCells; a client per call.
-        var coexReply: QMIMessage?
-        if let dev = device, let coex = try? dev.allocateClient(NAS.coexService) {
+        // COEX for the NR bandwidth and the activated NR SCells: the last WWAN State indication,
+        // else asked now on a client of its own.
+        func coexLines(_ r: QMIMessage, _ label: String) {
+            if raw { lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "coex %@ 0x%02x: ", label, $0.type) + $0.value.hex } }
+        }
+        var coexReply = coexState
+        if let r = coexReply {
+            coexLines(r, r.messageID == NAS.coexWWANStateIndication ? "0x0021" : "0x0022")
+        } else if let dev = device, let coex = try? dev.allocateClient(NAS.coexService) {
             do {
                 let r = try coex.request(NAS.coexGetWWANState, timeout: 2)
-                if raw { lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "coex 0x0022 0x%02x: ", $0.type) + $0.value.hex } }
+                coexLines(r, "0x0022")
                 coexReply = r
             } catch {
                 if raw { lines.append("coex 0x0022: \(error)") }
@@ -2044,6 +2083,7 @@ public final class Manager {
                                   ca: read(NAS.getLTECPHYCAInfo), coex: coexReply,
                                   arfcnList: read(NAS.getARFCNList), nrServing: nrServingCells)
         let radio = QMIDRadio(cells: info.cells.map(Self.cellInfo), endcAvailable: info.endcAvailable,
+                              lteRRC: info.lteRRC.flatMap(Self.lteRRC), nrRRC: info.nrRRC.flatMap(Self.nrRRC),
                               raw: raw ? lines : nil)
         return (radio.dictionary, nil)
     }
@@ -2666,6 +2706,54 @@ public final class Manager {
         return writeModes(n, supported, persistent: persistent)
     }
 
+    // Get ARFCN List RRC states (NAS IDL enums) as QMIDRRCState.
+    static func lteRRC(_ v: UInt32) -> QMIDRRCState? {
+        switch v {
+        case 1, 2, 7: return .idle
+        case 3: return .connecting
+        case 4: return .connected
+        case 5: return .releasing
+        case 6: return .inactive
+        case 8: return .suspended
+        default: return nil
+        }
+    }
+
+    static func nrRRC(_ v: UInt32) -> QMIDRRCState? {
+        [0: .idle, 1: .connected, 2: .inactive][v]
+    }
+
+    // MARK: - Radio events
+
+    // A radio indication came: read the radio once things settle (indications come in bursts).
+    private func scheduleRadioEvent() {
+        guard !radioPending else { return }
+        radioPending = true
+        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.radioPending = false
+            guard self.nas != nil, let d = self.radio(raw: false).0 else { return }
+            let key = Self.radioKey(d)
+            guard key != self.lastRadioKey else { return }
+            self.lastRadioKey = key
+            let ev = [QMIDKey.type: QMIDEventType.radio, QMIDKey.radio: d] as NSDictionary
+            self.lastRadioEvent = ev
+            self.onEvent?(ev)
+        }
+    }
+
+    // What a radio event is pushed for: the serving cells without their signal, EN-DC and the
+    // RRC states. Signal and neighbours change all the time.
+    static func radioKey(_ d: NSDictionary) -> NSDictionary {
+        let signal: Set<String> = [QMIDKey.rsrp, QMIDKey.rsrq, QMIDKey.rssi, QMIDKey.snr]
+        let serving = (d[QMIDKey.cells] as? [NSDictionary] ?? [])
+            .filter { $0[QMIDKey.role] as? String != QMIDCell.Role.neighbor.rawValue }
+            .map { c in (c as? [String: Any] ?? [:]).filter { !signal.contains($0.key) } as NSDictionary }
+        var k: [String: Any] = [QMIDKey.cells: serving]
+        for key in [QMIDKey.endcAvailable, QMIDKey.lteRRC, QMIDKey.nrRRC] { k[key] = d[key] }
+        return k as NSDictionary
+    }
+
     static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
         var q = QMIDCell(rat: c.rat == .lte ? .lte : .nr,
                          role: c.role == .primary ? .primary : c.role == .secondary ? .secondary : .neighbor)
@@ -3066,7 +3154,8 @@ public final class Manager {
 
     // Current state as events, for a new subscriber.
     public func snapshotEvents() -> [NSDictionary] {
-        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + [sharingEvent()].compactMap { $0 } + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
+        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + [sharingEvent(), lastRadioEvent].compactMap { $0 }
+            + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
     }
 
     private func publishModem() {

@@ -79,11 +79,13 @@ qmid.onBearers = { pdn, bearers in       // [QMIDBearer], see "Dedicated bearers
 }
 qmid.onGNSS = { gnss in                  // QMIDGNSS, see "Location"; never a position
 }
+qmid.onRadio = { radio in                // QMIDRadio?, see "Cells and signal"; nil: modem not ready
+}
 qmid.subscribe()                         // current state arrives immediately as events
 ```
 
 - Call `subscribe()` once. The client reconnects and resubscribes by itself if qmid restarts,
-  and a fresh snapshot (one `.modem`, one `onSIM`, `onPLMN` and `onGNSS` call, one `.pdn` per PDN, and one `onBearers` call per connected PDN)
+  and a fresh snapshot (one `.modem`, one `onSIM`, `onPLMN`, `onGNSS` and `onRadio` call, one `.pdn` per PDN, and one `onBearers` call per connected PDN)
   arrives each time.
 - Treat events as **full state, not deltas**: each `.pdn` event carries the whole PDN.
 - `status()` returns the same data on demand (plus datapath counters and the modem's `imei`) if you need a pull.
@@ -326,7 +328,10 @@ qmid sets up the IMS profile (P-CSCF request, IM CN flag, APN type ims) itself.
 ## Cells and signal (`QMIDRadio`)
 
 `radio()` reads the cells the modem is using and sees, at the moment of the call (a few NAS
-queries, well under a second). It is read only and has no event: poll it while you show it,
+queries, well under a second). `onRadio` pushes the same, after `subscribe()` and whenever
+the serving cells change: a cell added or gone, its role, channel, PCI, band or bandwidth,
+an SCell activated or released, EN-DC, or the RRC state. Signal and neighbours ride along as
+read at that moment but don't cause a call; poll `radio()` for them while you show them,
 every few seconds at most.
 
 ```swift
@@ -336,7 +341,20 @@ for c in r.serving {                     // primary first, then secondary cells
 }
 r.neighbors                              // measured cells that aren't serving
 r.endcAvailable                          // the LTE cell offers EN-DC
+r.lteRRC, r.nrRRC                        // .connected while data can flow; nrRRC nil without NR
+
+qmid.onRadio = { r in                    // QMIDRadio?: nil while the modem isn't ready
+}
 ```
+
+qmid learns of changes from the modem's indications rather than by polling: NR5G RRC BWP
+Info and COEX WWAN State (NR cells configured, NR SCells activated; an RM551E sends one per
+change), Sys Info, and the LTE CA and ARFCN list indications. A burst of them gives one
+event, about 0.3 s after the first.
+
+`lteRRC` / `nrRRC` (`QMIDRRCState`): `idle` (camped, no connection), `connecting`,
+`connected`, `releasing`, `inactive` (context kept, no connection), `suspended`. An NR cell
+can stay listed while `nrRRC` isn't `connected`: it is the last one used.
 
 | Role | Cells |
 |---|---|
@@ -375,7 +393,7 @@ activated for 1–18 s at a time during traffic, 21 times in 15 minutes. qmid re
 configured NR cells from NAS (Get ARFCN List and the NR5G RRC BWP Info indication, beyond
 libqmi) and the activated ones from COEX. Get NR5G CA Sig Info (NAS 0x015C), which would
 give their RSRP, is answered NotSupported by the RM551E. The NR cell stays in the list while the modem is idle (its last measured
-cell), so its presence doesn't mean NR carries data. `radio(raw: true)` adds the modem's TLVs (`raw`) for diagnostics.
+cell), so its presence doesn't mean NR carries data: `nrRRC` says that. `radio(raw: true)` adds the modem's TLVs (`raw`) for diagnostics.
 
 Neighbours are LTE only: QMI has no NR neighbour list. On Quectel modems the AT port (which
 qmid leaves free) has one: with `AT+QNWCFG="nr5g_meas_info",1` set, reading
@@ -927,6 +945,9 @@ Added in qmid 0.17 (API still 1): `setModePreference`, `resetModePreference`,
 Added in qmid 0.25 (API still 1): `QMIDCell.pscell`, and NR SCells (configured or
 activated) in `radio()`. An older qmid reports at most one secondary NR cell, the PSCell,
 without `pscell`.
+
+Added in qmid 0.26 (API still 1): `onRadio` (event type `radio`), `QMIDRadio.lteRRC` /
+`nrRRC` (`QMIDRRCState`). An older qmid sends no radio events: poll `radio()`.
 
 ## Testing from the command line
 

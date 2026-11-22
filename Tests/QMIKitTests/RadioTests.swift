@@ -124,7 +124,8 @@ final class RadioTests: XCTestCase {
     // The n1 SCell configured (COEX: n41 only), then activated (COEX: n1's 15 MHz carrier too).
     func testNRSCellConfiguredAndActive() throws {
         let loc = try response(NAS.getCellLocationInfo, [(0x2E, "9e 1d 08 00")])
-        let arfcn = try response(NAS.getARFCNList, [(0x1B, "01 00 00 00"), (0x1C, "02 9e 1d 08 00 4c 76 06 00")])
+        let arfcn = try response(NAS.getARFCNList, [(0x19, "04 00 00 00"), (0x1B, "01 00 00 00"),
+                                                    (0x1C, "02 9e 1d 08 00 4c 76 06 00")])
         let serving = NAS.parseNRBWPInfo(QMIMessage(service: .nas, clientID: 1, kind: .indication, transactionID: 1,
                                                     messageID: NAS.nrBWPInfoIndication,
                                                     tlvs: [TLV(0x10, [UInt8](hex: Self.bwpInfo)!)]))
@@ -140,6 +141,8 @@ final class RadioTests: XCTestCase {
         let a = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: idle,
                                arfcnList: arfcn, nrServing: serving)
         XCTAssertEqual(a.cells, [pscell, scell])
+        XCTAssertEqual(a.lteRRC, 4)
+        XCTAssertEqual(a.nrRRC, 1)
 
         scell.active = true
         let b = NAS.radioCells(sysInfo: nil, cellLocation: loc, signal: nil, rfBand: nil, ca: nil, coex: busy,

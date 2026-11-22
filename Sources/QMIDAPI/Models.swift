@@ -581,29 +581,44 @@ public enum QMIDLogLevel: Int, Comparable, CaseIterable {
 public struct QMIDRadio: Equatable {
     public var cells: [QMIDCell]
     public var endcAvailable: Bool?       // the LTE cell offers EN-DC (NR as a secondary leg)
+    public var lteRRC: QMIDRRCState?      // the LTE RRC connection: connected while data can flow
+    public var nrRRC: QMIDRRCState?       // the NR RRC connection; nil without NR
     public var raw: [String]?             // radio(raw: true): the modem's TLVs, "0x0043 0x13: 00 15 …"
 
     public var serving: [QMIDCell] { cells.filter { $0.role != .neighbor } }
     public var neighbors: [QMIDCell] { cells.filter { $0.role == .neighbor } }
 
-    public init(cells: [QMIDCell] = [], endcAvailable: Bool? = nil, raw: [String]? = nil) {
+    public init(cells: [QMIDCell] = [], endcAvailable: Bool? = nil, lteRRC: QMIDRRCState? = nil,
+                nrRRC: QMIDRRCState? = nil, raw: [String]? = nil) {
         self.cells = cells
         self.endcAvailable = endcAvailable
+        self.lteRRC = lteRRC
+        self.nrRRC = nrRRC
         self.raw = raw
     }
 
     public init(_ d: NSDictionary) {
         cells = (d[QMIDKey.cells] as? [NSDictionary] ?? []).compactMap(QMIDCell.init)
         endcAvailable = d[QMIDKey.endcAvailable] as? Bool
+        lteRRC = (d[QMIDKey.lteRRC] as? String).flatMap(QMIDRRCState.init)
+        nrRRC = (d[QMIDKey.nrRRC] as? String).flatMap(QMIDRRCState.init)
         raw = d[QMIDKey.raw] as? [String]
     }
 
     public var dictionary: NSDictionary {
         var d: [String: Any] = [QMIDKey.cells: cells.map(\.dictionary)]
         d[QMIDKey.endcAvailable] = endcAvailable
+        d[QMIDKey.lteRRC] = lteRRC?.rawValue
+        d[QMIDKey.nrRRC] = nrRRC?.rawValue
         d[QMIDKey.raw] = raw
         return d as NSDictionary
     }
+}
+
+// An RRC connection's state (radio(), lteRRC / nrRRC). Only connected carries data; idle is
+// camped (or not camped) with no connection; inactive keeps the context without one.
+public enum QMIDRRCState: String {
+    case idle, connecting, connected, releasing, inactive, suspended
 }
 
 public struct QMIDCell: Equatable {

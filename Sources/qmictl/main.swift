@@ -25,6 +25,7 @@ usage (through qmid):
                                             switch; held until Ctrl-C (or SECONDS), which ends it
   qmictl cancel-sim ICCID                   end a prepare-sim: attach profile back to the current SIM
   qmictl radio [-v]                         serving cells (LTE CA, NR), neighbours, signal; -v: raw TLVs
+  qmictl radio watch [-v]                   radio events as they come (cells, activation, RRC); -v: neighbours
   qmictl airplane on|off                    modem radio off / on (PDNs wait while off)
   qmictl restart-modem                      reset the modem; qmid reopens it and redials
   qmictl bands                              allowed technologies and LTE / NR bands
@@ -972,6 +973,8 @@ func daemonCommand(_ args: [String]) -> Bool {
         }
     case "prepare-sim" where args.count >= 2:
         prepareSIM(Array(args.dropFirst()))
+    case "radio" where args.count >= 2 && args[1] == "watch":
+        radioWatch(verbose: args.contains("-v"))
     case "radio" where args.count <= 2:
         withDaemon { d, done in
             d.radio(args.last == "-v") { dict, err in
@@ -1170,6 +1173,21 @@ func gnssWatch(_ args: [String]) -> Never {
     withExtendedLifetime(client) { dispatchMain() }
 }
 
+// Radio events: one block per change (serving cells, activation, EN-DC, RRC); -v: neighbours too.
+func radioWatch(verbose: Bool) -> Never {
+    let fmt = DateFormatter()
+    fmt.dateFormat = "HH:mm:ss"
+    let client = QMIDClient(queue: .main)
+    client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
+    client.onRadio = { r in
+        print("--- \(fmt.string(from: Date()))")
+        guard let r else { return print("radio: modem not ready") }
+        printRadio(r, neighbours: verbose)
+    }
+    client.subscribe()
+    withExtendedLifetime(client) { dispatchMain() }
+}
+
 func printXTRA(_ x: QMIDXTRA) {
     guard x.supported else { return print("xtra: not supported by this modem") }
     if let from = x.validFrom, let hours = x.validHours, let expires = x.expires {
@@ -1217,7 +1235,7 @@ func cellRole(_ c: QMIDCell) -> String {
     }
 }
 
-func printRadio(_ r: QMIDRadio) {
+func printRadio(_ r: QMIDRadio, neighbours: Bool = true) {
     func f(_ v: Double?, _ unit: String = "") -> String? { v.map { String(format: $0 == $0.rounded() ? "%.0f" : "%.1f", $0) + unit } }
     func line(_ c: QMIDCell) -> String {
         var parts: [String] = [c.rat.rawValue.padding(toLength: 4, withPad: " ", startingAt: 0)
@@ -1244,9 +1262,11 @@ func printRadio(_ r: QMIDRadio) {
     }
     print("cells: " + (r.serving.isEmpty ? "none" : r.serving.map(name).joined(separator: " + "))
           + ", \(r.neighbors.count) neighbours"
-          + (r.endcAvailable == true && !r.serving.contains { $0.rat == .nr } ? ", en-dc available" : ""))
+          + (r.endcAvailable == true && !r.serving.contains { $0.rat == .nr } ? ", en-dc available" : "")
+          + (r.lteRRC == nil && r.nrRRC == nil ? ""
+             : "; rrc " + [r.lteRRC.map { "lte \($0.rawValue)" }, r.nrRRC.map { "nr \($0.rawValue)" }].compactMap { $0 }.joined(separator: ", ")))
     r.serving.forEach { print(line($0)) }
-    if !r.neighbors.isEmpty {
+    if neighbours, !r.neighbors.isEmpty {
         print("neighbours:")
         r.neighbors.forEach { print("  " + line($0)) }
     }

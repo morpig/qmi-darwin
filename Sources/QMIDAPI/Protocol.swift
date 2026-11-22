@@ -225,6 +225,9 @@ public enum QMIDKey {
     public static let active = "active"               // Bool: secondary cell activated
     public static let scellIndex = "scellIndex"       // LTE secondary cell: RRC sCellIndex
     public static let pscell = "pscell"               // Bool: NR leg of EN-DC
+    public static let lteRRC = "lteRRC"               // QMIDRRCState raw value
+    public static let nrRRC = "nrRRC"                 // QMIDRRCState raw value
+    public static let radio = "radio"                 // radio dictionary ("radio" events)
 
     // band preference dictionary (bandPreference())
     public static let modes = "modes"                 // [String]: "lte", "nr", "umts", "gsm", …
@@ -313,6 +316,7 @@ public enum QMIDEventType {
     public static let bearers = "bearers"             // keys QMIDKey.pdn (name) and QMIDKey.bearers
     public static let gnss = "gnss"                   // key QMIDKey.gnss; to every subscriber
     public static let sharing = "sharing"             // key QMIDKey.sharing; absent when config "sharing" is unset
+    public static let radio = "radio"                 // key QMIDKey.radio; absent while the modem isn't ready
     // Only to connections that called startLocation:
     public static let location = "location"           // key QMIDKey.location
     public static let satellites = "satellites"       // keys QMIDKey.satellites, QMIDKey.time

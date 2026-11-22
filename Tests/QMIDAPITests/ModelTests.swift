@@ -279,7 +279,7 @@ final class ModelTests: XCTestCase {
         scell.channel = 325; scell.active = true; scell.scellIndex = 1
         var nrSCell = QMIDCell(rat: .nr, role: .secondary)
         nrSCell.channel = 423500; nrSCell.bandwidth = 15; nrSCell.active = true
-        let r = QMIDRadio(cells: [c, scell, nr, nrSCell], endcAvailable: true)
+        let r = QMIDRadio(cells: [c, scell, nr, nrSCell], endcAvailable: true, lteRRC: .connected, nrRRC: .inactive)
         XCTAssertEqual(QMIDRadio(r.dictionary), r)
         XCTAssertEqual(r.serving.count, 4)
         XCTAssertEqual(QMIDCell.band(.nr, channel: 423500), 1)

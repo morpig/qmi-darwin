@@ -19,7 +19,8 @@ of routes, DNS and Wi-Fi/cellular failover, the same way it does for any other i
 - Exposes QoS: the QCI and APN-AMBR of each PDN, plus the dedicated bearers with their
   packet filters.
 - Reports the radio: PCell, LTE SCells (active or configured), the NR PSCell with its
-  bandwidth, NR SCells (active or configured), LTE neighbours and signal (`qmictl radio`).
+  bandwidth, NR SCells (active or configured), RRC state, LTE neighbours and signal
+  (`qmictl radio`), and pushes changes as they happen (`qmictl radio watch`).
 - SIM and modem details: card and PIN state, ICCID, IMSI, MSISDN, IMEI and roaming.
 - Modem control: airplane mode, modem restart, and the allowed technologies (e.g. LTE only)
   and LTE / NR bands (read, restrict, reset).

@@ -771,10 +771,23 @@ public enum NAS {
     public static let getARFCNList: UInt16 = 0x00D2
     public static let nrBWPInfoIndication: UInt16 = 0x013F
     public static let nrBWPInfoEvents: TLV = .u8(0x5D, 1)
+    // Indications that only say the radio changed (qmid reads it again): LTE CPHY CA (an SCell
+    // added, activated or removed), LTE CA aggregated bandwidth, ARFCN list. Register
+    // Indications TLVs 0x28, 0x54, 0x3B; IDs from the NAS IDL.
+    public static let lteCAIndication: UInt16 = 0x0082
+    public static let lteCAAggregatedIndication: UInt16 = 0x0132
+    public static let arfcnListIndication: UInt16 = 0x00D3
+    public static let radioChangeEvents: [TLV] = [.u8(0x28, 1), .u8(0x54, 1), .u8(0x3B, 1)]
     // COEX (service 0x22) Get WWAN State: the carriers' centre frequencies and bandwidths, the
     // only source of the NR bandwidth (TLV 0x22; checked against AT+QCAINFO on an RM551E).
     public static let coexService = QMIService(rawValue: 0x22)
     public static let coexGetWWANState: UInt16 = 0x0022
+    // COEX Indication Register (TLV 0x10: WWAN state) turns on WWAN State indications, the same
+    // TLVs as Get WWAN State for the LTE (0x13) and NR (0x22) carriers. The RM551E sends one when
+    // registered and then one per change of its carriers (each NR SCell activation and release).
+    public static let coexIndicationRegister: UInt16 = 0x0020
+    public static let coexWWANStateIndication: UInt16 = 0x0021
+    public static let coexWWANStateEvents: TLV = .u8(0x10, 1)
 
     public struct Cell: Equatable {
         public enum RAT: Equatable { case lte, nr }
@@ -863,6 +876,8 @@ public enum NAS {
     public struct RadioInfo: Equatable {
         public var cells: [Cell] = []
         public var endcAvailable: Bool?     // the LTE cell offers EN-DC (NR as a secondary leg)
+        public var lteRRC: UInt32?          // Get ARFCN List 0x19: 1/2 idle, 3 connecting, 4 connected, 5 releasing, 6 inactive, 7 not camped, 8 suspended
+        public var nrRRC: UInt32?           // Get ARFCN List 0x1B: 0 idle, 1 connected, 2 inactive; absent without NR
         public init() {}
     }
 
@@ -1086,6 +1101,9 @@ public enum NAS {
         }
         if let v = sysInfo?[tlv: 0x4A], v.first == 2 { nr.role = .primary }
         if let v = sysInfo?[tlv: 0x4E], let b = v.first { info.endcAvailable = b != 0 }
+        for (t, set) in [(UInt8(0x19), { (x: UInt32) in info.lteRRC = x }), (0x1B, { info.nrRRC = $0 })] {
+            if let v = arfcnList?[tlv: t], v.count == 4 { var r = ByteReader(v); if let x = try? r.u32() { set(x) } }
+        }
 
         if let lte { info.cells.append(lte) }
         if nrSeen, nr.role == .primary {

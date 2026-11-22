@@ -7,6 +7,7 @@ import Foundation
 //   qmid.onSIM = { sim in ... }              // SIM and default bearer APN
 //   qmid.onPLMN = { plmn in ... }            // registered network and operator names
 //   qmid.onBearers = { pdn, bearers in ... } // dedicated bearers (QCI, rates, TFT) of a PDN
+//   qmid.onRadio = { radio in ... }          // serving cells, carrier aggregation, RRC state
 //   qmid.subscribe()                         // events now and after qmid restarts
 //   qmid.status { result in ... }
 //   qmid.onLog = { entry in ... }
@@ -42,6 +43,11 @@ public final class QMIDClient: NSObject, QMIDEvents {
     public var onGNSS: ((QMIDGNSS) -> Void)?
     // Internet Sharing over a PDN (config "sharing"): after subscribe() and whenever it changes.
     public var onSharing: ((QMIDSharing) -> Void)?
+    // The radio (as radio()): after subscribe() and whenever the serving cells, their roles,
+    // channels or activation, EN-DC or the RRC state change; nil while the modem isn't ready.
+    // Signal and neighbours are as read at that moment and don't trigger a call: poll radio()
+    // for those. onEvent sees these as .unknown(type: "radio").
+    public var onRadio: ((QMIDRadio?) -> Void)?
 
     private let queue: DispatchQueue
     private let lock = NSLock()
@@ -222,6 +228,9 @@ public final class QMIDClient: NSObject, QMIDEvents {
             if let s = (event[QMIDKey.sharing] as? NSDictionary).flatMap(QMIDSharing.init) {
                 queue.async { self.onSharing?(s) }
             }
+        case QMIDEventType.radio?:
+            let r = (event[QMIDKey.radio] as? NSDictionary).map(QMIDRadio.init)
+            queue.async { self.onRadio?(r) }
         default:
             break
         }
