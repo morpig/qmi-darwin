@@ -99,7 +99,10 @@ final class GNSSSession {
             try c.request(LOC.registerEvents, LOC.registerEventsRequest(events), timeout: 5)
         }
         if before?.interval != want.interval {
-            if before != nil { _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3) }
+            if before != nil {
+                _ = try? c.request(LOC.stop, LOC.stopRequest(), timeout: 3)
+                applied = nil                   // stopped: if Start fails, the next apply starts afresh
+            }
             if before == nil, !restart { beforeStart?(c) }
             try c.request(LOC.start, LOC.startRequest(intervalMs: UInt32(want.interval)), timeout: 5)
         }

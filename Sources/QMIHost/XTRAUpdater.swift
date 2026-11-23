@@ -1,10 +1,79 @@
 import Foundation
+import QMIDAPI
 import QMIKit
 
 // Keeping the modem's XTRA data fresh. The modem has not been seen fetching it by itself
 // under qmid, so qmid downloads the file (XTRADownload.servers) and loads it
 // (GNSSAssist.load) once the data is older than maxAge, or missing / unreadable. The download
 // goes over the Mac's default route. See docs/API.md, "GNSS assistance (XTRA)".
+//
+// XTRAUpdater decides; Manager runs a check on its GNSS queue (check) and applies the outcome
+// on its own (apply). The modem and the network are passed in, so both can be tested.
+enum XTRAUpdater {
+    enum Outcome: Equatable {
+        case unsupported
+        case notDue(Date)
+        case loaded(QMIDXTRA, lastModified: String?, from: String)
+        case notNewer(String)
+        case failed(String)
+    }
+
+    // One check: what the modem holds; if a load is due, download and load. Blocks.
+    static func check(state st: XTRAState, maxAge: TimeInterval, configured: [String]?, now: Date = Date(),
+                      snapshot: () throws -> GNSSAssist.Snapshot,
+                      fetch: (_ servers: [String], _ since: String?) throws -> XTRADownload.Result,
+                      load: ([UInt8]) throws -> QMIDXTRA) -> Outcome {
+        do {
+            let snap = try snapshot()
+            guard snap.supported else { return .unsupported }
+            let due = XTRASchedule.loadDue(validFrom: snap.validity?.start, unreadable: snap.unreadable, now: now,
+                                           maxAge: maxAge, notBefore: st.notBefore)
+            guard due <= now else { return .notDue(due) }
+            // Without usable data, any file will do: no If-Modified-Since.
+            let since = snap.validity == nil ? nil : st.lastModified
+            switch try fetch(XTRADownload.servers(configured: configured, modem: snap.servers), since) {
+            case .notModified(let host):
+                return .notNewer("not modified on \(host)")
+            case .file(let bytes, let lm, let host):
+                if !snap.unreadable, !XTRASchedule.isNewer(lastModified: lm.flatMap(XTRASchedule.httpDate), than: snap.validity?.start) {
+                    return .notNewer("\(host) has nothing newer (\(lm ?? "?"))")
+                }
+                return .loaded(try load(bytes), lastModified: lm, from: host)
+            }
+        } catch {
+            return .failed("\(error)")
+        }
+    }
+
+    // What an outcome does to the state; when to check next (nil: never) and what to log.
+    static func apply(_ outcome: Outcome, to state: inout XTRAState, now: Date, maxAge: TimeInterval)
+        -> (next: Date?, log: (level: QMIDLogLevel, message: String)?) {
+        switch outcome {
+        case .unsupported:
+            return (nil, (.info, "XTRA: not supported by this modem; no updates"))
+        case .notDue(let due):
+            return (XTRASchedule.nextCheck(due: due, now: now), nil)
+        case .loaded(let x, let lm, let host):
+            state.lastModified = lm
+            state.lastDownload = now
+            state.failures = 0
+            state.lastError = nil
+            state.notBefore = nil
+            return (XTRASchedule.nextCheck(due: x.validFrom.map { $0.addingTimeInterval(maxAge) } ?? now, now: now),
+                    (.notice, "XTRA: updated from \(host)"))
+        case .notNewer(let why):
+            state.notBefore = now.addingTimeInterval(XTRASchedule.notNewerDelay)
+            return (state.notBefore, (.info, "XTRA: \(why); asking again in 1 h"))
+        case .failed(let e):
+            state.failures += 1
+            state.lastError = e
+            let delay = XTRASchedule.retryDelay(failures: state.failures)
+            state.notBefore = now.addingTimeInterval(delay)
+            return (state.notBefore,
+                    (.error, "XTRA: update failed (\(state.failures) in a row): \(e); again in \(Int(delay / 60)) min"))
+        }
+    }
+}
 
 // When to load and when to look again; pure, so it can be tested with made-up times.
 enum XTRASchedule {
@@ -97,7 +166,7 @@ enum XTRADownload {
         return modem.isEmpty ? builtInServers : modem
     }
 
-    enum Result {
+    enum Result: Equatable {
         case file([UInt8], lastModified: String?, from: String)
         case notModified(from: String)
     }
@@ -114,7 +183,7 @@ enum XTRADownload {
                 errors.append("\(url.host ?? s): \(error)")
             }
         }
-        throw QMIHostError.transport(errors.isEmpty ? "no XTRA servers" : errors.joined(separator: "; "))
+        throw QMIHostError.failed(errors.isEmpty ? "no XTRA servers" : errors.joined(separator: "; "))
     }
 
     private static func fetch(_ url: URL, since: String?) throws -> Result {
@@ -122,30 +191,64 @@ enum XTRADownload {
         cfg.timeoutIntervalForRequest = 30
         cfg.timeoutIntervalForResource = 60
         cfg.waitsForConnectivity = true         // the modem's own data connection may be coming up
-        let session = URLSession(configuration: cfg)
+        let receiver = Receiver(url)
+        let session = URLSession(configuration: cfg, delegate: receiver, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         var req = URLRequest(url: url)
         if let since { req.setValue(since, forHTTPHeaderField: "If-Modified-Since") }
-        let done = DispatchSemaphore(value: 0)
-        var out: Swift.Result<Result, Error> = .failure(QMIHostError.transport("no answer"))
-        session.dataTask(with: req) { data, response, error in
-            defer { done.signal() }
-            if let error { out = .failure(error); return }
-            guard let http = response as? HTTPURLResponse else { out = .failure(QMIHostError.transport("not HTTP")); return }
+        let task = session.dataTask(with: req)
+        task.resume()
+        guard let out = receiver.result.wait(timeout: 70) else {
+            task.cancel()
+            throw QMIHostError.failed("no answer")
+        }
+        return try out.get()
+    }
+
+    // Collects the body, and gives up as soon as it is longer than maxSize (by its
+    // Content-Length, or while it arrives). Delegate calls come one at a time.
+    private final class Receiver: NSObject, URLSessionDataDelegate {
+        let result = BlockingValue<Swift.Result<Result, Error>>()
+        private let url: URL
+        private var body = Data()
+        private var tooLarge = false
+
+        init(_ url: URL) { self.url = url }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            if (response as? HTTPURLResponse)?.statusCode == 200, response.expectedContentLength > Int64(maxSize) {
+                tooLarge = true
+                completionHandler(.cancel)
+                return
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            // Only a 200 body is used; other statuses are reported by their code.
+            guard (dataTask.response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            body.append(data)
+            if body.count > maxSize {
+                tooLarge = true
+                dataTask.cancel()
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            let host = url.host ?? url.absoluteString
+            if tooLarge { return result.put(.failure(QMIHostError.failed("file larger than \(maxSize) bytes"))) }
+            if let error { return result.put(.failure(error)) }
+            guard let http = task.response as? HTTPURLResponse else { return result.put(.failure(QMIHostError.failed("not HTTP"))) }
             switch http.statusCode {
             case 304:
-                out = .success(.notModified(from: url.host ?? url.absoluteString))
+                result.put(.success(.notModified(from: host)))
             case 200:
-                guard let data, !data.isEmpty, data.count <= maxSize else {
-                    out = .failure(QMIHostError.transport("file of \(data?.count ?? 0) bytes")); return
-                }
-                out = .success(.file([UInt8](data), lastModified: http.value(forHTTPHeaderField: "Last-Modified"),
-                                     from: url.host ?? url.absoluteString))
+                guard !body.isEmpty else { return result.put(.failure(QMIHostError.failed("empty file"))) }
+                result.put(.success(.file([UInt8](body), lastModified: http.value(forHTTPHeaderField: "Last-Modified"), from: host)))
             default:
-                out = .failure(QMIHostError.transport("HTTP \(http.statusCode)"))
+                result.put(.failure(QMIHostError.failed("HTTP \(http.statusCode)")))
             }
-        }.resume()
-        _ = done.wait(timeout: .now() + 70)
-        return try out.get()
+        }
     }
 }

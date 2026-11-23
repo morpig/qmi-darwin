@@ -20,8 +20,10 @@ extension WDS {
         case ipv4 = 0, ppp = 1, ipv6 = 2, ipv4v6 = 3, nonIP = 4
         public var description: String { ["ipv4", "ppp", "ipv6", "ipv4v6", "non-ip"][Int(rawValue)] }
 
-        public init(families: [UInt8]) {
-            self = families == [4] ? .ipv4 : families == [6] ? .ipv6 : .ipv4v6
+        // From the names `description` gives; nil if unknown.
+        public init?(name: String) {
+            guard let i = ["ipv4", "ppp", "ipv6", "ipv4v6", "non-ip"].firstIndex(of: name.lowercased()) else { return nil }
+            self.init(rawValue: UInt8(i))
         }
     }
 
@@ -110,8 +112,7 @@ extension WDS {
             if let contextNumber { t.append(.u8(0x25, contextNumber)) }
             if let apnType {
                 var w = ByteWriter()
-                w.u32(UInt32(truncatingIfNeeded: apnType.rawValue))
-                w.u32(UInt32(truncatingIfNeeded: apnType.rawValue >> 32))
+                w.u64(apnType.rawValue)
                 t.append(TLV(0xDD, w.bytes))
             }
             return t
@@ -160,13 +161,10 @@ extension WDS {
     public static func parseProfileList(_ m: QMIMessage) throws -> [(index: UInt8, name: String)] {
         guard let v = m[tlv: 0x01] else { return [] }
         var r = ByteReader(v)
-        let n = Int(try r.u8("count"))
-        return try (0..<n).compactMap { _ in
+        return try r.list(count: .u8, "count") { r -> (type: UInt8, index: UInt8, name: String) in
             let type = try r.u8(), index = try r.u8()
-            let len = Int(try r.u8())
-            let name = String(decoding: try r.take(len), as: UTF8.self)
-            return type == profileType3GPP ? (index, name) : nil
-        }
+            return (type, index, String(decoding: try r.take(Int(try r.u8())), as: UTF8.self))
+        }.filter { $0.type == profileType3GPP }.map { ($0.index, $0.name) }
     }
 
     public static func profileIdentifier(_ index: UInt8) -> TLV { TLV(0x01, [profileType3GPP, index]) }
@@ -187,10 +185,7 @@ extension WDS {
         p.apnDisabled = flag(0x2F)
         p.roamingDisallowed = flag(0x3E)
         p.contextNumber = m[tlv: 0x25]?.first
-        if let v = m[tlv: 0xDD], v.count >= 8 {
-            var r = ByteReader(v)
-            if let lo = try? r.u32(), let hi = try? r.u32() { p.apnType = APNTypeMask(rawValue: UInt64(hi) << 32 | UInt64(lo)) }
-        }
+        p.apnType = m.u64(tlv: 0xDD).map(APNTypeMask.init(rawValue:))
         return p
     }
 
@@ -201,7 +196,7 @@ extension WDS {
 
     // Extended error (TLV 0xE0), e.g. why a profile write was refused.
     public static func parseExtendedError(_ m: QMIMessage) -> UInt16? {
-        m[tlv: 0xE0].flatMap { var r = ByteReader($0); return try? r.u16() }
+        m.u16(tlv: 0xE0)
     }
 
     public enum AutoconnectSetting: UInt8, CustomStringConvertible {
@@ -215,10 +210,8 @@ extension WDS {
 
     public static func parseAttachPDNList(_ m: QMIMessage) -> (current: [UInt16], pending: [UInt16]) {
         func list(_ t: UInt8) -> [UInt16] {
-            guard let v = m[tlv: t] else { return [] }
-            var r = ByteReader(v)
-            guard let n = try? r.u8() else { return [] }
-            return (0..<Int(n)).compactMap { _ in try? r.u16() }
+            var r = ByteReader(m[tlv: t] ?? [])
+            return r.partialList { try $0.u16() }
         }
         return (list(0x10), list(0x11))
     }

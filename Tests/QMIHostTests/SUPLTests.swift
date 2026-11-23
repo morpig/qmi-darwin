@@ -86,4 +86,12 @@ final class SUPLConfigTests: XCTestCase {
         XCTAssertEqual(Manager.distance(0, 0, 0, 1), 111_195, accuracy: 1)
         XCTAssertEqual(Manager.distance(10, 20, 10, 20), 0, accuracy: 1e-6)
     }
+
+    // A new SUPL query is worth it only for another PLMN or tracking area, not another cell.
+    func testSameAreaIgnoresCellAndPCI() {
+        let a = SUPL.Cell(mcc: "001", mnc: "01", cellID: 1, tac: 100, pci: 1)
+        XCTAssertTrue(Manager.sameArea(a, SUPL.Cell(mcc: "001", mnc: "01", cellID: 2, tac: 100, pci: 2)))
+        XCTAssertFalse(Manager.sameArea(a, SUPL.Cell(mcc: "001", mnc: "01", cellID: 1, tac: 101, pci: 1)))
+        XCTAssertFalse(Manager.sameArea(a, SUPL.Cell(mcc: "001", mnc: "02", cellID: 1, tac: 100, pci: 1)))
+    }
 }

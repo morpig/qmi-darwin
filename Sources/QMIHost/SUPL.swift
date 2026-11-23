@@ -276,7 +276,8 @@ enum SUPL {
     // location is in). Blocks for at most
     // `timeout`; run it off the manager queue. `log` gets each step.
     static func query(host: String, port: UInt16, cell: Cell, timeout: TimeInterval,
-                      log: (String) -> Void) throws -> ReferenceLocation {
+                      log sink: LogSink) throws -> ReferenceLocation {
+        func log(_ s: String) { sink(.info, s) }
         let conn = try Connection(host: host, port: port, deadline: Date().addingTimeInterval(timeout))
         defer { conn.close() }
         log("SUPL: connected to \(host):\(port) (\(conn.path))")
@@ -324,33 +325,40 @@ enum SUPL {
             guard let p = NWEndpoint.Port(rawValue: port) else { throw Failure.transport("port \(port)") }
             let params = NWParameters(tls: NWProtocolTLS.Options(), tcp: NWProtocolTCP.Options())
             conn = NWConnection(host: NWEndpoint.Host(host), port: p, using: params)
-            let ready = DispatchSemaphore(value: 0)
-            var failure: String?
-            var waiting: String?
-            conn.stateUpdateHandler = { state in
+            // The path once ready, nil when it failed. `waiting` and `failure` are written on
+            // `queue` and read there once the handler is gone. No `self` in the handler: a
+            // connection that never gets ready is dropped with its handler cleared.
+            let ready = BlockingValue<String?>()
+            var waiting: String?, failure: String?
+            conn.stateUpdateHandler = { [conn] state in
                 switch state {
-                case .ready:
-                    if let route = self.conn.currentPath?.availableInterfaces.first { self.path = "via \(route.name)" }
-                    ready.signal()
+                case .ready: ready.put(conn.currentPath?.availableInterfaces.first.map { "via \($0.name)" } ?? "")
                 case .waiting(let e): waiting = "\(e)"          // no route yet: keep waiting until the deadline
-                case .failed(let e): failure = "\(e)"; ready.signal()
-                case .cancelled: failure = failure ?? "cancelled"; ready.signal()
+                case .failed(let e): failure = "\(e)"; ready.put(nil)
+                case .cancelled: failure = failure ?? "cancelled"; ready.put(nil)
                 default: break
                 }
             }
             conn.start(queue: queue)
-            guard ready.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success else {
-                conn.cancel()
-                throw Failure.transport("no connection to \(host) within the time limit\(waiting.map { " (\($0))" } ?? "")")
+            let outcome = ready.wait(timeout: remaining)
+            if case let path?? = outcome {
+                self.path = path
+                return
             }
-            if let failure { conn.cancel(); throw Failure.transport("connecting to \(host): \(failure)") }
+            close()
+            let (w, f) = queue.sync { (waiting, failure) }
+            guard outcome != nil else {
+                throw Failure.transport("no connection to \(host) within the time limit\(w.map { " (\($0))" } ?? "")")
+            }
+            throw Failure.transport("connecting to \(host): \(f ?? "cancelled")")
         }
 
+        private var remaining: TimeInterval { deadline.timeIntervalSinceNow }
+
         func send(_ bytes: [UInt8]) throws {
-            let done = DispatchSemaphore(value: 0)
-            var failure: NWError?
-            conn.send(content: Data(bytes), completion: .contentProcessed { failure = $0; done.signal() })
-            guard done.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success else { throw Failure.transport("send timed out") }
+            let done = BlockingValue<NWError?>()
+            conn.send(content: Data(bytes), completion: .contentProcessed { done.put($0) })
+            guard let failure = done.wait(timeout: remaining) else { throw Failure.transport("send timed out") }
             if let failure { throw Failure.transport("send: \(failure)") }
         }
 
@@ -365,15 +373,14 @@ enum SUPL {
                         return pdu
                     }
                 }
-                let done = DispatchSemaphore(value: 0)
-                var chunk: Data?, failure: NWError?, closed = false
+                let done = BlockingValue<(chunk: Data?, failure: NWError?, closed: Bool)>()
                 conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, complete, e in
-                    chunk = d; failure = e; closed = complete; done.signal()
+                    done.put((d, e, complete))
                 }
-                guard done.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success else { throw Failure.transport("no answer within the time limit") }
-                if let failure { throw Failure.transport("receive: \(failure)") }
-                if let chunk { buffer += chunk }
-                if closed, chunk?.isEmpty ?? true { throw Failure.transport("the server closed the connection") }
+                guard let r = done.wait(timeout: remaining) else { throw Failure.transport("no answer within the time limit") }
+                if let failure = r.failure { throw Failure.transport("receive: \(failure)") }
+                if let chunk = r.chunk { buffer += chunk }
+                if r.closed, r.chunk?.isEmpty ?? true { throw Failure.transport("the server closed the connection") }
             }
         }
 

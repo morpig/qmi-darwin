@@ -60,10 +60,10 @@ public struct QMIDConfig: Codable, Equatable {
         public var name: String
         public var profile: Int?
         public var apn: String?
-        public var family: String?          // ipv4, ipv6, ipv4v6 (default)
+        public var family: Family?          // default ipv4v6
         public var policy: String?          // QMIDPolicy raw value
         public var autoconnect: Bool?
-        public var role: String?
+        public var role: QMIDRole?
         public var attach: Bool?
         public var username: String?
         public var password: String?
@@ -76,14 +76,21 @@ public struct QMIDConfig: Codable, Equatable {
         public var autoconnects: Bool { autoconnect ?? !oneShot }
         public var apnTypeMask: WDS.APNTypeMask? { apnType.flatMap(WDS.APNTypeMask.init(names:)) }
 
-        public var effectiveRole: String { role ?? (name == "internet" || name == "ims" ? name : "other") }
-        public var isAttach: Bool { attach ?? (effectiveRole == "internet") }
+        // Unset: the PDN's name if it is a role's ("internet", "ims"), else other.
+        public var effectiveRole: QMIDRole { role ?? QMIDRole(rawValue: name) ?? .other }
+        public var isAttach: Bool { attach ?? (effectiveRole == .internet) }
+        public var families: [UInt8] { (family ?? .ipv4v6).families }
+    }
+
+    // "family": which IP families qmid starts calls for.
+    public enum Family: String, CaseIterable {
+        case ipv4, ipv6, ipv4v6
 
         public var families: [UInt8] {
-            switch family ?? "ipv4v6" {
-            case "ipv4": return [4]
-            case "ipv6": return [6]
-            default: return [4, 6]
+            switch self {
+            case .ipv4: return [4]
+            case .ipv6: return [6]
+            case .ipv4v6: return [4, 6]
             }
         }
     }
@@ -132,13 +139,22 @@ public struct QMIDConfig: Codable, Equatable {
 
     public struct SUPLSettings: Codable, Equatable {
         public var enabled: Bool?
-        public var server: String?              // "host:port"
+        public var server: String?              // "host:port", "[IPv6]:port"
 
         public var on: Bool { enabled ?? true }
-        public var endpoint: (host: String, port: UInt16)? {
-            let s = server ?? "supl.google.com:7275"
-            guard let i = s.lastIndex(of: ":"), let port = UInt16(s[s.index(after: i)...]), i > s.startIndex else { return nil }
-            return (String(s[..<i]), port)
+        public var endpoint: (host: String, port: UInt16)? { Self.endpoint(server ?? "supl.google.com:7275") }
+
+        // An IPv6 address needs its brackets: without them its last group would be the port.
+        static func endpoint(_ s: String) -> (host: String, port: UInt16)? {
+            guard let i = s.lastIndex(of: ":"), let port = UInt16(s[s.index(after: i)...]), port > 0 else { return nil }
+            var host = s[..<i]
+            if host.hasPrefix("["), host.hasSuffix("]") {
+                host = host.dropFirst().dropLast()
+                guard host.contains(":") else { return nil }
+            } else if host.contains(where: { ":[]".contains($0) }) {
+                return nil
+            }
+            return host.isEmpty ? nil : (String(host), port)
         }
     }
 
@@ -206,16 +222,18 @@ public struct QMIDConfig: Codable, Equatable {
     public static let defaultPath = "/Library/Application Support/qmi-darwin/qmid.json"
 
     public static let builtIn = QMIDConfig(interface: nil, pdns: [
-        PDN(name: "internet", profile: 1, apn: nil, family: "ipv4v6", policy: "prefer-wifi", autoconnect: true,
+        PDN(name: "internet", profile: 1, apn: nil, family: .ipv4v6, policy: "prefer-wifi", autoconnect: true,
             role: nil, attach: nil, username: nil, password: nil, auth: nil),
-        PDN(name: "ims", profile: 2, apn: nil, family: "ipv6", policy: "never", autoconnect: true,
+        PDN(name: "ims", profile: 2, apn: nil, family: .ipv6, policy: "never", autoconnect: true,
             role: nil, attach: nil, username: nil, password: nil, auth: nil),
     ])
 
     public static func decode(_ data: Data) throws -> QMIDConfig {
         let c: QMIDConfig
-        do { c = try JSONDecoder().decode(QMIDConfig.self, from: data) } catch {
-            throw QMIHostError.transport("config: \(error)")
+        do { c = try JSONDecoder().decode(QMIDConfig.self, from: data) } catch let e as DecodingError {
+            throw QMIHostError.config(Self.describe(e))
+        } catch {
+            throw QMIHostError.config("\(error)")
         }
         try c.validate()
         return c
@@ -232,6 +250,24 @@ public struct QMIDConfig: Codable, Equatable {
         return try decode(Data(contentsOf: URL(fileURLWithPath: path)))
     }
 
+    // A decoding error in a line. A bad role or family names its PDN (PDN.init(from:)); other
+    // errors say where in the file ("pdns[1].profile").
+    static func describe(_ e: DecodingError) -> String {
+        func path(_ keys: [CodingKey]) -> String {
+            let s = keys.map { k in k.intValue.map { "[\($0)]" } ?? ".\(k.stringValue)" }.joined()
+            return s.hasPrefix(".") ? String(s.dropFirst()) : s
+        }
+        switch e {
+        case .dataCorrupted(let c):
+            // Bad JSON: the line and column are in the underlying error's debug description.
+            let at = (c.underlyingError as NSError?)?.userInfo[NSDebugDescriptionErrorKey] as? String
+            return at.map { "\(c.debugDescription) \($0)" } ?? c.debugDescription
+        case .keyNotFound(let k, let c): return "\(path(c.codingPath + [k])) is missing"
+        case .typeMismatch(let t, let c), .valueNotFound(let t, let c): return "\(path(c.codingPath)) must be \(t)"
+        @unknown default: return "\(e)"
+        }
+    }
+
     // vendorIDs as numbers; nil entries are rejected by validate().
     public var usbVendorIDs: [UInt16] {
         (vendorIDs ?? []).compactMap { $0.count == 4 ? UInt16($0, radix: 16) : nil }
@@ -239,57 +275,57 @@ public struct QMIDConfig: Codable, Equatable {
 
     public func validate() throws {
         if supl?.server != nil, supl?.endpoint == nil {
-            throw QMIHostError.transport("config: supl server must be \"host:port\"")
+            throw QMIHostError.config("supl server must be \"host:port\"")
         }
         if let h = xtra?.maxAgeHours, !(1...167).contains(h) {
-            throw QMIHostError.transport("config: xtra maxAgeHours must be 1–167 (a file lasts 168 h)")
+            throw QMIHostError.config("xtra maxAgeHours must be 1–167 (a file lasts 168 h)")
         }
         for s in xtra?.servers ?? [] where URL(string: s)?.scheme != "https" {
-            throw QMIHostError.transport("config: xtra server \(s) is not an https URL")
+            throw QMIHostError.config("xtra server \(s) is not an https URL")
         }
         for v in vendorIDs ?? [] where v.count != 4 || UInt16(v, radix: 16) == nil {
-            throw QMIHostError.transport("config: vendorID \(v) is not 4 hex digits")
+            throw QMIHostError.config("vendorID \(v) is not 4 hex digits")
         }
         if let s = sharing {
             guard let p = pdns.first(where: { $0.name == s.pdn }) else {
-                throw QMIHostError.transport("config: sharing pdn \(s.pdn) is not a PDN")
+                throw QMIHostError.config("sharing pdn \(s.pdn) is not a PDN")
             }
-            guard p.effectiveRole == "internet" else {
-                throw QMIHostError.transport("config: sharing pdn \(s.pdn) must have role internet")
+            guard p.effectiveRole == .internet else {
+                throw QMIHostError.config("sharing pdn \(s.pdn) must have role internet")
             }
         }
         var names = Set<String>()
         for p in pdns {
-            guard !p.name.isEmpty, names.insert(p.name).inserted else { throw QMIHostError.transport("config: duplicate or empty PDN name \(p.name)") }
-            guard p.profile != nil || p.apn != nil else { throw QMIHostError.transport("config: \(p.name) needs profile or apn") }
-            if let pr = p.profile, !(1...255).contains(pr) { throw QMIHostError.transport("config: \(p.name) profile out of range") }
-            if let pol = p.policy, QMIDPolicy(rawValue: pol) == nil { throw QMIHostError.transport("config: \(p.name) bad policy \(pol)") }
-            if let a = p.auth, WDS.Authentication(name: a) == nil { throw QMIHostError.transport("config: \(p.name) bad auth \(a)") }
+            guard !p.name.isEmpty, names.insert(p.name).inserted else { throw QMIHostError.config("duplicate or empty PDN name \(p.name)") }
+            guard p.profile != nil || p.apn != nil else { throw QMIHostError.config("\(p.name) needs profile or apn") }
+            if let pr = p.profile, !(1...255).contains(pr) { throw QMIHostError.config("\(p.name) profile out of range") }
+            if let pol = p.policy, QMIDPolicy(rawValue: pol) == nil { throw QMIHostError.config("\(p.name) bad policy \(pol)") }
+            if let a = p.auth, WDS.Authentication(name: a) == nil { throw QMIHostError.config("\(p.name) bad auth \(a)") }
             if let t = p.apnType, WDS.APNTypeMask(names: t) == nil {
-                throw QMIHostError.transport("config: \(p.name) bad apnType \(t.joined(separator: ", "))")
+                throw QMIHostError.config("\(p.name) bad apnType \(t.joined(separator: ", "))")
             }
             if p.oneShot, p.autoconnect == true {
-                throw QMIHostError.transport("config: \(p.name) can't autoconnect with redial false")
+                throw QMIHostError.config("\(p.name) can't autoconnect with redial false")
             }
             if let m = p.maxUptime {
-                guard m > 0 else { throw QMIHostError.transport("config: \(p.name) maxUptime must be positive") }
-                guard p.oneShot else { throw QMIHostError.transport("config: \(p.name) maxUptime needs redial false") }
+                guard m > 0 else { throw QMIHostError.config("\(p.name) maxUptime must be positive") }
+                guard p.oneShot else { throw QMIHostError.config("\(p.name) maxUptime needs redial false") }
             }
         }
         let pinned = pdns.compactMap(\.profile)
-        guard Set(pinned).count == pinned.count else { throw QMIHostError.transport("config: two PDNs pin the same profile") }
-        guard pdns.filter(\.isAttach).count <= 1 else { throw QMIHostError.transport("config: only one PDN can be the attach PDN") }
-        guard pdns.count <= 8 else { throw QMIHostError.transport("config: at most 8 PDNs") }
+        guard Set(pinned).count == pinned.count else { throw QMIHostError.config("two PDNs pin the same profile") }
+        guard pdns.filter(\.isAttach).count <= 1 else { throw QMIHostError.config("only one PDN can be the attach PDN") }
+        guard pdns.count <= 8 else { throw QMIHostError.config("at most 8 PDNs") }
         if let carriers {
-            guard pdns.contains(where: \.isAttach) else { throw QMIHostError.transport("config: carriers need an attach PDN") }
+            guard pdns.contains(where: \.isAttach) else { throw QMIHostError.config("carriers need an attach PDN") }
             for c in carriers {
-                func bad(_ why: String) -> Error { QMIHostError.transport("config: carrier \(c.name.isEmpty ? "(no name)" : c.name): \(why)") }
+                func bad(_ why: String) -> Error { QMIHostError.config("carrier \(c.name.isEmpty ? "(no name)" : c.name): \(why)") }
                 guard !c.name.isEmpty else { throw bad("needs a name") }
                 guard !(c.mccmnc ?? []).isEmpty || !(c.iccid ?? []).isEmpty else { throw bad("needs mccmnc or iccid") }
-                for m in c.mccmnc ?? [] where !(5...6).contains(m.count) || !m.allSatisfy(\.isASCII) || !m.allSatisfy(\.isNumber) {
+                for m in c.mccmnc ?? [] where !SIMIdentity.isMCCMNC(m) {
                     throw bad("mccmnc \(m) is not 5 or 6 digits")
                 }
-                for i in c.iccid ?? [] where !(1...22).contains(i.count) || !i.allSatisfy(\.isASCII) || !i.allSatisfy(\.isNumber) {
+                for i in c.iccid ?? [] where !SIMIdentity.isICCIDPrefix(i) {
                     throw bad("iccid prefix \(i) is not 1–22 digits")
                 }
                 if let a = c.auth, WDS.Authentication(name: a) == nil { throw bad("bad auth \(a)") }
@@ -298,8 +334,60 @@ public struct QMIDConfig: Codable, Equatable {
     }
 }
 
+// role and family are decoded from their names by hand: QMIDRole (QMIDAPI) isn't Codable, and a
+// bad value is reported with the PDN's name.
+extension QMIDConfig.PDN {
+    private enum CodingKeys: String, CodingKey {
+        case name, profile, apn, family, policy, autoconnect, role, attach, username, password, auth, apnType, redial, maxUptime
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let name = try c.decode(String.self, forKey: .name)
+        func named<T: RawRepresentable>(_ key: CodingKeys, _ what: String) throws -> T? where T.RawValue == String {
+            guard let raw = try c.decodeIfPresent(String.self, forKey: key) else { return nil }
+            guard let v = T(rawValue: raw) else {
+                throw DecodingError.dataCorruptedError(forKey: key, in: c, debugDescription: "\(name) bad \(what) \(raw)")
+            }
+            return v
+        }
+        self.init(name: name,
+                  profile: try c.decodeIfPresent(Int.self, forKey: .profile),
+                  apn: try c.decodeIfPresent(String.self, forKey: .apn),
+                  family: try named(.family, "family"),
+                  policy: try c.decodeIfPresent(String.self, forKey: .policy),
+                  autoconnect: try c.decodeIfPresent(Bool.self, forKey: .autoconnect),
+                  role: try named(.role, "role"),
+                  attach: try c.decodeIfPresent(Bool.self, forKey: .attach),
+                  username: try c.decodeIfPresent(String.self, forKey: .username),
+                  password: try c.decodeIfPresent(String.self, forKey: .password),
+                  auth: try c.decodeIfPresent(String.self, forKey: .auth),
+                  apnType: try c.decodeIfPresent([String].self, forKey: .apnType),
+                  redial: try c.decodeIfPresent(Bool.self, forKey: .redial),
+                  maxUptime: try c.decodeIfPresent(Int.self, forKey: .maxUptime))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encodeIfPresent(profile, forKey: .profile)
+        try c.encodeIfPresent(apn, forKey: .apn)
+        try c.encodeIfPresent(family?.rawValue, forKey: .family)
+        try c.encodeIfPresent(policy, forKey: .policy)
+        try c.encodeIfPresent(autoconnect, forKey: .autoconnect)
+        try c.encodeIfPresent(role?.rawValue, forKey: .role)
+        try c.encodeIfPresent(attach, forKey: .attach)
+        try c.encodeIfPresent(username, forKey: .username)
+        try c.encodeIfPresent(password, forKey: .password)
+        try c.encodeIfPresent(auth, forKey: .auth)
+        try c.encodeIfPresent(apnType, forKey: .apnType)
+        try c.encodeIfPresent(redial, forKey: .redial)
+        try c.encodeIfPresent(maxUptime, forKey: .maxUptime)
+    }
+}
+
 // The SIM as qmid identifies it: home MCC/MNC (NAS Get Home Network) and ICCID.
-public struct SIMIdentity: Equatable {
+public struct SIMIdentity: Equatable, CustomStringConvertible {
     public var mccmnc: String?
     public var iccid: String?
 
@@ -322,6 +410,14 @@ public struct SIMIdentity: Equatable {
         guard let iccid, iccid == prepared.iccid else { return nil }
         return SIMIdentity(mccmnc: mccmnc ?? prepared.mccmnc, iccid: iccid)
     }
+
+    // "00101" / "001001": 5 or 6 ASCII digits.
+    public static func isMCCMNC(_ s: String) -> Bool { (5...6).contains(s.count) && isDigits(s) }
+
+    // A prefix of an ICCID (config "carriers"): 1 to 22 ASCII digits.
+    public static func isICCIDPrefix(_ s: String) -> Bool { (1...22).contains(s.count) && isDigits(s) }
+
+    private static func isDigits(_ s: String) -> Bool { s.allSatisfy { $0.isASCII && $0.isNumber } }
 
     // Last 4 digits: enough to tell SIMs apart in status and logs.
     public var iccidSuffix: String? { iccid.map { "…" + String($0.suffix(4)) } }

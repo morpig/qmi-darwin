@@ -51,21 +51,14 @@ func register() -> String? {
 }
 
 // This bundle's build, in the format qmid reports.
-let bundleVersion: String = {
-    let info = Bundle.main.infoDictionary ?? [:]
-    return "\(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?"))"
-}()
+let bundleVersion = QMIDVersion.string() ?? "?"
 
-// Calls qmid synchronously, waiting up to `timeout`; nil if it doesn't answer.
+// Calls qmid and waits up to `timeout` (QMIDClient.sync); a timeout is a failure with timedOut.
 func withQMID<T>(timeout: TimeInterval = 5,
-                 _ call: (QMIDClient, @escaping (T?) -> Void) -> Void) -> T? {
-    let client = QMIDClient(queue: DispatchQueue(label: "call"))
-    let done = DispatchSemaphore(value: 0)
-    var out: T?
-    call(client) { out = $0; done.signal() }
-    _ = done.wait(timeout: .now() + timeout)
-    client.invalidate()
-    return out
+                 _ call: (QMIDClient, @escaping (Result<T, QMIDError>) -> Void) -> Void) -> Result<T, QMIDError> {
+    let client = QMIDClient(queue: DispatchQueue(label: "qmid"))
+    defer { client.invalidate() }
+    return client.sync(timeout: timeout) { call(client, $0) }
 }
 
 // Asks qmid to remove what it added to the network preferences (the Internet Sharing source
@@ -73,16 +66,15 @@ func withQMID<T>(timeout: TimeInterval = 5,
 // doesn't answer (it adds nothing while stopped).
 func prepareUninstall() -> String? {
     guard service.status == .enabled else { return nil }
-    let r: Result<Void, QMIDError>? = withQMID { c, done in c.prepareUninstall { done($0) } }
-    switch r {
-    case .failure(let e)?: return "couldn't remove the Internet Sharing source service: \(e.message)"
-    case nil: return "qmid didn't answer; an Internet Sharing source service it added may remain"
-    default: return nil
+    switch withQMID({ c, done in c.prepareUninstall(done) }) {
+    case .failure(let e) where e.timedOut: return "qmid didn't answer; an Internet Sharing source service it added may remain"
+    case .failure(let e): return "couldn't remove the Internet Sharing source service: \(e.message)"
+    case .success: return nil
     }
 }
 
 func fetchStatus() -> QMIDStatus? {
-    withQMID { c, done in c.status { done(try? $0.get()) } }
+    try? withQMID { c, done in c.status(done) }.get()
 }
 
 func describe(_ s: QMIDStatus) -> String {
@@ -98,7 +90,7 @@ func describe(_ s: QMIDStatus) -> String {
 // wait for the new one. Returns a line to show, or nil when nothing needed doing.
 func restartIfOutdated() -> String? {
     guard service.status == .enabled, let s = fetchStatus(), let running = s.version, running != bundleVersion else { return nil }
-    let asked: Bool = withQMID { c, done in c.restart { done((try? $0.get()) != nil) } } ?? false
+    let asked = (try? withQMID { c, done in c.restart(done) }.get()) != nil
     guard asked else { return "qmid \(running) is running but didn't accept a restart; the app has \(bundleVersion)" }
     // launchd may throttle the relaunch for up to 10 s.
     for _ in 0..<30 {

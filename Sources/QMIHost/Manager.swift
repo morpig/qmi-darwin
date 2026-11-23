@@ -15,7 +15,7 @@ import QMIKit
 // Device: absent → opening → ready → (unplugged/reset) → absent …
 public final class Manager {
     public let queue = DispatchQueue(label: "qmid.manager")
-    public var logSink: (QMIDLogLevel, String) -> Void = { print("[\($0.name)] \($1)") }
+    public var logSink: LogSink = { print("[\($0.name)] \($1)") }
     // Whether anyone collects debug output (the QMI message trace); checked per message.
     public var debugEnabled: () -> Bool = { false }
     // Called when the device keeps failing to open while it is present; qmid exits so launchd
@@ -25,9 +25,12 @@ public final class Manager {
     public var version: String?
     // Pushed to XPC subscribers (QMIDAPI event dictionaries); called on `queue`.
     public var onEvent: ((NSDictionary) -> Void)?
-    private var lastPDNEvent: [String: NSDictionary] = [:]
-    private var lastBearersEvent: [String: NSDictionary] = [:]
-    private var lastModemEvent: NSDictionary?
+    // The last event pushed per type (and PDN), and what it was compared on (emit).
+    private struct EventID: Hashable {
+        let type: String
+        var pdn: String?
+    }
+    private var sentEvents: [EventID: (event: NSDictionary, key: NSDictionary)] = [:]
     private var openFailures = 0
 
     private let configPath: String
@@ -39,7 +42,7 @@ public final class Manager {
     private var wda: QMIClient?
     private var deviceState = QMIDModemState.absent
     private var deviceError: String?
-    private var reopenScheduled = false
+    private let reopenTimer = TimerSlot()
     private var fastReopenUntil: Date?       // after arrival/loss: retry every 3 s while the modem boots
     private var lastArrival: Date?
 
@@ -54,7 +57,7 @@ public final class Manager {
         var lastError: String?               // in words, for status and clients
         var lastErrorDetail: String?         // with the codes, for the log
         var attempts = 0
-        var retry: DispatchWorkItem?
+        let retry = TimerSlot()               // backoff redial
         var connectedAt: Date?
         var dialStarted: UInt64 = 0         // uptime ns; indications received earlier are stale
         var profileIndex: UInt8?            // resolved by syncProfiles; PDNs start by profile only
@@ -62,22 +65,22 @@ public final class Manager {
         var qos: PDNQoS?                    // while connected: QCI, AMBR, dedicated bearers
         var qosState = PDNQoS.State()       // QCI, AMBR, bearers as last known
         var snapshot = QoSSnapshot()
+        let snapshotRetry = TimerSlot()
         var dialing: PDNSession?            // a dial running on dialQueue
         var dialCancelled = false           // torn down meanwhile: its call is stopped when it returns
         var dialAgain = false               // dial once the cancelled one has returned
         var waiters: [(String?) -> Void] = []  // connect calls waiting for the attempt's outcome
-        var uptimeLimit: DispatchWorkItem?  // maxUptime
+        let uptimeLimit = TimerSlot()       // maxUptime
         // After a drop: the utun and service are kept while it redials (linkHold), with the
         // settings they still carry.
         var heldSettings: WDS.RuntimeSettings?
-        var linkHold: DispatchWorkItem?
+        let linkHold = TimerSlot()
         var reason: QMIDReason?             // lastError as a word for clients
         var ends: [UInt8: WDS.CallEnd] = [:]  // lastError's call end causes, per family
         var rat: String?                    // while connected: the technology its data goes over
 
         // Bookkeeping of the QoS snapshot (snapshotQoS); reset with the call.
         struct QoSSnapshot {
-            var retry: DispatchWorkItem?
             var running = false
             var touched = Set<UInt32>()     // bearers reported / deleted while it runs
             var deleted = Set<UInt32>()
@@ -86,18 +89,15 @@ public final class Manager {
             var failures = 0                // failed snapshots in a row
         }
 
+        static func policy(_ c: QMIDConfig.PDN) -> QMIDPolicy { c.policy.flatMap(QMIDPolicy.init(rawValue:)) ?? .preferWifi }
+
         var dialFamilies: [UInt8] { config.families.filter { blocked[$0] == nil } }
         var blockedSummary: String { PDNSession.summary(blocked) }
-
-        func cancelRetry() {
-            retry?.cancel()
-            retry = nil
-        }
 
         init(config: QMIDConfig.PDN, muxID: UInt8) {
             self.config = config
             self.muxID = muxID
-            policy = config.policy.flatMap(QMIDPolicy.init(rawValue:)) ?? .preferWifi
+            policy = Self.policy(config)
             wanted = config.autoconnects
         }
 
@@ -118,11 +118,11 @@ public final class Manager {
             if let pw = config.password { p.password = pw }
             if config.username != nil, config.auth == nil { p.authentication = .papOrChap }
             switch config.effectiveRole {
-            case "ims":
+            case .ims:
                 p.pcscfUsingPCO = true
                 p.imcn = true
                 p.apnType = .ims
-            case "internet":
+            case .internet:
                 p.apnType = .default
             default:
                 break
@@ -134,37 +134,23 @@ public final class Manager {
     }
 
     private var pdns: [PDNState] = []
+    private func pdn(named name: String) -> PDNState? { pdns.first { $0.config.name == name } }
+    // The PDN whose call holds this WDS client.
+    private func pdn(client id: UInt8) -> PDNState? { pdns.first { $0.session?.clientIDs.contains(id) == true } }
     private var control: QMIClient?          // long-lived WDS client: profile ops + Profile Changed events
     private var syncing = false
     private var lastSyncWrite: UInt64 = 0    // our own writes also raise Profile Changed
     // What the last syncProfiles did, per PDN (profiles(), prepareSIM).
-    private struct ProfileSyncEntry {
-        var pdn: String
-        var action = ""
-        var failed = false                  // writing the profile failed
-        var profile: UInt8?
-        var attach = false                  // it is the LTE attach profile
-        var settings: String?
-
-        var dictionary: [String: Any] {
-            var d: [String: Any] = ["pdn": pdn, "action": action]
-            if let i = profile { d["profile"] = Int(i) }
-            if attach { d["attach"] = true }
-            if let s = settings { d["settings"] = s }
-            return d
-        }
-    }
-    private var profileReport: [ProfileSyncEntry] = []
+    private var profileReport: [QMIDProfileReport.PDN] = []
     private var profileSyncError: String?
     private var profileCheck: DispatchSourceTimer?
     private var linkAnchor: (v4: Bool, v6: Bool) = (false, false)
-    private var nas: QMIClient?              // Serving System indications (registration gate)
+    private var nas: QMIClient?              // NAS requests; and indications when registered
+    private var servingIndications = false   // Serving System indications registered (registration gate)
     private var nrServingCells: [NAS.NRServingCell] = []   // the last NR5G RRC BWP Info indication
     private var coexWatch: QMIClient?        // COEX WWAN State indications (radio events)
     private var coexState: QMIMessage?       // the last WWAN State (indication or reply)
-    private var radioPending = false         // a radio event is due (debounce)
-    private var lastRadioKey: NSDictionary?  // what the last radio event is compared on
-    private var lastRadioEvent: NSDictionary?
+    private let radioTimer = TimerSlot()     // a radio event is due (debounce)
     private var uimWatch: QMIClient?         // UIM card status indications
     private var dmsWatch: QMIClient?         // DMS operating mode indications
     private var gnss: GNSSAssist?            // XTRA on the open modem; its calls run on gnssQueue
@@ -181,27 +167,27 @@ public final class Manager {
     private var gnssEngine: Bool?
     private var gnssStarted: Date?            // the session's start, for the time to first fix
     private var lastFix: Date?
-    private var gnssHold: DispatchWorkItem?   // the session outlives its last client this long
+    private let gnssHold = TimerSlot()        // the session outlives its last client this long
     static let gnssHoldTime: TimeInterval = 45
-    private var gnssOpened: Date?             // when this modem was opened: it may have lost its position then
     private var gnssAssist: QMIDGNSSAssist?   // the last SUPL starting position (status; never the position)
     private var assistPosition: (latitude: Double, longitude: Double)?  // memory only: for the first fix's distance
     private var suplAwaitingPLMN = false      // SUPL skipped for want of a PLMN: ask once registered
-    private var gnssRetry: DispatchWorkItem?
-    private var lastGNSSEvent: NSDictionary?
+    private var suplArea: SUPL.Cell?          // the cell of the last injected SUPL position
+    private let suplRecheck = TimerSlot()     // no fix yet: look for a new area every 10 min
+    private let gnssRetry = TimerSlot()
     // Internet Sharing over a PDN (config "sharing", Sharing.swift).
     private var sharing: Sharing?
     private var sharingWasOn = false          // seen on with the PDN up; kept in state.json "sharingOn"
     private var sharingLastNAT: Sharing.NAT?  // as last read, to tell what changed
     private var sharingRestoredFor: Date?     // the PDN connection Internet Sharing was turned back on for
-    private var sharingRecheck: DispatchWorkItem?
-    private var lastSharingEvent: NSDictionary?
+    private let sharingRecheck = TimerSlot()
     private var xtraState = XTRAState()       // qmid's own XTRA updates (state.json "xtra")
-    private var xtraCheck: DispatchWorkItem?
+    private let xtraCheck = TimerSlot()
     private var xtraNext: Date?
     private var xtraRunning = false
     private var airplane = false             // the radio is off: setAirplaneMode, or someone's AT+CFUN=4
     private var restarting = false           // restartModem: its offline step isn't airplane mode
+    private let restartEnd = TimerSlot()     // ends `restarting` if the modem never goes away
     private var imei: String?
     private var card: UIM.Card?              // the card in the modem: state, PIN
     private var imsi: String?                // of `sim`; read once its PIN is verified
@@ -222,18 +208,16 @@ public final class Manager {
     private var attachFromNetwork = false      // the attach profile's APN is empty: the network chose
     // Home MCC/MNC → the APN the default bearer got there, for "carriers" suggestions.
     private var learned: [String: [String: String]] = [:]
-    private var lastSIMEvent: NSDictionary?
     private var serving = ""
     // Registered PLMN and its operator names: the network's (NITZ) or, until it sends them,
     // the modem's own (Get PLMN Name).
-    private var plmn: (mcc: UInt16, mnc: UInt16)?
+    private var plmn: PLMNID?
     private var plmnNITZ: NAS.NetworkName?   // the network's (Operator Name Data)
     private var plmnSPN: String?             // the SIM's Service Provider Name
     private var plmnPNN: NAS.NetworkName?    // the SIM's name for the PLMN (EF_OPL/EF_PNN)
     private var plmnModem: NAS.NetworkName?  // the modem's (Get PLMN Name), read once per PLMN
     private var plmnLogged: NAS.NetworkName?
     private var lteEmergency = NAS.LTEEmergency()   // of the registered network
-    private var lastPLMNEvent: NSDictionary?
     private var arrivalPort: IONotificationPortRef?
     private var arrivalIterator: io_iterator_t = 0
     private var powerPort: IONotificationPortRef?
@@ -251,6 +235,24 @@ public final class Manager {
     }
 
     func log(_ s: String, level: QMIDLogLevel = .info) { logSink(level, s) }
+
+    private var notReady: String { "modem not ready (\(deviceState.rawValue))" }
+
+    // `body` on `watch` (a long-lived client of `dev`'s) when qmid holds one, else on a client
+    // of `service` allocated for this call only.
+    @discardableResult
+    private func withClient<T>(_ service: QMIService, _ dev: QMIDevice, reuse watch: QMIClient?,
+                               _ body: (QMIClient) throws -> T) throws -> T {
+        if let watch { return try body(watch) }
+        let c = try dev.allocateClient(service)
+        defer { c.release() }
+        return try body(c)
+    }
+
+    @discardableResult
+    private func withDMS<T>(_ dev: QMIDevice, _ body: (QMIClient) throws -> T) throws -> T {
+        try withClient(.dms, dev, reuse: dmsWatch, body)
+    }
 
     public init(configPath: String = QMIDConfig.defaultPath) throws {
         self.configPath = configPath
@@ -286,14 +288,14 @@ public final class Manager {
     // MARK: - Device
 
     public func start() {
-        queue.async {
-            _ = self.status()                       // the answer while `queue` is busy, from the start
+        queue.async { [self] in
+            _ = status()                            // the answer while `queue` is busy, from the start
             LinkAnchor.down()                       // left over by a crashed qmid
-            self.proxyMirror = ProxyMirror(queue: self.queue) { [weak self] in self?.proxiesChanged() }
-            self.setUpSharing(removeStale: true)
-            self.watchArrivals()
-            self.watchPower()
-            self.openDevice()
+            proxyMirror = ProxyMirror(queue: queue) { [weak self] in self?.proxiesChanged() }
+            setUpSharing(removeStale: true)
+            watchArrivals()
+            watchPower()
+            openDevice()
         }
     }
 
@@ -305,7 +307,7 @@ public final class Manager {
     private var stopped = false                 // shutdown(): a device opened late is closed
 
     private func openDevice() {
-        reopenScheduled = false
+        reopenTimer.cancel()
         guard device == nil, !opening, !stopped else { return }
         opening = true
         // Right after an arrival the firmware may still be booting: wait for QMI on the open
@@ -354,20 +356,9 @@ public final class Manager {
                 log(String(format: "QMI answered after %.0f s%@", Date().timeIntervalSince(t0),
                            dev.syncIndicationAt != nil ? " (modem sent its Sync indication)" : ""))
             }
-            let wda = try dev.allocateClient(.wda)
-            let g = WDA.parseGranted(try wda.request(WDA.setDataFormat,
-                                                     WDA.Request(endpointInterface: UInt32(dev.modem.interfaceNumber)).tlvs))
-            if let problem = g.datapathProblem {
-                wda.release()
-                throw QMIHostError.transport("unusable data format: \(problem)")
-            }
-            dev.modem.batchUtunIO = batch
-            dev.modem.batchFallbackHandler = { [weak self] reason in
+            let (wda, g) = try dev.bringUpDatapath(batch: batch) { [weak self] reason in
                 self?.log("utun batching off: \(reason); using one system call per packet", level: .notice)
             }
-            try dev.modem.startDatapath(withDownlinkSize: UInt(g.downlinkMaxSize ?? 16384),
-                                        uplinkSize: UInt(g.uplinkMaxSize ?? 0),
-                                        uplinkDatagrams: UInt(g.uplinkMaxDatagrams ?? 0))
             return BroughtUp(device: dev, wda: wda, granted: g)
         } catch {
             // The interface is opened exclusively: a device that failed setup (e.g. Sync timing
@@ -399,7 +390,7 @@ public final class Manager {
         }
         let dev = up.device, g = up.granted
         device = dev
-        gnss = GNSSAssist(device: dev) { [weak self] s, level in self?.queue.async { self?.log(s, level: level) } }
+        gnss = GNSSAssist(device: dev) { [weak self] level, s in self?.queue.async { self?.log(s, level: level) } }
         dmsICCIDUnsupported = false             // may be a different modem
         outsideEdits = []
         outsideEditsHalted = false
@@ -425,7 +416,7 @@ public final class Manager {
             return openFailed(error)
         }
         ensureModemAutoconnectOff()
-        if let dms = try? dev.allocateClient(.dms) {
+        try? withDMS(dev) { dms in
             imei = (try? dms.request(DMS.getIDs, timeout: 5)).flatMap(DMS.parseIMEI)
             // A modem left in low power (airplane mode before qmid restarted, or AT+CFUN=4)
             // stays so; only a re-attach's own low power is undone (radioOff, below).
@@ -433,7 +424,6 @@ public final class Manager {
                 airplane = DMS.isLowPower(mode)
                 if airplane { log("modem radio is off (operating mode \(mode)): airplane mode", level: .notice) }
             }
-            dms.release()
         }
         if radioOff {
             // A re-attach was cut short by the reopen: bring the radio back.
@@ -447,7 +437,6 @@ public final class Manager {
         readAttach()
         startProfileCheck()
         for p in pdns where p.wanted { dial(p) }
-        gnssOpened = Date()
         applyLocation()                             // a session doesn't survive a modem reset: start anew
         // Once the modem has settled; sooner if a client is waiting for a fix.
         scheduleXTRACheck(in: wantedLocation != nil ? 5 : 60)
@@ -473,17 +462,10 @@ public final class Manager {
         if let until = fastReopenUntil, Date() < until { scheduleReopen(after: 3) } else { scheduleReopen(after: 30) }
     }
 
-    private var reopenGeneration = 0
-
-    private func scheduleReopen(after seconds: Double) {
-        guard !reopenScheduled else { return }
-        reopenScheduled = true
-        reopenGeneration += 1
-        let gen = reopenGeneration
-        queue.asyncAfter(deadline: .now() + seconds) {
-            guard gen == self.reopenGeneration else { return }   // superseded by an earlier reopen
-            self.openDevice()
-        }
+    // An open after `seconds`, unless one is due already; `replacing`: this one instead.
+    private func scheduleReopen(after seconds: Double, replacing: Bool = false) {
+        guard replacing || !reopenTimer.isScheduled else { return }
+        reopenTimer.schedule(on: queue, after: seconds) { [weak self] in self?.openDevice() }
     }
 
     // Unplug or modem reset: the utuns and services go, calls are gone with the modem.
@@ -491,28 +473,29 @@ public final class Manager {
         guard let dev = device, which == nil || which === dev else { return }
         log("modem went away", level: .notice)
         for p in pdns {
-            p.cancelRetry()
             if p.config.oneShot { p.wanted = false }
             teardown(p, stopCall: false, state: .idle, error: "modem went away", reason: .modemLost)
         }
         wda = nil
         control = nil
         nas = nil
+        servingIndications = false
         nrServingCells = []
         coexWatch = nil
         coexState = nil
-        if lastRadioEvent != nil { onEvent?([QMIDKey.type: QMIDEventType.radio] as NSDictionary) }
-        lastRadioEvent = nil
-        lastRadioKey = nil
+        radioTimer.cancel()
+        if sentEvents.removeValue(forKey: EventID(type: QMIDEventType.radio)) != nil {
+            onEvent?(QMIDEventDictionary.radio(nil))
+        }
         uimWatch = nil
         dmsWatch = nil
         gnss = nil
         dropLocationSession()                       // its client went with the modem; startLocation clients stay
-        xtraCheck?.cancel()
-        xtraCheck = nil
+        xtraCheck.cancel()
         xtraNext = nil
         airplane = false                            // read again when it comes back
         restarting = false
+        restartEnd.cancel()
         imei = nil
         card = nil
         imsi = nil
@@ -575,7 +558,7 @@ public final class Manager {
             scheduleRedial(p)
             return settle(p)
         }
-        p.cancelRetry()
+        p.retry.cancel()
         p.state = .dialing
         p.lastError = nil
         p.lastErrorDetail = nil
@@ -583,7 +566,7 @@ public final class Manager {
         p.ends = [:]
         p.dialStarted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         publishStatus(p)
-        let session = PDNSession(device: dev, config: p.pdnConfig, dataInterface: dev.modem.interfaceNumber)
+        let session = PDNSession(device: dev, config: p.pdnConfig)
         p.dialing = session
         muxBusy.insert(p.muxID)
         dialQueue.async { [weak self] in
@@ -595,7 +578,7 @@ public final class Manager {
 
     // Nothing to dial into yet: the PDN waits (a one-shot PDN stops instead).
     private func wait(_ p: PDNState, error: String, reason: QMIDReason) {
-        p.cancelRetry()
+        p.retry.cancel()
         if p.config.oneShot { return stopOneShot(p, error: error, reason: reason) }
         p.state = .waiting
         p.lastError = error
@@ -636,8 +619,7 @@ public final class Manager {
             p.ends = session.ends
             p.attempts = 0
             p.connectedAt = Date()
-            p.linkHold?.cancel()
-            p.linkHold = nil
+            p.linkHold.cancel()
             p.heldSettings = nil
             try publishService(p)
             log("\(p.config.name): \(kept ? "reconnected" : "connected") on \(utun.name) (\(p.policy.rawValue)) " +
@@ -736,21 +718,17 @@ public final class Manager {
     }
 
     private func armLinkHold(_ p: PDNState) {
-        p.linkHold?.cancel()
-        let item = DispatchWorkItem { [weak self, weak p] in
+        p.linkHold.schedule(on: queue, after: Self.linkHoldSeconds) { [weak self, weak p] in
             guard let self, let p, p.session == nil, let utun = p.utun else { return }
             self.log("\(p.config.name): not back within \(Int(Self.linkHoldSeconds)) s; removing \(utun.name)", level: .notice)
             self.releaseLink(p)
             self.publishStatus(p)
         }
-        p.linkHold = item
-        queue.asyncAfter(deadline: .now() + Self.linkHoldSeconds, execute: item)
     }
 
     // The utun and service of a PDN without a call (kept by dropped(), or torn down now).
     private func releaseLink(_ p: PDNState) {
-        p.linkHold?.cancel()
-        p.linkHold = nil
+        p.linkHold.cancel()
         p.heldSettings = nil
         publisher.remove(prefix: ServicePublisher.serviceKey(ServicePublisher.serviceID(for: p.config.name)))
         p.utun?.close()
@@ -761,7 +739,6 @@ public final class Manager {
     private func stopOneShot(_ p: PDNState, error: String, reason: QMIDReason, ends: [UInt8: WDS.CallEnd] = [:],
                              stopCall: Bool = true, detail: String? = nil) {
         p.wanted = false
-        p.cancelRetry()
         teardown(p, stopCall: stopCall, state: .idle, error: error, reason: reason, ends: ends)
         log("\(p.config.name): \(detail ?? error); down until the next connect (redial false)",
             level: reason == .maxUptime ? .notice : .error)
@@ -770,28 +747,24 @@ public final class Manager {
 
     // maxUptime: hang up after that long; connect on the connected PDN starts it again.
     private func armUptimeLimit(_ p: PDNState) {
-        p.uptimeLimit?.cancel()
-        p.uptimeLimit = nil
+        p.uptimeLimit.cancel()
         guard let limit = p.config.maxUptime else { return }
-        let item = DispatchWorkItem { [weak self, weak p] in
+        p.uptimeLimit.schedule(on: queue, after: TimeInterval(limit)) { [weak self, weak p] in
             guard let self, let p, p.state == .connected else { return }
             self.stopOneShot(p, error: "max uptime reached (\(limit) s)", reason: .maxUptime)
         }
-        p.uptimeLimit = item
-        queue.asyncAfter(deadline: .now() + .seconds(limit), execute: item)
     }
 
-    // PROBE: the modem's throttle state for a PDN whose calls came back throttled, raw, to learn
-    // the layout of 0x006C / 0x00D0 while a throttle is active.
+    // With debug logging on: the modem's throttle state for a PDN whose calls came back
+    // throttled, raw (the layout of 0x006C / 0x00D0 while a throttle is active).
     private func logThrottle(_ p: PDNState) {
-        guard let wds = control else { return }
+        guard debugEnabled(), let wds = control else { return }
         func dump(_ name: String, _ message: UInt16, _ tlvs: [TLV]) {
             do {
-                let r = try wds.request(message, tlvs, timeout: 5)
-                let body = r.tlvs.filter { $0.type != 0x02 }.map { String(format: "0x%02x[%d] ", $0.type, $0.value.count) + $0.value.hex }
-                log("\(p.config.name): probe \(name): " + (body.isEmpty ? "(no TLVs)" : body.joined(separator: " | ")), level: .notice)
+                let body = try wds.request(message, tlvs, timeout: 5).tlvDump()
+                log("\(p.config.name): \(name): " + (body.isEmpty ? "(no TLVs)" : body.joined(separator: " | ")), level: .debug)
             } catch {
-                log("\(p.config.name): probe \(name): \(error)", level: .notice)
+                log("\(p.config.name): \(name): \(error)", level: .debug)
             }
         }
         dump("PDN throttle info (3GPP)", WDS.getPDNThrottleInfo, [.u8(0x01, 0)])
@@ -831,20 +804,19 @@ public final class Manager {
 
     private func teardown(_ p: PDNState, stopCall: Bool, state: QMIDPDN.State, error: String?,
                           reason: QMIDReason? = nil, ends: [UInt8: WDS.CallEnd] = [:], keepLink: Bool = false) {
-        let cancelsDial = p.dialing != nil && !p.dialCancelled
-        if p.dialing != nil {
-            p.dialCancelled = true                  // dialed() stops its call
-            p.dialAgain = false
-        }
-        p.uptimeLimit?.cancel()
-        p.uptimeLimit = nil
+        // The attempt connect calls wait on ends here: a dial running, or one waiting for its mux.
+        let endsAttempt = (p.dialing != nil && !p.dialCancelled) || p.dialAgain
+        if p.dialing != nil { p.dialCancelled = true }   // dialed() stops its call
+        p.dialAgain = false
+        p.retry.cancel()
+        p.uptimeLimit.cancel()
         if let dev = device, p.utun != nil { dev.modem.detachMux(p.muxID) }
         if keepLink {
             p.heldSettings = p.session?.merged ?? p.heldSettings
         } else {
             releaseLink(p)
         }
-        p.snapshot.retry?.cancel()
+        p.snapshotRetry.cancel()
         p.snapshot = .init()
         p.qosState = PDNQoS.State()
         p.qos?.close(release: stopCall)
@@ -860,7 +832,7 @@ public final class Manager {
         p.ends = ends
         publishStatus(p)
         emitBearers(p)
-        if cancelsDial { settle(p) }
+        if endsAttempt { settle(p) }
     }
 
     // 2 s, 4 s, 8 s … capped at 5 min (PLAN.md §7). Permanent causes block instead
@@ -870,12 +842,10 @@ public final class Manager {
         p.attempts += 1
         let delay = min(300, pow(2, Double(min(p.attempts, 9))))
         log("\(p.config.name): \(p.lastErrorDetail ?? p.lastError ?? "down"); retry in \(Int(delay)) s", level: .notice)
-        let item = DispatchWorkItem { [weak self, weak p] in
+        p.retry.schedule(on: queue, after: delay) { [weak self, weak p] in
             guard let self, let p, p.wanted, self.device != nil else { return }
             self.dial(p)
         }
-        p.retry = item
-        queue.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func indication(_ m: QMIMessage, receivedAt: UInt64) {
@@ -930,7 +900,7 @@ public final class Manager {
             return
         }
         if m.service == .uim, m.messageID == UIM.statusChangeIndication {
-            if let c = (try? UIM.parseCardStatus(m)).flatMap(Self.mainCard) { cardChanged(c) }
+            if let c = (try? UIM.parseCardStatus(m)).flatMap(UIM.Card.main) { cardChanged(c) }
             return
         }
         if m.service == .nas, m.messageID == NAS.networkTimeIndication {
@@ -949,14 +919,14 @@ public final class Manager {
             return
         }
         if m.service == .wds, m.messageID == WDS.eventReport {
-            if let p = pdns.first(where: { $0.session?.clientIDs.contains(m.clientID) == true }),
+            if let p = pdn(client: m.clientID),
                let rat = WDS.parseBearerRAT(m) {
                 setBearerRAT(p, rat)
             }
             return
         }
         if m.service == .wds, m.messageID == WDS.ambrIndication {
-            if let p = pdns.first(where: { $0.session?.clientIDs.contains(m.clientID) == true }), p.qos != nil,
+            if let p = pdn(client: m.clientID), p.qos != nil,
                let a = WDS.parseAMBR(m), a != p.qosState.ambr {
                 p.qosState.ambr = a
                 if p.snapshot.running { p.snapshot.ambrSince = true }   // newer than the snapshot's read
@@ -967,17 +937,19 @@ public final class Manager {
         }
         guard m.service == .wds, m.messageID == WDS.getPacketServiceStatus,
               let s = WDS.parsePacketServiceStatus(m) else { return }
-        guard let p = pdns.first(where: { $0.session?.clientIDs.contains(m.clientID) == true }) else {
+        guard let p = pdn(client: m.clientID) else {
             if !muxBusy.isEmpty, heldIndications.count < 64 { heldIndications.append((m, receivedAt)) }
             return
         }
+        // Each family has its own WDS client, so each reports its own packet service.
+        let family = [UInt8(4), 6].first { p.session?.client(family: $0)?.id == m.clientID }
+        let name = p.config.name + (family.map { " ipv\($0)" } ?? "")
         guard receivedAt >= p.dialStarted else {
-            log("\(p.config.name): ignoring stale packet service \(s.connectionName) for reused client \(m.clientID)")
+            log("\(name): ignoring stale packet service \(s.connectionName) for reused client \(m.clientID)")
             return
         }
-        log("\(p.config.name): packet service \(s.connectionName)\(s.connection == 1 ? ", \(s.callEnd)" : "")\(s.reconfigurationRequired ? " (reconfiguration required)" : "")")
+        log("\(name): packet service \(s.connectionName)\(s.connection == 1 ? ", \(s.callEnd)" : "")\(s.reconfigurationRequired ? " (reconfiguration required)" : "")")
         if s.connection == 1, p.state == .connected {
-            let family = [UInt8(4), 6].first { p.session?.client(family: $0)?.id == m.clientID }
             dropped(p, stopCall: true, error: "dropped: \(s.callEnd.text)", detail: "dropped: \(s.callEnd)",
                     ends: family.map { [$0: s.callEnd] } ?? [:])
         } else if s.connection == 2, s.reconfigurationRequired, p.state == .connected {
@@ -1002,10 +974,13 @@ public final class Manager {
     // MARK: - Registration gate (NAS)
 
     private func startRegistrationWatch(_ dev: QMIDevice) {
+        // Without Serving System indications the client still serves NAS requests; dials go
+        // ungated, and a re-attach polls for the attach (reattachLTE).
         do {
             let n = try dev.allocateClient(.nas)
             nas = n
             try n.request(NAS.registerIndications, [NAS.servingSystemEvents])
+            servingIndications = true
             for t in [NAS.networkTimeEvents, NAS.operatorNameEvents, NAS.sysInfoEvents, NAS.nrBWPInfoEvents] + NAS.radioChangeEvents {
                 _ = try? n.request(NAS.registerIndications, [t])
             }
@@ -1067,8 +1042,8 @@ public final class Manager {
         let rats = s.radioInterfaces.map(NAS.ServingSystem.radioName).joined(separator: "+")
         serving = "\(s.registrationName), ps \(s.psAttached ? "attached" : "detached")\(rats.isEmpty ? "" : ", \(rats)")"
         // Indications may leave out the current PLMN (TLV 0x12) when it hasn't changed.
-        let current = s.registration != 1 ? nil : s.mcc.flatMap { mcc in s.mnc.map { (mcc: mcc, mnc: $0) } } ?? plmn
-        let plmnChanged = current?.mcc != plmn?.mcc || current?.mnc != plmn?.mnc
+        let current = s.registration != 1 ? nil : s.mcc.flatMap { mcc in s.mnc.map { PLMNID(mcc: mcc, mnc: $0) } } ?? plmn
+        let plmnChanged = current != plmn
         if plmnChanged {
             plmn = current
             resetPLMNNames()
@@ -1122,7 +1097,7 @@ public final class Manager {
         if let r = try? n.request(NAS.getOperatorNameData, timeout: 5) {
             if let nitz = NAS.parseNITZName(r) { plmnNITZ = nitz }
             plmnSPN = NAS.parseSPN(r)
-            plmnPNN = NAS.parseSIMPLMNName(r, mccmnc: mccmnc(p), home: isHome(p))
+            plmnPNN = NAS.parseSIMPLMNName(r, mccmnc: mccmnc(p), home: p.isHome(sim?.mccmnc))
         }
         readModemName()
         namesChanged()
@@ -1142,24 +1117,14 @@ public final class Manager {
         namesChanged()
     }
 
-    private func isHome(_ p: (mcc: UInt16, mnc: UInt16)) -> Bool {
-        guard let h = sim?.mccmnc, h.count >= 5 else { return false }
-        return Int(h.prefix(3)) == Int(p.mcc) && Int(h.dropFirst(3)) == Int(p.mnc)
-    }
-
-    // The SIM's spelling on its home network (3-digit MNCs below 100), else 2 digits below 100.
-    private func mccmnc(_ p: (mcc: UInt16, mnc: UInt16)) -> String {
-        if isHome(p), let h = sim?.mccmnc { return h }
-        return Self.mccmncString(p)
-    }
-
-    // 3-digit MNCs below 100 can't be told from 2-digit ones here: written with 2 digits.
-    static func mccmncString(_ p: (mcc: UInt16, mnc: UInt16)) -> String {
-        String(format: "%03d", p.mcc) + String(format: p.mnc > 99 ? "%03d" : "%02d", p.mnc)
+    // The SIM's spelling on its home network (3-digit MNCs below 100), else PLMNID's.
+    private func mccmnc(_ p: PLMNID) -> String {
+        if let h = sim?.mccmnc, p.isHome(h) { return h }
+        return p.mccmnc
     }
 
     private var shownName: NAS.NetworkName {
-        let spn = plmn.map(isHome) == true ? plmnSPN : nil
+        let spn = plmn?.isHome(sim?.mccmnc) == true ? plmnSPN : nil
         return NAS.NetworkName(longName: plmnNITZ?.longName ?? spn ?? plmnPNN?.longName ?? plmnModem?.longName,
                                shortName: plmnNITZ?.shortName ?? spn ?? plmnPNN?.shortName ?? plmnModem?.shortName)
     }
@@ -1202,18 +1167,12 @@ public final class Manager {
     private func plmnInfo() -> QMIDPLMN? {
         guard let p = plmn else { return nil }
         let n = shownName
-        var d = QMIDPLMN(mccmnc: Self.mccmncString(p), longName: n.longName, shortName: n.shortName,
+        var d = QMIDPLMN(mccmnc: p.mccmnc, longName: n.longName, shortName: n.shortName,
                          nameFromNetwork: plmnNITZ != nil)
         d.emergencyBearers = lteEmergency.bearers
         d.emergencyAccessBarred = lteEmergency.accessBarred
         d.roaming = roaming
         return d
-    }
-
-    private func plmnEvent() -> NSDictionary {
-        var d: [String: Any] = [QMIDKey.type: QMIDEventType.plmn]
-        d[QMIDKey.plmn] = plmnInfo()?.dictionary
-        return d as NSDictionary
     }
 
     // MARK: - SIM (per-SIM attach APN, config "carriers")
@@ -1226,21 +1185,20 @@ public final class Manager {
         guard let dev = device else { return false }
         readCard()
         var id = SIMIdentity()
-        if !dmsICCIDUnsupported, let dms = try? dev.allocateClient(.dms) {
+        if !dmsICCIDUnsupported {
             do {
-                id.iccid = DMS.parseICCID(try dms.request(DMS.uimGetICCID, timeout: 5))
+                id.iccid = try withDMS(dev) { DMS.parseICCID(try $0.request(DMS.uimGetICCID, timeout: 5)) }
             } catch QMIHostError.protocolError(let e, _) where e == .notSupported {
                 dmsICCIDUnsupported = true          // this firmware: UIM only
             } catch {}
-            dms.release()
         }
-        if id.iccid == nil, let uim = try? dev.allocateClient(.uim) {
-            id.iccid = (try? uim.request(UIM.readTransparent, UIM.readICCIDRequest, timeout: 5)).flatMap(UIM.parseICCID)
-            uim.release()
+        if id.iccid == nil {
+            id.iccid = try? withClient(.uim, dev, reuse: uimWatch) {
+                UIM.parseICCID(try $0.request(UIM.readTransparent, UIM.readICCIDRequest, timeout: 5))
+            }
         }
-        if let n = nas ?? (try? dev.allocateClient(.nas)) {
-            id.mccmnc = (try? n.request(NAS.getHomeNetwork, timeout: 5)).flatMap { try? NAS.parseHomeNetwork($0) }?.mccmnc
-            if n !== nas { n.release() }
+        id.mccmnc = try? withClient(.nas, dev, reuse: nas) {
+            try NAS.parseHomeNetwork(try $0.request(NAS.getHomeNetwork, timeout: 5)).mccmnc
         }
         guard id.iccid != nil || id.mccmnc != nil else { return false }
         if let p = pendingSIM, let arrived = id.arrival(of: p) {
@@ -1279,48 +1237,30 @@ public final class Manager {
         return true
     }
 
-    // The card a status reports for: the first present one, else the first.
-    static func mainCard(_ cards: [UIM.Card]) -> UIM.Card? { cards.first { $0.state == 1 } ?? cards.first }
-
     private func readCard() {
-        guard let dev = device, let uim = uimWatch ?? (try? dev.allocateClient(.uim)) else { return }
-        if let c = (try? uim.request(UIM.getCardStatus, timeout: 5)).flatMap({ try? UIM.parseCardStatus($0) }).flatMap(Self.mainCard) {
-            card = c
-        }
-        if uim !== uimWatch { uim.release() }
+        guard let dev = device else { return }
+        let cards = try? withClient(.uim, dev, reuse: uimWatch) { try UIM.parseCardStatus(try $0.request(UIM.getCardStatus, timeout: 5)) }
+        if let c = cards.flatMap(UIM.Card.main) { card = c }
     }
 
     // A card status indication: a card in or out, a PIN entered or blocked.
     private func cardChanged(_ c: UIM.Card) {
         guard c != card else { return }
         card = c
-        log("SIM card \(c.stateName)\(c.pin.map { ", pin \(Self.pinState($0.state).rawValue)" } ?? "")", level: .notice)
-        if c.state != 1 { imsi = nil; msisdn = nil }
+        log("SIM card \(c.stateName)\(c.pin.map { ", pin \($0.simState.rawValue)" } ?? "")", level: .notice)
+        if !c.isPresent { imsi = nil; msisdn = nil }
         if checkSIM() { reconcile("follow the SIM") } else { publishModem() }
     }
 
     // IMSI and MSISDN of the card in the modem: once per card, after its PIN is verified.
     private func readSIMDetails() {
         guard let dev = device, sim != nil, card?.isReady != false, imsi == nil else { return }
-        if let uim = uimWatch ?? (try? dev.allocateClient(.uim)) {
+        try? withClient(.uim, dev, reuse: uimWatch) { uim in
             imsi = (try? uim.request(UIM.readTransparent, UIM.readIMSIRequest, timeout: 5)).flatMap(UIM.parseIMSI)
             msisdn = (try? uim.request(UIM.readRecord, UIM.readMSISDNRequest, timeout: 5)).flatMap(UIM.parseMSISDN)
-            if uim !== uimWatch { uim.release() }
         }
-        if msisdn == nil, let dms = try? dev.allocateClient(.dms) {
-            msisdn = (try? dms.request(DMS.getMSISDN, timeout: 5)).flatMap(DMS.parseMSISDN)
-            dms.release()
-        }
-    }
-
-    static func pinState(_ s: UInt8) -> QMIDSIM.PINState {
-        switch s {
-        case 0, 3: return .disabled
-        case 1: return .required
-        case 2: return .verified
-        case 4: return .pukRequired
-        case 5: return .blocked
-        default: return .unknown
+        if msisdn == nil {
+            msisdn = try? withDMS(dev) { (try? $0.request(DMS.getMSISDN, timeout: 5)).flatMap(DMS.parseMSISDN) }
         }
     }
 
@@ -1361,9 +1301,9 @@ public final class Manager {
     private func simInfo(identities: Bool = true) -> QMIDSIM? {
         var d = QMIDSIM(mccmnc: sim?.mccmnc, iccidSuffix: sim?.iccidSuffix)
         if let c = card {
-            d.card = c.state == 0 ? .absent : c.state == 1 ? .present : .error
-            if let p = c.pin, c.state == 1 {
-                d.pin = Self.pinState(p.state)
+            d.card = c.simCardState
+            if let p = c.pin, c.isPresent {
+                d.pin = p.simState
                 d.pinRetries = Int(p.retries)
                 d.pukRetries = Int(p.pukRetries)
             }
@@ -1386,12 +1326,6 @@ public final class Manager {
         return d
     }
 
-    private func simEvent() -> NSDictionary {
-        var d: [String: Any] = [QMIDKey.type: QMIDEventType.sim]
-        d[QMIDKey.sim] = simInfo()?.dictionary
-        return d as NSDictionary
-    }
-
     // MARK: - Prepared SIM switch (prepareSIM / cancelSIM)
 
     // Before a client switches cards (eSIM profile switch): writes the attach profile for the
@@ -1401,7 +1335,7 @@ public final class Manager {
     public func prepareSIM(iccid raw: String, mccmnc: String?, owner: AnyHashable?) -> (NSDictionary?, String?) {
         guard config.carriers != nil else { return (nil, "no \"carriers\" in the config: the attach APN is the same for every SIM") }
         guard let iccid = ICCID.normalize(raw) else { return (nil, "bad iccid \"\(raw)\"") }
-        if let m = mccmnc, !(5...6).contains(m.count) || !m.allSatisfy(\.isNumber) { return (nil, "bad mccmnc \"\(m)\"") }
+        if let m = mccmnc, !SIMIdentity.isMCCMNC(m) { return (nil, "bad mccmnc \"\(m)\"") }
         guard device != nil, control != nil else { return (nil, "modem not ready") }
         let id = SIMIdentity(mccmnc: mccmnc, iccid: iccid)
         if iccid == sim?.iccid {
@@ -1536,8 +1470,7 @@ public final class Manager {
         }
         log("modem interfaces appeared; opening")
         fastReopenUntil = Date().addingTimeInterval(60)
-        reopenScheduled = false
-        scheduleReopen(after: 1)
+        scheduleReopen(after: 1, replacing: true)
     }
 
     // MARK: - Sleep / wake
@@ -1628,8 +1561,7 @@ public final class Manager {
 
     private func reopenNow() {
         deviceLost()
-        reopenScheduled = false
-        scheduleReopen(after: 1)
+        scheduleReopen(after: 1, replacing: true)
     }
 
     private func wakeCheck() {
@@ -1674,7 +1606,7 @@ public final class Manager {
         syncing = true
         defer { syncing = false }
         var changed: Set<UInt8> = []
-        var report: [ProfileSyncEntry] = []
+        var report: [QMIDProfileReport.PDN] = []
         profileSyncError = nil
         do {
             var profiles = try readProfiles(wds)
@@ -1688,7 +1620,7 @@ public final class Manager {
 
             for p in pdns {
                 var want = p.desiredProfile
-                var entry = ProfileSyncEntry(pdn: p.config.name)
+                var entry = QMIDProfileReport.PDN(pdn: p.config.name)
                 var wrote = false
                 func willWrite() {
                     lastSyncWrite = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -1763,7 +1695,7 @@ public final class Manager {
                         log("\(p.config.name): could not make profile \(i) the LTE attach profile: \(error)", level: .error)
                     }
                 }
-                if let i = index { claimed.insert(i); entry.profile = i; savedProfiles[p.config.name] = Int(i) }
+                if let i = index { claimed.insert(i); entry.profile = Int(i); savedProfiles[p.config.name] = Int(i) }
                 entry.attach = index == attachIndex
                 report.append(entry)
                 if wrote { profiles = (try? readProfiles(wds)) ?? profiles }
@@ -1796,7 +1728,7 @@ public final class Manager {
                 }
             }
             for i in report.indices {
-                report[i].settings = profiles.first { $0.index == report[i].profile }?.summary
+                report[i].settings = profiles.first { Int($0.index) == report[i].profile }?.summary
             }
         } catch {
             log("profile sync failed: \(error)", level: .error)
@@ -1809,7 +1741,7 @@ public final class Manager {
     // The attach APN changed: detach and re-attach so the default bearer uses it (DMS Set
     // Operating Mode: low power, then online). All PDNs drop and are redialed.
     private var lastReattach: Date?
-    private var reattachDeferred = false
+    private let reattachTimer = TimerSlot()  // a re-attach held back by the rate limit
     private var radioOff = false             // low power for a re-attach, online not sent yet
     private var radioReopened = false        // retryRadioOnline reopened the device this time
     private var reattachStarted: UInt64 = 0  // uptime ns; Serving System indications received earlier are stale
@@ -1817,10 +1749,8 @@ public final class Manager {
     // DMS Set Operating Mode online, ending a re-attach's low power (also when it was cut short
     // by a reopen or shutdown, so the modem isn't left offline).
     private func radioOnline(_ dev: QMIDevice) throws {
-        let dms = try dev.allocateClient(.dms)
-        defer { dms.release() }
         // NoEffect: already online (an earlier request took effect but its response was lost).
-        try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.online), timeout: 20, accept: [.noEffect])
+        try withDMS(dev) { try $0.request(DMS.setOperatingMode, DMS.operatingModeRequest(.online), timeout: 20, accept: [.noEffect]) }
         radioOff = false
         radioReopened = false
     }
@@ -1855,17 +1785,12 @@ public final class Manager {
         // held-back re-attach runs when the minute is up, so the last attach APN still applies.
         if let last = lastReattach, Date().timeIntervalSince(last) < 60 {
             let wait = 60 - Date().timeIntervalSince(last)
-            guard !reattachDeferred else { return }
-            reattachDeferred = true
+            guard !reattachTimer.isScheduled else { return }
             log("attach APN changed again \(Int(Date().timeIntervalSince(last))) s after the last re-attach; re-attaching in \(Int(wait.rounded(.up))) s", level: .notice)
-            queue.asyncAfter(deadline: .now() + wait) { [weak self] in
-                guard let self, self.reattachDeferred else { return }
-                self.reattachDeferred = false
-                self.reattachLTE()
-            }
+            reattachTimer.schedule(on: queue, after: wait) { [weak self] in self?.reattachLTE() }
             return
         }
-        reattachDeferred = false
+        reattachTimer.cancel()
         // In airplane mode the radio is off already; turning it on attaches with the new APN.
         guard !airplane else { return log("attach APN changed; it applies when airplane mode ends", level: .notice) }
         lastReattach = Date()
@@ -1873,10 +1798,8 @@ public final class Manager {
         log("attach APN changed; re-attaching (all PDNs drop briefly)", level: .notice)
         reattachStarted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         do {
-            let dms = try dev.allocateClient(.dms)
-            defer { dms.release() }
             radioOff = true
-            try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.lowPower), timeout: 20)
+            try withDMS(dev) { try $0.request(DMS.setOperatingMode, DMS.operatingModeRequest(.lowPower), timeout: 20) }
         } catch {
             log("re-attach failed: \(error)", level: .error)
             retryRadioOnline(dev) {}                // in case low power took effect after all
@@ -1890,7 +1813,7 @@ public final class Manager {
         // Online again in 2 s, without holding the queue meanwhile.
         queue.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.retryRadioOnline(dev) { [weak self] in
-                guard let self, self.nas == nil else { return }
+                guard let self, !self.servingIndications else { return }
                 // No registration indications: poll for the default bearer, but stop on the first
                 // unanswered request (the health check deals with a modem that stopped answering).
                 do {
@@ -2007,7 +1930,6 @@ public final class Manager {
         for p in pdns {
             guard let i = p.profileIndex, changed.contains(i) || before[p.config.name] != i else { continue }
             if p.state == .connected || p.state == .backoff {
-                p.cancelRetry()
                 dropped(p, stopCall: true, error: "profile changed", now: true)
             }
         }
@@ -2015,45 +1937,36 @@ public final class Manager {
 
     public func profiles() -> NSArray {
         guard let wds = control else { return [] }
-        var out: [[String: Any]] = []
+        var r = QMIDProfileReport(sim: QMIDProfileReport.simNotRead, pdns: profileReport, error: profileSyncError)
         if let sim {
-            var e: [String: Any] = ["sim": sim.description]
+            r.sim = sim.description
             if config.carriers != nil {
-                e["carrier"] = config.carrier(for: sim).map { "\($0.carrier.name) by \($0.matchedBy)" } ?? "no match"
+                r.carrier = config.carrier(for: sim).map { "\($0.carrier.name) by \($0.matchedBy)" } ?? "no match"
             }
-            if let apn = attach?.apn, !apn.isEmpty { e["attachAPN"] = apn + (attachFromNetwork ? " (chosen by the network)" : "") }
-            if let p = pendingSIM { e["pending"] = p.description }
-            out.append(e)
-        } else {
-            out.append(["sim": "not read yet"])
+            if let apn = attach?.apn, !apn.isEmpty { r.attachAPN = apn + (attachFromNetwork ? " (chosen by the network)" : "") }
+            r.pending = pendingSIM?.description
         }
-        out += profileReport.map(\.dictionary)
-        if let e = profileSyncError { out.append(["error": e]) }
-        if !learned.isEmpty {
-            out.append(["learned": learned.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value["apn"] ?? "")" }])
-        }
-        if let list = try? readProfiles(wds) {
-            out.append(["modem": list.map(\.summary)])
-        }
-        if let r = try? wds.request(WDS.getAutoconnectSettings), let a = WDS.parseAutoconnect(r) {
-            out.append(["autoconnect": a.description])
-        }
-        out.append(["attach": Int(attachProfileIndex(wds))])
-        return out as NSArray
+        r.learned = learned.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value["apn"] ?? "")" }
+        r.modemProfiles = (try? readProfiles(wds))?.map(\.summary)
+        r.autoconnect = (try? wds.request(WDS.getAutoconnectSettings)).flatMap(WDS.parseAutoconnect)?.description
+        r.attachProfile = Int(attachProfileIndex(wds))
+        return r.array
     }
 
     // The serving and neighbour cells, read now on the registration-watch NAS client. Each
     // message is optional (older firmware lacks some); a short timeout, as this runs on the
     // manager queue.
     public func radio(raw: Bool) -> (NSDictionary?, String?) {
-        guard let n = nas else { return (nil, "modem not ready") }
+        readRadio(raw: raw).map { ($0.dictionary, nil) } ?? (nil, "modem not ready")
+    }
+
+    private func readRadio(raw: Bool) -> QMIDRadio? {
+        guard let n = nas else { return nil }
         var lines: [String] = []
         func read(_ message: UInt16) -> QMIMessage? {
             do {
                 let r = try n.request(message, timeout: 2)
-                if raw {
-                    lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "0x%04x 0x%02x: ", message, $0.type) + $0.value.hex }
-                }
+                if raw { lines += r.tlvDump(prefix: String(format: "0x%04x ", message)) }
                 return r
             } catch {
                 if raw { lines.append(String(format: "0x%04x: ", message) + "\(error)") }
@@ -2061,31 +1974,23 @@ public final class Manager {
             }
         }
         // COEX for the NR bandwidth and the activated NR SCells: the last WWAN State indication,
-        // else asked now on a client of its own.
-        func coexLines(_ r: QMIMessage, _ label: String) {
-            if raw { lines += r.tlvs.filter { $0.type != 0x02 }.map { String(format: "coex %@ 0x%02x: ", label, $0.type) + $0.value.hex } }
-        }
-        var coexReply = coexState
-        if let r = coexReply {
-            coexLines(r, r.messageID == NAS.coexWWANStateIndication ? "0x0021" : "0x0022")
-        } else if let dev = device, let coex = try? dev.allocateClient(NAS.coexService) {
+        // else asked now.
+        var coex = coexState
+        if coex == nil, let dev = device {
             do {
-                let r = try coex.request(NAS.coexGetWWANState, timeout: 2)
-                coexLines(r, "0x0022")
-                coexReply = r
+                coex = try withClient(NAS.coexService, dev, reuse: coexWatch) { try $0.request(NAS.coexGetWWANState, timeout: 2) }
             } catch {
                 if raw { lines.append("coex 0x0022: \(error)") }
             }
-            coex.release()
         }
+        if raw, let r = coex { lines += r.tlvDump(prefix: String(format: "coex 0x%04x ", r.messageID)) }
         let info = NAS.radioCells(sysInfo: read(NAS.getSysInfo), cellLocation: read(NAS.getCellLocationInfo),
                                   signal: read(NAS.getSignalInfo), rfBand: read(NAS.getRFBandInfo),
-                                  ca: read(NAS.getLTECPHYCAInfo), coex: coexReply,
+                                  ca: read(NAS.getLTECPHYCAInfo), coex: coex,
                                   arfcnList: read(NAS.getARFCNList), nrServing: nrServingCells)
-        let radio = QMIDRadio(cells: info.cells.map(Self.cellInfo), endcAvailable: info.endcAvailable,
-                              lteRRC: info.lteRRC.flatMap(Self.lteRRC), nrRRC: info.nrRRC.flatMap(Self.nrRRC),
-                              raw: raw ? lines : nil)
-        return (radio.dictionary, nil)
+        return QMIDRadio(cells: info.cells.map(QMIDCell.init), endcAvailable: info.endcAvailable,
+                         lteRRC: info.lteRRC.flatMap(QMIDRRCState.init(lte:)), nrRRC: info.nrRRC.flatMap(QMIDRRCState.init(nr:)),
+                         raw: raw ? lines : nil)
     }
 
     // MARK: - GNSS assistance (XTRA)
@@ -2093,7 +1998,7 @@ public final class Manager {
     // On gnssQueue: a load takes a few seconds (60 parts, each acknowledged), and the modem's
     // other work goes on meanwhile. Replies come from that queue.
     public func xtra(_ reply: @escaping (NSDictionary?, String?) -> Void) {
-        guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
+        guard let g = gnss else { return reply(nil, notReady) }
         let add = xtraAnnotate
         gnssQueue.async {
             do { reply(add(try g.status()).dictionary, nil) } catch { reply(nil, "\(error)") }
@@ -2115,7 +2020,7 @@ public final class Manager {
     }
 
     public func loadXTRA(_ data: Data, _ reply: @escaping (NSDictionary?, String?) -> Void) {
-        guard let g = gnss else { return reply(nil, "modem not ready (\(deviceState.rawValue))") }
+        guard let g = gnss else { return reply(nil, notReady) }
         log("XTRA: loading \(data.count) bytes (client request)")
         let add = xtraAnnotate
         gnssQueue.async {
@@ -2133,22 +2038,11 @@ public final class Manager {
     // MARK: - XTRA updates (config "xtra")
 
     private func scheduleXTRACheck(in seconds: TimeInterval) {
-        xtraCheck?.cancel()
-        xtraCheck = nil
+        xtraCheck.cancel()
         xtraNext = nil
         guard config.xtraSettings.downloads, device != nil else { return }
-        let item = DispatchWorkItem { [weak self] in self?.runXTRACheck() }
-        xtraCheck = item
         xtraNext = Date().addingTimeInterval(seconds)
-        queue.asyncAfter(deadline: .now() + seconds, execute: item)
-    }
-
-    private enum XTRAOutcome {
-        case unsupported
-        case notDue(Date)
-        case loaded(QMIDXTRA, lastModified: String?, from: String)
-        case notNewer(String)
-        case failed(String)
+        xtraCheck.schedule(on: queue, after: seconds) { [weak self] in self?.runXTRACheck() }
     }
 
     // On gnssQueue: what the modem holds; if a load is due, download and load. The outcome is
@@ -2159,70 +2053,19 @@ public final class Manager {
         xtraState.use(modem: imei)
         let st = xtraState, maxAge = config.xtraSettings.maxAge, configured = config.xtraSettings.servers
         gnssQueue.async {
-            let outcome: XTRAOutcome
-            do {
-                let snap = try g.snapshot()
-                let now = Date()
-                let due = XTRASchedule.loadDue(validFrom: snap.validity?.start, unreadable: snap.unreadable, now: now,
-                                               maxAge: maxAge, notBefore: st.notBefore)
-                if !snap.supported {
-                    outcome = .unsupported
-                } else if due > now {
-                    outcome = .notDue(due)
-                } else {
-                    // Without usable data, any file will do: no If-Modified-Since.
-                    let since = snap.validity == nil ? nil : st.lastModified
-                    switch try XTRADownload.fetch(XTRADownload.servers(configured: configured, modem: snap.servers), since: since) {
-                    case .notModified(let host):
-                        outcome = .notNewer("not modified on \(host)")
-                    case .file(let bytes, let lm, let host):
-                        let lmDate = lm.flatMap(XTRASchedule.httpDate)
-                        if !snap.unreadable, !XTRASchedule.isNewer(lastModified: lmDate, than: snap.validity?.start) {
-                            outcome = .notNewer("\(host) has nothing newer (\(lm ?? "?"))")
-                        } else {
-                            outcome = .loaded(try g.load(bytes), lastModified: lm, from: host)
-                        }
-                    }
-                }
-            } catch {
-                outcome = .failed("\(error)")
-            }
+            let outcome = XTRAUpdater.check(state: st, maxAge: maxAge, configured: configured,
+                                            snapshot: g.snapshot, fetch: XTRADownload.fetch, load: g.load)
             self.queue.async { self.xtraChecked(outcome) }
         }
     }
 
-    private func xtraChecked(_ outcome: XTRAOutcome) {
+    private func xtraChecked(_ outcome: XTRAUpdater.Outcome) {
         xtraRunning = false
         let now = Date()
-        let maxAge = config.xtraSettings.maxAge
-        var next: Date?
-        switch outcome {
-        case .unsupported:
-            log("XTRA: not supported by this modem; no updates")
-        case .notDue(let due):
-            next = XTRASchedule.nextCheck(due: due, now: now)
-        case .loaded(let x, let lm, let host):
-            xtraState.lastModified = lm
-            xtraState.lastDownload = now
-            xtraState.failures = 0
-            xtraState.lastError = nil
-            xtraState.notBefore = nil
-            log("XTRA: updated from \(host)", level: .notice)
-            next = XTRASchedule.nextCheck(due: x.validFrom.map { $0.addingTimeInterval(maxAge) } ?? now, now: now)
-        case .notNewer(let why):
-            xtraState.notBefore = now.addingTimeInterval(XTRASchedule.notNewerDelay)
-            log("XTRA: \(why); asking again in 1 h")
-            next = xtraState.notBefore
-        case .failed(let e):
-            xtraState.failures += 1
-            xtraState.lastError = e
-            let delay = XTRASchedule.retryDelay(failures: xtraState.failures)
-            xtraState.notBefore = now.addingTimeInterval(delay)
-            log("XTRA: update failed (\(xtraState.failures) in a row): \(e); again in \(Int(delay / 60)) min", level: .error)
-            next = xtraState.notBefore
-        }
+        let r = XTRAUpdater.apply(outcome, to: &xtraState, now: now, maxAge: config.xtraSettings.maxAge)
+        if let l = r.log { log(l.message, level: l.level) }
         saveState()
-        if let next { scheduleXTRACheck(in: max(60, next.timeIntervalSince(now))) }
+        if let next = r.next { scheduleXTRACheck(in: max(60, next.timeIntervalSince(now))) }
     }
 
     // MARK: - Location (GNSS sessions for client apps)
@@ -2266,18 +2109,14 @@ public final class Manager {
     // `release`: the hold is over. A session whose last client left keeps running for a while:
     // a client that stops and starts again (seen: 1 s apart) would otherwise lose the search.
     private func applyLocation(restart: Bool = false, release: Bool = false) {
-        gnssRetry?.cancel()
-        gnssRetry = nil
+        gnssRetry.cancel()
         let want = wantedLocation
         if want != nil || release {
-            gnssHold?.cancel()
-            gnssHold = nil
+            gnssHold.cancel()
         } else if device != nil, gnssSession != nil, gnssApplied != nil {
-            if gnssHold == nil {
+            if !gnssHold.isScheduled {
                 log(String(format: "location: no clients; keeping the session for %.0f s", Self.gnssHoldTime))
-                let hold = DispatchWorkItem { [weak self] in self?.applyLocation(release: true) }
-                gnssHold = hold
-                queue.asyncAfter(deadline: .now() + Self.gnssHoldTime, execute: hold)
+                gnssHold.schedule(on: queue, after: Self.gnssHoldTime) { [weak self] in self?.applyLocation(release: true) }
             }
             return emitGNSS()
         }
@@ -2286,7 +2125,7 @@ public final class Manager {
         let session = gnssSession ?? makeLocationSession(dev)
         gnssSession = session
         let fresh = gnssApplied == nil && want != nil && !restart
-        if gnssApplied == nil, want != nil { gnssStarted = Date() }
+        if gnssApplied == nil, want != nil { gnssStarted = Date(); assistPosition = nil }
         gnssApplied = want
         if fresh { scheduleXTRACheck(in: 0) }           // old or missing data would slow this search
         session.apply(want, restart: restart, beforeStart: fresh ? beforeStart() : nil) { [weak self] err in
@@ -2297,15 +2136,15 @@ public final class Manager {
                     self.gnssApplied = nil
                     self.gnssSession = nil          // a new client next time
                     if self.wantedLocation != nil {
-                        let retry = DispatchWorkItem { [weak self] in self?.applyLocation() }
-                        self.gnssRetry = retry
-                        self.queue.asyncAfter(deadline: .now() + 10, execute: retry)
+                        self.gnssRetry.schedule(on: self.queue, after: 10) { [weak self] in self?.applyLocation() }
                     }
                 } else if want == nil, self.wantedLocation == nil {
                     self.gnssSession = nil
                     self.gnssEngine = false
                     self.gnssStarted = nil
                     self.suplAwaitingPLMN = false
+                    self.suplArea = nil
+                    self.suplRecheck.cancel()
                     self.log("location: session stopped")
                 } else if let want, restart || self.gnssEngine != true {
                     self.log("location: session running (\(want.interval) ms)")
@@ -2338,18 +2177,17 @@ public final class Manager {
                 self.lastFix = Date()
             }
             self.engineSeen()
-            let ev: NSDictionary = [QMIDKey.type: QMIDEventType.location, QMIDKey.location: l.dictionary]
+            let ev = QMIDEventDictionary.location(l)
             self.locationClients.values.forEach { $0.sink(ev) }
         }
         s.onSatellites = { [weak self] sats in
             guard let self else { return }
             self.engineSeen()
-            let ev = NSMutableDictionary(dictionary: sats.dictionary)
-            ev[QMIDKey.type] = QMIDEventType.satellites
+            let ev = QMIDEventDictionary.satellites(sats)
             self.locationClients.values.filter(\.want.satellites).forEach { $0.sink(ev) }
         }
         s.onNMEA = { [weak self] n in
-            let ev: NSDictionary = [QMIDKey.type: QMIDEventType.nmea, QMIDKey.nmea: n]
+            let ev = QMIDEventDictionary.nmea(n)
             self?.locationClients.values.filter(\.want.nmea).forEach { $0.sink(ev) }
         }
         s.onEngine = { [weak self] on in
@@ -2386,7 +2224,7 @@ public final class Manager {
 
     // The Mac's clock to the modem. Its own clock can be hours off (seen: 12 h, flagged unknown),
     // and it then searches without using XTRA. The engine is free to keep a better time.
-    private static func injectTime(_ client: QMIClient, log: (QMIDLogLevel, String) -> Void) {
+    private static func injectTime(_ client: QMIClient, log: LogSink) {
         do {
             let ind = try client.requestIndication(LOC.injectUTCTime, LOC.injectUTCTimeRequest(Date(), uncertaintyMs: 500),
                                                    timeout: 5, indicationTimeout: 5)
@@ -2405,7 +2243,10 @@ public final class Manager {
     // running (`running`), on that queue as soon as it's free. It reads the serving LTE cell,
     // asks the SUPL server over the Mac's default route and injects the answer. Any failure:
     // the session goes on without it.
-    private func startingPosition(running: Bool = false) -> ((QMIClient) -> Void)? {
+    // recheck: the 10-min look while there's no fix; asks only if the serving cell is in another
+    // area (PLMN or TAC) than the last injected position's. Into a running session (running),
+    // only an injected position replaces the status and first-fix bookkeeping of the last one.
+    private func startingPosition(running: Bool = false, recheck: Bool = false) -> ((QMIClient) -> Void)? {
         let s = config.suplSettings
         guard s.on else {
             log("location: SUPL starting position off (config supl.enabled false)")
@@ -2419,6 +2260,7 @@ public final class Manager {
             log("location: no SUPL starting position: \(why)")
             gnssAssist = QMIDGNSSAssist(time: Date(), result: .skipped, server: server, error: why)
             emitGNSS()
+            armSUPLRecheck()
             return nil
         }
         guard let p = plmn else {
@@ -2429,30 +2271,39 @@ public final class Manager {
         guard let nas else { return skip("no NAS client") }
         let mm = mccmnc(p)
         let mcc = String(mm.prefix(3)), mnc = String(mm.dropFirst(3))
+        let known = suplArea
+        let session = gnssStarted                // a reply for an earlier session is dropped
+        // Straight to the log sink (thread-safe, as the QMI trace): times as they happen.
+        let sink = logSink
         return { [weak self] client in
             let started = Date()
-            // Straight to the log sink (thread-safe, as the QMI trace): times as they happen.
-            let sink = self?.logSink
-            func log(_ s: String, _ level: QMIDLogLevel = .info) { sink?(level, s) }
-            func done(_ a: QMIDGNSSAssist, _ position: (Double, Double)? = nil) {
+            func log(_ s: String, _ level: QMIDLogLevel = .info) { sink(level, s) }
+            // nil: nothing asked (a recheck in the same area). Every outcome arms the next recheck.
+            func done(_ a: QMIDGNSSAssist?, _ position: (Double, Double)? = nil, cell: SUPL.Cell? = nil) {
                 self?.queue.async {
-                    guard let self else { return }
-                    self.gnssAssist = a
-                    self.assistPosition = position.map { (latitude: $0.0, longitude: $0.1) }
-                    self.emitGNSS()
+                    guard let self, self.gnssStarted == session else { return }
+                    if let a, !running || a.result == .injected {
+                        self.gnssAssist = a
+                        self.assistPosition = position.map { (latitude: $0.0, longitude: $0.1) }
+                        if a.result == .injected { self.suplArea = cell }
+                        self.emitGNSS()
+                    }
+                    self.armSUPLRecheck()
                 }
             }
-            let reply = try? nas.request(NAS.getCellLocationInfo, timeout: 2)
-            let serving = NAS.radioCells(sysInfo: nil, cellLocation: reply, signal: nil, rfBand: nil, ca: nil)
-                .cells.first { $0.rat == .lte && $0.role == .primary }
-            guard let c = serving, let eci = c.cellID, eci < 1 << 28, let tac = c.tac, let pci = c.pci else {
+            guard let cell = Self.suplCell(nas, mcc: mcc, mnc: mnc) else {
+                if recheck { return done(nil) }
                 log("location: no SUPL starting position: no LTE serving cell (SUPL here knows LTE cells only)")
                 return done(QMIDGNSSAssist(time: started, result: .skipped, server: server, error: "no LTE serving cell"))
             }
-            let cell = SUPL.Cell(mcc: mcc, mnc: mnc, cellID: UInt32(eci), tac: UInt16(truncatingIfNeeded: tac), pci: pci)
+            if recheck {
+                if let k = known, Self.sameArea(k, cell) { return done(nil) }
+                log(known.map { "location: no fix yet and the cell is in another area (\($0.mcc)-\($0.mnc) tac \($0.tac) → "
+                                + "\(cell.mcc)-\(cell.mnc) tac \(cell.tac))" } ?? "location: no fix yet and no SUPL position so far")
+            }
             log("location: asking \(server) for a starting position (cell \(cell.description))")
             do {
-                let ref = try SUPL.query(host: ep.host, port: ep.port, cell: cell, timeout: 8) { log($0) }
+                let ref = try SUPL.query(host: ep.host, port: ep.port, cell: cell, timeout: 8, log: sink)
                 let took = Date().timeIntervalSince(started)
                 // At least 1.5 km: the server's figure is for the cell, and the Mac may be moving.
                 let unc = max(ref.semiMajor, 1500).rounded()
@@ -2466,7 +2317,7 @@ public final class Manager {
                                        cell: cell.description, uncertainty: unc, duration: (took * 100).rounded() / 100)
                 if st == .success {
                     log(String(format: "location: injected the SUPL starting position (±%.0f m) %@", unc, when), .notice)
-                    done(a, (ref.latitude, ref.longitude))
+                    done(a, (ref.latitude, ref.longitude), cell: cell)
                 } else {
                     a.error = "modem: \(st.map { "\($0)" } ?? "no status")"
                     log("location: the modem refused the SUPL position (\(a.error!)); \(without)", .error)
@@ -2491,6 +2342,34 @@ public final class Manager {
         if let step = startingPosition(running: true) { session.withClient(step) }
     }
 
+    // The LTE serving cell as SUPL names it; nil without one (SUPL here knows LTE cells only).
+    static func suplCell(_ nas: QMIClient, mcc: String, mnc: String) -> SUPL.Cell? {
+        let reply = try? nas.request(NAS.getCellLocationInfo, timeout: 2)
+        let serving = NAS.radioCells(sysInfo: nil, cellLocation: reply, signal: nil, rfBand: nil, ca: nil)
+            .cells.first { $0.rat == .lte && $0.role == .primary }
+        guard let c = serving, let eci = c.cellID, eci < 1 << 28, let tac = c.tac, let pci = c.pci else { return nil }
+        return SUPL.Cell(mcc: mcc, mnc: mnc, cellID: UInt32(eci), tac: UInt16(truncatingIfNeeded: tac), pci: pci)
+    }
+
+    // While location runs without a fix, every 10 min: the Mac may have moved (e.g. asleep) to
+    // another area than the last SUPL position's, so its serving cell is looked at again
+    // (startingPosition(recheck:)). Armed after each SUPL attempt; a fix ends it.
+    private func armSUPLRecheck() {
+        guard gnssSession != nil, gnssApplied != nil, noFixYet else { return suplRecheck.cancel() }
+        suplRecheck.schedule(on: queue, after: 600) { [weak self] in
+            guard let self, let session = self.gnssSession, self.gnssApplied != nil, self.noFixYet,
+                  self.config.suplSettings.on else { return }
+            // Not registered or no NAS client for now: look again in 10 min.
+            guard self.device != nil, self.plmn != nil, self.nas != nil,
+                  let step = self.startingPosition(running: true, recheck: true) else { return self.armSUPLRecheck() }
+            session.withClient(step)
+        }
+    }
+
+    private var noFixYet: Bool { gnssStarted.map { s in lastFix.map { $0 < s } ?? true } ?? false }
+
+    static func sameArea(_ a: SUPL.Cell, _ b: SUPL.Cell) -> Bool { a.mcc == b.mcc && a.mnc == b.mnc && a.tac == b.tac }
+
     static func distance(_ lat1: Double, _ lon1: Double, _ lat2: Double, _ lon2: Double) -> Double {
         let r = 6_371_000.0, p1 = lat1 * .pi / 180, p2 = lat2 * .pi / 180
         let dp = p2 - p1, dl = (lon2 - lon1) * .pi / 180
@@ -2500,15 +2379,15 @@ public final class Manager {
 
     // The modem went away: its LOC client with it. Clients stay; the next open starts again.
     private func dropLocationSession() {
-        gnssRetry?.cancel()
-        gnssRetry = nil
-        gnssHold?.cancel()
-        gnssHold = nil
+        gnssRetry.cancel()
+        gnssHold.cancel()
         gnssSession = nil
         gnssApplied = nil
         gnssEngine = nil
         gnssStarted = nil
         suplAwaitingPLMN = false
+        suplArea = nil
+        suplRecheck.cancel()
         emitGNSS()
     }
 
@@ -2520,22 +2399,20 @@ public final class Manager {
     }
 
     // Without lastFix, which changes every second while running.
-    private func gnssEvent() -> NSDictionary {
-        [QMIDKey.type: QMIDEventType.gnss, QMIDKey.gnss: gnssInfo(withLastFix: false).dictionary]
-    }
+    private func gnssEvent() -> NSDictionary { QMIDEventDictionary.gnss(gnssInfo(withLastFix: false)) }
 
-    private func emitGNSS() { emitIfChanged(gnssEvent(), &lastGNSSEvent) }
+    private func emitGNSS() { emit(gnssEvent()) }
 
     // MARK: - Airplane mode, restart, bands
 
     public func setAirplaneMode(_ on: Bool) -> String? {
-        guard let dev = device else { return "modem not ready (\(deviceState.rawValue))" }
+        guard let dev = device else { return notReady }
         guard !radioOff else { return "a re-attach is in progress; try again in a few seconds" }
         do {
-            let dms = try dev.allocateClient(.dms)
-            defer { dms.release() }
-            try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(on ? .lowPower : .online), timeout: 20,
-                            accept: [.noEffect])
+            try withDMS(dev) {
+                try $0.request(DMS.setOperatingMode, DMS.operatingModeRequest(on ? .lowPower : .online), timeout: 20,
+                               accept: [.noEffect])
+            }
         } catch {
             return "\(error)"
         }
@@ -2558,28 +2435,34 @@ public final class Manager {
     }
 
     public func restartModem() -> String? {
-        guard let dev = device else { return "modem not ready (\(deviceState.rawValue))" }
+        guard let dev = device else { return notReady }
         restarting = true
         // Ends when the modem goes away (deviceLost), or after 2 minutes if it never does.
-        queue.asyncAfter(deadline: .now() + 120) { [weak self] in self?.restarting = false }
+        restartEnd.schedule(on: queue, after: 120) { [weak self] in self?.restarting = false }
         do {
-            let dms = try dev.allocateClient(.dms)
-            defer { dms.release() }
-            try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.offline), timeout: 20, accept: [.noEffect])
-            // The modem resets right away; its answer may not make it out.
-            _ = try? dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.reset), timeout: 5)
+            try withDMS(dev) { dms in
+                try dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.offline), timeout: 20, accept: [.noEffect])
+                // The modem resets right away; its answer may not make it out.
+                _ = try? dms.request(DMS.setOperatingMode, DMS.operatingModeRequest(.reset), timeout: 5)
+            }
         } catch {
             restarting = false
+            restartEnd.cancel()
             return "\(error)"
         }
         log("modem restart requested", level: .notice)
         return nil
     }
 
+    // MARK: Band and mode preference (NAS System Selection Preference)
+
+    // What qmid first changes is kept as the modem had it (bandsBefore, modesBefore; state.json),
+    // so a reset puts it back.
+
     public func bandPreference() -> (NSDictionary?, String?) {
         guard let n = nas else { return (nil, "modem not ready") }
         do {
-            let p = NAS.parseBandPreference(try n.request(NAS.getSystemSelectionPreference, timeout: 5))
+            let p = try selection(n)
             let caps = bandCapabilities()
             return (QMIDBandPreference(modes: p.modes, lteBands: p.lte, nrNSABands: p.nrNSA, nrSABands: p.nrSA,
                                        supportedLTEBands: caps.lte, supportedNRBands: caps.nr,
@@ -2589,10 +2472,19 @@ public final class Manager {
         }
     }
 
+    private func selection(_ n: QMIClient) throws -> NAS.BandPreference {
+        NAS.parseBandPreference(try n.request(NAS.getSystemSelectionPreference, timeout: 5))
+    }
+
     private func bandCapabilities() -> (lte: [Int], nr: [Int]) {
-        guard let dev = device, let dms = try? dev.allocateClient(.dms) else { return ([], []) }
-        defer { dms.release() }
-        return (try? dms.request(DMS.getBandCapabilities, timeout: 5)).map(DMS.parseBandCapabilities) ?? ([], [])
+        guard let dev = device else { return ([], []) }
+        return (try? withDMS(dev) { try DMS.parseBandCapabilities($0.request(DMS.getBandCapabilities, timeout: 5)) }) ?? ([], [])
+    }
+
+    // The technologies this modem has (DMS Get Capabilities), as mode names; [] when unknown.
+    private func modeCapabilities() -> [String] {
+        guard let dev = device else { return [] }
+        return (try? withDMS(dev) { try DMS.parseModeCapabilities($0.request(DMS.getCapabilities, timeout: 5)) }) ?? []
     }
 
     // nil lists stay as they are. Refused: an empty list, or a band the modem doesn't support.
@@ -2606,58 +2498,30 @@ public final class Manager {
             let bad = list.filter { !supported.isEmpty && !supported.contains($0) }
             if !bad.isEmpty { return "\(name): not supported by this modem: \(bad.map(String.init).joined(separator: ", "))" }
         }
-        // The setting before qmid's first change, for resetBandPreference.
         if bandsBefore == nil {
-            guard let r = try? n.request(NAS.getSystemSelectionPreference, timeout: 5) else {
-                return "couldn't read the current band preference (needed to reset it later)"
-            }
-            let p = NAS.parseBandPreference(r)
+            guard let p = try? selection(n) else { return Self.unreadable("band") }
             bandsBefore = ["lte": p.lte, "nsa": p.nrNSA, "sa": p.nrSA]
             saveState()
         }
         return writeBands(n, lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent)
     }
 
-    private func writeBands(_ n: QMIClient, lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> String? {
-        do {
-            try n.request(NAS.setSystemSelectionPreference,
-                          NAS.bandPreferenceRequest(lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent), timeout: 10)
-        } catch {
-            return "\(error)"
-        }
-        func show(_ l: [Int]?) -> String { l.map { $0.map(String.init).joined(separator: ",") } ?? "unchanged" }
-        log("band preference set (\(persistent ? "persistent" : "until restart")): lte \(show(lte)), nr nsa \(show(nrNSA)), nr sa \(show(nrSA))",
-            level: .notice)
-        return nil
-    }
-
     // Back to the setting qmid found before its first change (written as it was, unchecked:
     // the modem's own default may list bands it doesn't report as supported); without one,
-    // every supported band.
+    // every supported band (not through setBandPreference: that would keep the current
+    // setting as the one to reset to, and the next reset would undo this one).
     public func resetBandPreference(persistent: Bool) -> String? {
-        if let b = bandsBefore {
-            guard let n = nas else { return "modem not ready" }
-            func list(_ k: String) -> [Int]? { b[k].flatMap { $0.isEmpty ? nil : $0 } }
-            if let err = writeBands(n, lte: list("lte"), nrNSA: list("nsa"), nrSA: list("sa"), persistent: persistent) { return err }
-            bandsBefore = nil
-            saveState()
-            log("band preference back to the setting before qmid changed it", level: .notice)
-            return nil
-        }
-        // Not through setBandPreference: that would save the current setting as the one to
-        // reset to, and the next reset would undo this one.
         guard let n = nas else { return "modem not ready" }
+        if let b = bandsBefore {
+            func list(_ k: String) -> [Int]? { b[k].flatMap { $0.isEmpty ? nil : $0 } }
+            return restored("band", writeBands(n, lte: list("lte"), nrNSA: list("nsa"), nrSA: list("sa"), persistent: persistent)) {
+                bandsBefore = nil
+            }
+        }
         let caps = bandCapabilities()
         guard !caps.lte.isEmpty || !caps.nr.isEmpty else { return "the modem didn't report its supported bands" }
         let nr = caps.nr.isEmpty ? nil : caps.nr
         return writeBands(n, lte: caps.lte.isEmpty ? nil : caps.lte, nrNSA: nr, nrSA: nr, persistent: persistent)
-    }
-
-    // The technologies this modem has (DMS Get Capabilities), as mode names; [] when unknown.
-    private func modeCapabilities() -> [String] {
-        guard let dev = device, let dms = try? dev.allocateClient(.dms) else { return [] }
-        defer { dms.release() }
-        return (try? dms.request(DMS.getCapabilities, timeout: 5)).map(DMS.parseModeCapabilities) ?? []
     }
 
     // Restricts the technologies (QMIDBandPreference.modes names; e.g. ["lte"] for LTE only).
@@ -2672,105 +2536,71 @@ public final class Manager {
         let supported = modeCapabilities()
         let missing = modes.filter { !supported.isEmpty && !supported.contains($0) }
         if !missing.isEmpty { return "not supported by this modem: \(missing.joined(separator: ", "))" }
-        // The setting before qmid's first change, for resetModePreference.
         if modesBefore == nil {
-            guard let r = try? n.request(NAS.getSystemSelectionPreference, timeout: 5) else {
-                return "couldn't read the current mode preference (needed to reset it later)"
-            }
-            modesBefore = NAS.parseBandPreference(r).modes
+            guard let p = try? selection(n) else { return Self.unreadable("mode") }
+            modesBefore = p.modes
             saveState()
         }
         return writeModes(n, modes, persistent: persistent)
     }
 
-    private func writeModes(_ n: QMIClient, _ modes: [String], persistent: Bool) -> String? {
-        guard let tlvs = NAS.modePreferenceRequest(modes, persistent: persistent) else { return "unknown mode" }
-        do { try n.request(NAS.setSystemSelectionPreference, tlvs, timeout: 10) } catch { return "\(error)" }
-        log("mode preference set (\(persistent ? "persistent" : "until restart")): \(modes.joined(separator: ", "))", level: .notice)
-        return nil
-    }
-
-    // Back to the modes qmid found before its first change; without them, every mode the modem
-    // has (not through setModePreference, which would save the current setting to reset to).
+    // Back to the modes qmid found before its first change; without them (or when the modem
+    // reported none), every mode the modem has, as resetBandPreference.
     public func resetModePreference(persistent: Bool) -> String? {
         guard let n = nas else { return "modem not ready" }
         if let m = modesBefore, !m.isEmpty {
-            if let err = writeModes(n, m, persistent: persistent) { return err }
-            modesBefore = nil
-            saveState()
-            log("mode preference back to the setting before qmid changed it", level: .notice)
-            return nil
+            return restored("mode", writeModes(n, m, persistent: persistent)) { modesBefore = nil }
         }
         let supported = modeCapabilities()
         guard !supported.isEmpty else { return "the modem didn't report its technologies" }
-        return writeModes(n, supported, persistent: persistent)
-    }
-
-    // Get ARFCN List RRC states (NAS IDL enums) as QMIDRRCState.
-    static func lteRRC(_ v: UInt32) -> QMIDRRCState? {
-        switch v {
-        case 1, 2, 7: return .idle
-        case 3: return .connecting
-        case 4: return .connected
-        case 5: return .releasing
-        case 6: return .inactive
-        case 8: return .suspended
-        default: return nil
+        let error = writeModes(n, supported, persistent: persistent)
+        if error == nil, modesBefore != nil {
+            modesBefore = nil                       // none to go back to: read again at the next change
+            saveState()
         }
+        return error
     }
 
-    static func nrRRC(_ v: UInt32) -> QMIDRRCState? {
-        [0: .idle, 1: .connected, 2: .inactive][v]
+    private static func unreadable(_ what: String) -> String {
+        "couldn't read the current \(what) preference (needed to reset it later)"
+    }
+
+    private func writeBands(_ n: QMIClient, lte: [Int]?, nrNSA: [Int]?, nrSA: [Int]?, persistent: Bool) -> String? {
+        func show(_ l: [Int]?) -> String { l.map { $0.map(String.init).joined(separator: ",") } ?? "unchanged" }
+        return writeSelection(n, NAS.bandPreferenceRequest(lte: lte, nrNSA: nrNSA, nrSA: nrSA, persistent: persistent),
+                              persistent: persistent, "band", "lte \(show(lte)), nr nsa \(show(nrNSA)), nr sa \(show(nrSA))")
+    }
+
+    private func writeModes(_ n: QMIClient, _ modes: [String], persistent: Bool) -> String? {
+        guard let tlvs = NAS.modePreferenceRequest(modes, persistent: persistent) else { return "unknown mode" }
+        return writeSelection(n, tlvs, persistent: persistent, "mode", modes.joined(separator: ", "))
+    }
+
+    private func writeSelection(_ n: QMIClient, _ tlvs: [TLV], persistent: Bool, _ what: String, _ detail: String) -> String? {
+        do { try n.request(NAS.setSystemSelectionPreference, tlvs, timeout: 10) } catch { return "\(error)" }
+        log("\(what) preference set (\(persistent ? "persistent" : "until restart")): \(detail)", level: .notice)
+        return nil
+    }
+
+    // A reset to the setting kept before qmid's first change: once written, it is forgotten.
+    private func restored(_ what: String, _ error: String?, forget: () -> Void) -> String? {
+        if let error { return error }
+        forget()
+        saveState()
+        log("\(what) preference back to the setting before qmid changed it", level: .notice)
+        return nil
     }
 
     // MARK: - Radio events
 
     // A radio indication came: read the radio once things settle (indications come in bursts).
+    // Pushed when what QMIDRadio.eventKey compares changed.
     private func scheduleRadioEvent() {
-        guard !radioPending else { return }
-        radioPending = true
-        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
-            self.radioPending = false
-            guard self.nas != nil, let d = self.radio(raw: false).0 else { return }
-            let key = Self.radioKey(d)
-            guard key != self.lastRadioKey else { return }
-            self.lastRadioKey = key
-            let ev = [QMIDKey.type: QMIDEventType.radio, QMIDKey.radio: d] as NSDictionary
-            self.lastRadioEvent = ev
-            self.onEvent?(ev)
+        guard !radioTimer.isScheduled else { return }
+        radioTimer.schedule(on: queue, after: 0.3) { [weak self] in
+            guard let self, let r = self.readRadio(raw: false) else { return }
+            self.emit(QMIDEventDictionary.radio(r), comparedOn: QMIDRadio.eventKey(r.dictionary))
         }
-    }
-
-    // What a radio event is pushed for: the serving cells without their signal, EN-DC and the
-    // RRC states. Signal and neighbours change all the time.
-    static func radioKey(_ d: NSDictionary) -> NSDictionary {
-        let signal: Set<String> = [QMIDKey.rsrp, QMIDKey.rsrq, QMIDKey.rssi, QMIDKey.snr]
-        let serving = (d[QMIDKey.cells] as? [NSDictionary] ?? [])
-            .filter { $0[QMIDKey.role] as? String != QMIDCell.Role.neighbor.rawValue }
-            .map { c in (c as? [String: Any] ?? [:]).filter { !signal.contains($0.key) } as NSDictionary }
-        var k: [String: Any] = [QMIDKey.cells: serving]
-        for key in [QMIDKey.endcAvailable, QMIDKey.lteRRC, QMIDKey.nrRRC] { k[key] = d[key] }
-        return k as NSDictionary
-    }
-
-    static func cellInfo(_ c: NAS.Cell) -> QMIDCell {
-        var q = QMIDCell(rat: c.rat == .lte ? .lte : .nr,
-                         role: c.role == .primary ? .primary : c.role == .secondary ? .secondary : .neighbor)
-        q.channel = c.channel.map(Int.init)
-        q.band = c.band ?? q.channel.flatMap { QMIDCell.band(q.rat, channel: $0) }   // the modem's, else from the channel
-        q.pci = c.pci.map(Int.init)
-        q.cellID = c.cellID
-        q.tac = c.tac.map(Int.init)
-        q.bandwidth = c.bandwidthMHz
-        q.rsrp = c.rsrp
-        q.rsrq = c.rsrq
-        q.rssi = c.rssi
-        q.snr = c.snr
-        q.active = c.active
-        q.scellIndex = c.scellIndex.map(Int.init)
-        q.pscell = c.pscell
-        return q
     }
 
     // MARK: - Publishing
@@ -2788,7 +2618,7 @@ public final class Manager {
     // Internet PDNs only: an IMS or other PDN is never primary, and its apps bind to it
     // directly, where a proxy on this Mac's loopback would only get in the way.
     private func proxies(for p: PDNState) -> [String: Any]? {
-        guard config.mirrorProxies ?? true, p.config.effectiveRole == "internet" else { return nil }
+        guard config.mirrorProxies ?? true, p.config.effectiveRole == .internet else { return nil }
         return proxyMirror?.current
     }
 
@@ -2798,21 +2628,23 @@ public final class Manager {
     }
 
     private func publishStatus(_ p: PDNState) {
-        var d: [String: Any]
+        var d: QMIDStorePDN
         if let s = p.session, let u = p.utun {
             d = ServicePublisher.pdnStatus(name: p.config.name, interface: u.name,
                                            config: p.pdnConfig, settings: s.merged, policy: p.policy)
         } else {
-            d = ["ServiceID": ServicePublisher.serviceID(for: p.config.name), "MuxID": Int(p.muxID),
-                 "Policy": p.policy.rawValue]
+            d = QMIDStorePDN(state: p.state.rawValue, serviceID: ServicePublisher.serviceID(for: p.config.name),
+                             muxID: Int(p.muxID), policy: p.policy.rawValue)
         }
-        d["State"] = p.state.rawValue
-        if let e = p.lastError { d["LastError"] = e }
-        if let r = p.rat { d["RAT"] = r }
-        if p.qos != nil, let c = p.qosState.qci { d["QCI"] = Int(c) }
-        if p.qos != nil, let a = p.qosState.ambr { d["AMBR"] = ["Uplink": NSNumber(value: a.uplink), "Downlink": NSNumber(value: a.downlink)] }
-        try? publisher.publish([QMIDStoreKey.pdn(p.config.name): d])
-        emitPDN(p)
+        d.state = p.state.rawValue
+        d.lastError = p.lastError
+        d.rat = p.rat
+        if p.qos != nil {
+            d.qci = p.qosState.qci.map(Int.init)
+            d.ambr = p.qosState.ambr.map(QMIDAMBR.init)
+        }
+        try? publisher.publish([QMIDStoreKey.pdn(p.config.name): d.dictionary])
+        emit(pdnEvent(p), pdn: p.config.name)
         updateLinkAnchor()
         updateSharing()
         _ = status()                            // the answer while `queue` is busy
@@ -2826,8 +2658,8 @@ public final class Manager {
     private func setUpSharing(removeStale: Bool) {
         guard let s = config.sharing else {
             sharing = nil
-            sharingRecheck?.cancel()
-            lastSharingEvent = nil
+            sharingRecheck.cancel()
+            sentEvents[EventID(type: QMIDEventType.sharing)] = nil
             if removeStale {
                 do {
                     let n = try Sharing.removeAll()
@@ -2838,7 +2670,7 @@ public final class Manager {
             }
             return
         }
-        let device = pdns.first { $0.config.name == s.pdn }?.utun?.name ?? "utun"
+        let device = pdn(named: s.pdn)?.utun?.name ?? "utun"
         do {
             if let what = try Sharing.ensureService(id: ServicePublisher.serviceID(for: s.pdn), pdn: s.pdn, device: device) {
                 log("sharing: source service \"Cellular (\(s.pdn))\" \(what); choose it under Internet Sharing", level: .notice)
@@ -2860,7 +2692,7 @@ public final class Manager {
     // The PDN connection that counts for sharing: up, and since when.
     private func sharingPDN() -> (name: String, utun: String?, upSince: Date?)? {
         guard let s = config.sharing else { return nil }
-        let p = pdns.first { $0.config.name == s.pdn }
+        let p = pdn(named: s.pdn)
         let up = p?.state == .connected
         return (s.pdn, up ? p?.utun?.name : nil, up ? p?.connectedAt : nil)
     }
@@ -2901,13 +2733,11 @@ public final class Manager {
             }
         }
         // The shared network shows up a few seconds after Internet Sharing starts: look again.
-        sharingRecheck?.cancel()
+        sharingRecheck.cancel()
         if selected, nat.enabled, utun != nil, Sharing.bridge(for: nat) == nil {
-            let item = DispatchWorkItem { [weak self] in self?.updateSharing() }
-            sharingRecheck = item
-            queue.asyncAfter(deadline: .now() + 5, execute: item)
+            sharingRecheck.schedule(on: queue, after: 5) { [weak self] in self?.updateSharing() }
         }
-        emitIfChanged(sharingEvent() ?? [:], &lastSharingEvent)
+        if let ev = sharingEvent() { emit(ev) }
     }
 
     private func sharingInfo(withClients: Bool) -> QMIDSharing? {
@@ -2929,7 +2759,7 @@ public final class Manager {
 
     // Without clients, which change without qmid hearing of it (status() has them).
     private func sharingEvent() -> NSDictionary? {
-        sharingInfo(withClients: false).map { [QMIDKey.type: QMIDEventType.sharing, QMIDKey.sharing: $0.dictionary] }
+        sharingInfo(withClients: false).map(QMIDEventDictionary.sharing)
     }
 
     // Before qmid is unregistered: the source service goes (QMIDControl.prepareUninstall).
@@ -2948,7 +2778,7 @@ public final class Manager {
         var v4 = false, v6 = false
         if config.linkAnchor ?? true {
             // A PDN redialing with its link kept keeps the stand-in too.
-            for p in pdns where p.config.effectiveRole == "internet" {
+            for p in pdns where p.config.effectiveRole == .internet {
                 guard let s = p.state == .connected ? p.session?.merged : p.heldSettings else { continue }
                 if s.ipv4Address != nil { v4 = true }
                 if s.ipv6Address != nil { v6 = true }
@@ -2970,7 +2800,7 @@ public final class Manager {
     private func pdnInfo(_ p: PDNState) -> QMIDPDN {
         var d = QMIDPDN(name: p.config.name, state: p.state)
         d.policy = p.policy.rawValue
-        d.role = p.config.effectiveRole
+        d.role = p.config.effectiveRole.rawValue
         d.mux = Int(p.muxID)
         d.wanted = p.wanted
         d.serviceID = ServicePublisher.serviceID(for: p.config.name)
@@ -2987,7 +2817,7 @@ public final class Manager {
         }
         if p.qos != nil {
             d.qci = p.qosState.qci.map(Int.init)
-            d.ambr = p.qosState.ambr.map { QMIDAMBR(uplink: $0.uplink, downlink: $0.downlink) }
+            d.ambr = p.qosState.ambr.map(QMIDAMBR.init)
         }
         d.error = p.lastError
         d.reason = p.reason
@@ -3005,17 +2835,19 @@ public final class Manager {
     private func pdnEvent(_ p: PDNState) -> NSDictionary {
         var info = pdnInfo(p)
         info.uptime = nil
-        return [QMIDKey.type: QMIDEventType.pdn, QMIDKey.pdn: info.dictionary] as NSDictionary
+        return QMIDEventDictionary.pdn(info)
     }
 
-    private func emitPDN(_ p: PDNState) {
-        emitIfChanged(pdnEvent(p), &lastPDNEvent[p.config.name])
-    }
-
-    // Only real changes are pushed.
-    private func emitIfChanged(_ ev: NSDictionary, _ last: inout NSDictionary?) {
-        guard ev != last else { return }
-        last = ev
+    // Pushes `ev` if it differs from the last one of its type (and PDN): compared whole, or on
+    // `key`. A bearers event compares with an empty list before the first, so a PDN that never
+    // had bearers pushes none.
+    private func emit(_ ev: NSDictionary, pdn: String? = nil, comparedOn key: NSDictionary? = nil) {
+        guard let type = ev[QMIDKey.type] as? String else { return }
+        let id = EventID(type: type, pdn: pdn)
+        let key = key ?? ev
+        let last = sentEvents[id]?.key ?? (type == QMIDEventType.bearers ? QMIDEventDictionary.bearers(pdn: pdn ?? "", []) : nil)
+        guard key != last else { return }
+        sentEvents[id] = (ev, key)
         onEvent?(ev)
     }
 
@@ -3045,7 +2877,7 @@ public final class Manager {
 
     private func startQoS(_ p: PDNState, _ dev: QMIDevice) {
         guard let session = p.session else { return }
-        p.qos = PDNQoS(device: dev, session: session, callbackQueue: queue, log: { [weak self] in self?.log($0) })
+        p.qos = PDNQoS(device: dev, session: session, callbackQueue: queue, log: logSink)
         snapshotQoS(p)
     }
 
@@ -3072,7 +2904,7 @@ public final class Manager {
     // up to 5 times in a row; the last state stays meanwhile.
     private func snapshotQoS(_ p: PDNState) {
         guard let q = p.qos, !p.snapshot.running else { return }
-        p.snapshot.retry?.cancel()
+        p.snapshotRetry.cancel()
         p.snapshot = .init(done: p.snapshot.done, failures: p.snapshot.failures)
         p.snapshot.running = true
         q.snapshot { [weak self, weak p] state in
@@ -3081,9 +2913,9 @@ public final class Manager {
             guard let state else {
                 p.snapshot.failures += 1
                 guard p.snapshot.failures <= 5 else { p.snapshot.failures = 0; self.log("\(p.config.name): qos: snapshot failed, giving up"); return }
-                let item = DispatchWorkItem { [weak self, weak p] in if let self, let p { self.snapshotQoS(p) } }
-                p.snapshot.retry = item
-                self.queue.asyncAfter(deadline: .now() + 2, execute: item)
+                p.snapshotRetry.schedule(on: self.queue, after: 2) { [weak self, weak p] in
+                    if let self, let p { self.snapshotQoS(p) }
+                }
                 return
             }
             let first = !p.snapshot.done
@@ -3106,20 +2938,11 @@ public final class Manager {
     }
 
     private func bearersEvent(_ p: PDNState) -> NSDictionary {
-        [QMIDKey.type: QMIDEventType.bearers, QMIDKey.pdn: p.config.name,
-         QMIDKey.bearers: (p.qos != nil ? p.qosState.bearers : []).map { Self.bearerInfo($0).dictionary }] as NSDictionary
+        QMIDEventDictionary.bearers(pdn: p.config.name, p.qos != nil ? p.qosState.bearers.map(QMIDBearer.init) : [])
     }
 
-    // Only real changes are pushed (no event yet counts as an empty list), so a PDN that goes
-    // down with bearers pushes one empty list.
-    private func emitBearers(_ p: PDNState) {
-        let ev = bearersEvent(p)
-        let previous = lastBearersEvent[p.config.name]
-            ?? [QMIDKey.type: QMIDEventType.bearers, QMIDKey.pdn: p.config.name, QMIDKey.bearers: [Any]()] as NSDictionary
-        guard ev != previous else { return }
-        lastBearersEvent[p.config.name] = ev
-        onEvent?(ev)
-    }
+    // A PDN that goes down with bearers pushes one empty list.
+    private func emitBearers(_ p: PDNState) { emit(bearersEvent(p), pdn: p.config.name) }
 
     static func describe(_ a: WDS.AMBR?) -> String {
         guard let a else { return "?" }
@@ -3127,53 +2950,27 @@ public final class Manager {
         return "\(mbps(a.uplink))/\(mbps(a.downlink)) Mbps"
     }
 
-    // A bearer as clients see it (status() and events).
-    static func bearerInfo(_ b: QoS.Bearer) -> QMIDBearer {
-        func rates(_ r: QoS.Bitrates) -> QMIDBitrates { QMIDBitrates(max: r.max, guaranteed: r.guaranteed) }
-        func filter(_ f: QoS.PacketFilter) -> QMIDPacketFilter {
-            var q = QMIDPacketFilter(id: Int(f.id), precedence: Int(f.precedence), ipVersion: Int(f.ipVersion))
-            q.source = f.source?.description
-            q.destination = f.destination?.description
-            q.ipProtocol = f.ipProtocol.map(Int.init)
-            q.sourcePorts = f.sourcePorts.map { Int($0.lowerBound)...Int($0.upperBound) }
-            q.destinationPorts = f.destinationPorts.map { Int($0.lowerBound)...Int($0.upperBound) }
-            return q
-        }
-        return QMIDBearer(id: Int(b.qosID), qci: b.qci.map(Int.init), networkInitiated: b.networkInitiated,
-                          uplink: rates(b.uplink.rates), downlink: rates(b.downlink.rates),
-                          uplinkFilters: b.uplinkFilters.map(filter), downlinkFilters: b.downlinkFilters.map(filter))
-    }
-
     private func modemEvent() -> NSDictionary {
-        var d: [String: Any] = [QMIDKey.type: QMIDEventType.modem, QMIDKey.modem: deviceState.rawValue]
-        if !serving.isEmpty { d[QMIDKey.network] = serving }
-        if let e = deviceError { d[QMIDKey.modemError] = e }
-        if airplane { d[QMIDKey.airplaneMode] = true }
-        return d as NSDictionary
+        QMIDEventDictionary.modem(QMIDModem(state: deviceState, network: serving.isEmpty ? nil : serving,
+                                            error: deviceError, airplaneMode: airplane))
     }
 
     // Current state as events, for a new subscriber.
     public func snapshotEvents() -> [NSDictionary] {
-        [modemEvent(), simEvent(), plmnEvent(), gnssEvent()] + [sharingEvent(), lastRadioEvent].compactMap { $0 }
+        [modemEvent(), QMIDEventDictionary.sim(simInfo()), QMIDEventDictionary.plmn(plmnInfo()), gnssEvent()]
+            + [sharingEvent(), sentEvents[EventID(type: QMIDEventType.radio)]?.event].compactMap { $0 }
             + pdns.map(pdnEvent) + pdns.filter { $0.qos != nil }.map(bearersEvent)
     }
 
     private func publishModem() {
-        var d: [String: Any] = ["State": deviceState.rawValue]
-        if !serving.isEmpty { d["Network"] = serving }
-        if let dev = device {
-            d["VendorID"] = Int(dev.modem.vendorID)
-            d["ProductID"] = Int(dev.modem.productID)
-            d["Interface"] = Int(dev.modem.interfaceNumber)
-        }
-        if let e = deviceError { d["LastError"] = e }
-        if airplane { d["AirplaneMode"] = true }
-        d["SIM"] = simInfo(identities: false)?.dictionary
-        d["PLMN"] = plmnInfo()?.dictionary
-        try? publisher.publish([QMIDStoreKey.modem: d])
-        emitIfChanged(modemEvent(), &lastModemEvent)
-        emitIfChanged(simEvent(), &lastSIMEvent)
-        emitIfChanged(plmnEvent(), &lastPLMNEvent)
+        let m = QMIDStoreModem(state: deviceState.rawValue, network: serving.isEmpty ? nil : serving,
+                               vendorID: device.map { Int($0.modem.vendorID) }, productID: device.map { Int($0.modem.productID) },
+                               interface: device.map { Int($0.modem.interfaceNumber) }, lastError: deviceError,
+                               airplaneMode: airplane, sim: simInfo(identities: false), plmn: plmnInfo())
+        try? publisher.publish([QMIDStoreKey.modem: m.dictionary])
+        emit(modemEvent())
+        emit(QMIDEventDictionary.sim(simInfo()))
+        emit(QMIDEventDictionary.plmn(plmnInfo()))
         _ = status()
     }
 
@@ -3206,27 +3003,17 @@ public final class Manager {
     }
 
     public func status() -> NSDictionary {
-        let stats = device?.modem.statistics() ?? [:]
-        let list = pdns.map { p -> NSDictionary in
+        let stats = (device?.modem.statistics() ?? [:]).mapValues { QMIDCounters($0 as NSDictionary) }
+        let list = pdns.map { p in
             var info = pdnInfo(p)
-            if p.qos != nil { info.bearers = p.qosState.bearers.map(Self.bearerInfo) }
-            guard let c = stats[NSNumber(value: p.muxID)] else { return info.dictionary }
-            let d = NSMutableDictionary(dictionary: info.dictionary)
-            d[QMIDKey.counters] = c
-            return d
+            if p.qos != nil { info.bearers = p.qosState.bearers.map(QMIDBearer.init) }
+            info.counters = stats[NSNumber(value: p.muxID)]
+            return info
         }
-        var out: [String: Any] = [QMIDKey.apiVersion: qmidAPIVersion, QMIDKey.modem: deviceState.rawValue, QMIDKey.pdns: list]
-        if let v = version { out[QMIDKey.version] = v }
-        if let i = imei { out[QMIDKey.imei] = i }
-        out[QMIDKey.airplaneMode] = airplane
-        if !serving.isEmpty { out[QMIDKey.network] = serving }
-        if let e = deviceError { out[QMIDKey.modemError] = e }
-        if let g = stats[0] { out[QMIDKey.datapath] = g }
-        out[QMIDKey.sim] = simInfo()?.dictionary
-        out[QMIDKey.plmn] = plmnInfo()?.dictionary
-        out[QMIDKey.gnss] = gnssInfo(withLastFix: true).dictionary
-        out[QMIDKey.sharing] = sharingInfo(withClients: true)?.dictionary
-        let d = out as NSDictionary
+        let d = QMIDStatus(version: version, modem: deviceState.rawValue, modemError: deviceError,
+                           network: serving.isEmpty ? nil : serving, pdns: list, sim: simInfo(), plmn: plmnInfo(),
+                           imei: imei, airplaneMode: airplane, gnss: gnssInfo(withLastFix: true),
+                           sharing: sharingInfo(withClients: true), datapath: stats[0]).dictionary
         lastStatusLock.lock()
         lastStatus = d
         lastStatusLock.unlock()
@@ -3256,13 +3043,13 @@ public final class Manager {
     // Replies when the attempt has ended: nil once connected, else why not (lastError).
     // Connected already: replies at once and starts maxUptime again.
     public func connect(_ name: String, reply: @escaping (String?) -> Void) {
-        guard let p = pdns.first(where: { $0.config.name == name }) else { return reply("no PDN \(name)") }
+        guard let p = pdn(named: name) else { return reply("no PDN \(name)") }
         p.attempts = 0
         p.blocked.removeAll()
         guard device != nil else {
-            if p.config.oneShot { return reply("modem not ready (\(deviceState.rawValue))") }
+            if p.config.oneShot { return reply(notReady) }
             p.wanted = true
-            return reply("modem not ready (\(deviceState.rawValue)); will connect when it is")
+            return reply("\(notReady); will connect when it is")
         }
         p.wanted = true
         if p.state == .connected {
@@ -3274,9 +3061,8 @@ public final class Manager {
     }
 
     public func disconnect(_ name: String) -> String? {
-        guard let p = pdns.first(where: { $0.config.name == name }) else { return "no PDN \(name)" }
+        guard let p = pdn(named: name) else { return "no PDN \(name)" }
         p.wanted = false
-        p.cancelRetry()
         teardown(p, stopCall: true, state: .idle, error: nil)
         log("\(name): disconnected by request", level: .notice)
         return nil
@@ -3284,7 +3070,7 @@ public final class Manager {
 
     // Re-publishes the service entity only; no reconnect (PLAN.md §5.2).
     public func setPolicy(_ name: String, _ policy: String) -> String? {
-        guard let p = pdns.first(where: { $0.config.name == name }) else { return "no PDN \(name)" }
+        guard let p = pdn(named: name) else { return "no PDN \(name)" }
         guard let pol = QMIDPolicy(rawValue: policy) else {
             return "bad policy \(policy) (\(QMIDPolicy.allCases.map(\.rawValue).joined(separator: ", ")))"
         }
@@ -3321,19 +3107,17 @@ public final class Manager {
             guard let (p, old) = before[q.name], Self.sameExceptPolicy(old, q) else { continue }
             p.config = q
             if old.policy != q.policy {
-                p.policy = q.policy.flatMap(QMIDPolicy.init(rawValue:)) ?? .preferWifi
+                p.policy = PDNState.policy(q)
             }
             if old.policy != q.policy || mirrorChanged, p.state == .connected { try? publishService(p) }
             p.blocked.removeAll()
             kept[q.name] = p
         }
         for (name, (p, _)) in before where kept[name] == nil {
-            p.cancelRetry()
             teardown(p, stopCall: true, state: .idle, error: nil)
             if !resolved.contains(where: { $0.name == name }) {
                 publisher.remove(prefix: QMIDStoreKey.pdn(name))
-                lastPDNEvent[name] = nil
-                lastBearersEvent[name] = nil
+                sentEvents = sentEvents.filter { $0.key.pdn != name }
             }
         }
         // A kept PDN keeps its mux; a new one takes the lowest free (one still stopping a
@@ -3352,7 +3136,7 @@ public final class Manager {
         log("config reloaded: \(c.pdns.map(\.name).joined(separator: ", "))" +
             (redialed.isEmpty ? ", every PDN unchanged" : "; new or changed: \(redialed.joined(separator: ", "))"))
         if device != nil { resyncProfiles() }
-        onEvent?([QMIDKey.type: QMIDEventType.config] as NSDictionary)
+        onEvent?(QMIDEventDictionary.config)
         for p in pdns {
             publishStatus(p)
             if p.wanted, device != nil, p.session == nil {
@@ -3374,11 +3158,12 @@ public final class Manager {
     public func shutdown() {
         stopped = true
         if radioOff, let dev = device { try? radioOnline(dev) }   // don't exit with the radio off
-        for p in pdns {
-            p.cancelRetry()
-            teardown(p, stopCall: true, state: .idle, error: nil)
-        }
-        [wda, control, nas, uimWatch, dmsWatch].forEach { $0?.release() }
+        for p in pdns { teardown(p, stopCall: true, state: .idle, error: nil) }
+        [reopenTimer, radioTimer, gnssHold, gnssRetry, suplRecheck, sharingRecheck, xtraCheck, restartEnd, reattachTimer].forEach { $0.cancel() }
+        profileCheck?.cancel()
+        profileCheck = nil
+        endPendingSIM()
+        [wda, control, nas, coexWatch, uimWatch, dmsWatch].forEach { $0?.release() }
         device?.close()
         device = nil
         gnss = nil
@@ -3388,6 +3173,5 @@ public final class Manager {
         LinkAnchor.down()
         linkAnchor = (false, false)
         sharing = nil                               // the Setup: service stays (see Sharing.swift)
-        sharingRecheck?.cancel()
     }
 }

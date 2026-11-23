@@ -16,17 +16,17 @@ final class RadioEventTests: XCTestCase {
 
     // Signal and neighbours don't make a radio event; activation and RRC state do.
     func testRadioKey() {
-        let base = Manager.radioKey(radio(rsrp: -90, nrActive: false, neighbours: 2))
-        XCTAssertEqual(Manager.radioKey(radio(rsrp: -97, nrActive: false, neighbours: 5)), base)
-        XCTAssertNotEqual(Manager.radioKey(radio(rsrp: -90, nrActive: true, neighbours: 2)), base)
-        XCTAssertNotEqual(Manager.radioKey(radio(rsrp: -90, nrActive: false, neighbours: 2, nrRRC: .idle)), base)
+        let base = QMIDRadio.eventKey(radio(rsrp: -90, nrActive: false, neighbours: 2))
+        XCTAssertEqual(QMIDRadio.eventKey(radio(rsrp: -97, nrActive: false, neighbours: 5)), base)
+        XCTAssertNotEqual(QMIDRadio.eventKey(radio(rsrp: -90, nrActive: true, neighbours: 2)), base)
+        XCTAssertNotEqual(QMIDRadio.eventKey(radio(rsrp: -90, nrActive: false, neighbours: 2, nrRRC: .idle)), base)
     }
 
     func testRRCStates() {
-        XCTAssertEqual([1, 2, 3, 4, 5, 6, 7, 8].map { Manager.lteRRC($0) },
+        XCTAssertEqual([1, 2, 3, 4, 5, 6, 7, 8].map { QMIDRRCState(lte: $0) },
                        [.idle, .idle, .connecting, .connected, .releasing, .inactive, .idle, .suspended])
-        XCTAssertNil(Manager.lteRRC(0))
-        XCTAssertEqual([0, 1, 2].map { Manager.nrRRC($0) }, [.idle, .connected, .inactive])
-        XCTAssertNil(Manager.nrRRC(3))
+        XCTAssertNil(QMIDRRCState(lte: 0))
+        XCTAssertEqual([0, 1, 2].map { QMIDRRCState(nr: $0) }, [.idle, .connected, .inactive])
+        XCTAssertNil(QMIDRRCState(nr: 3))
     }
 }

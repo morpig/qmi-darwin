@@ -1,4 +1,5 @@
 import Foundation
+import QMIDAPI
 import QMIDatapath
 import QMIKit
 
@@ -6,9 +7,11 @@ public enum QMIHostError: Error, CustomStringConvertible {
     case open(String)
     case notFound(String)                   // no modem interface to open: the modem is away
     case cancelled                          // the interface went away while it was being opened
-    case transport(String)
+    case transport(String)                  // talking to the modem (USB, QMI framing)
     case timeout(QMIService, UInt16)
     case protocolError(QMIProtocolError, QMIMessage)
+    case config(String)                     // qmid.json (QMIDConfig.validate)
+    case failed(String)                     // anything else: a command, the system's configuration, a download
 
     public var description: String {
         switch self {
@@ -17,12 +20,9 @@ public enum QMIHostError: Error, CustomStringConvertible {
         case .transport(let s): return "transport: \(s)"
         case .timeout(let svc, let msg): return "timeout waiting for \(svc) 0x\(String(format: "%04x", msg))"
         case .protocolError(let e, let m): return "\(m.service) 0x\(String(format: "%04x", m.messageID)): \(e)"
+        case .config(let s): return "config: \(s)"
+        case .failed(let s): return s
         }
-    }
-
-    public var protocolError: QMIProtocolError? {
-        if case .protocolError(let e, _) = self { return e }
-        return nil
     }
 
     // The modem isn't there to open (unplugged, or re-enumerating).
@@ -32,6 +32,9 @@ public enum QMIHostError: Error, CustomStringConvertible {
         return false
     }
 }
+
+// Where QMIHost's parts send log lines, from any thread.
+public typealias LogSink = (QMIDLogLevel, String) -> Void
 
 // The QMI control channel of one modem: request/response matching by (service, client, txid)
 // and indication dispatch. Requests are synchronous; call them off the main thread if a UI
@@ -70,15 +73,14 @@ public final class QMIDevice {
     // Message ID is part of the key: after a crash the modem may still hold responses to an
     // earlier process's requests with the same transaction IDs.
     private struct Key: Hashable { let service: UInt8; let client: UInt8; let tx: UInt16; let message: UInt16 }
-    private final class Waiter { let done = DispatchSemaphore(value: 0); var response: QMIMessage? }
+    private typealias Waiter = BlockingValue<QMIMessage>
 
     // A reply that comes as an indication (LOC): keyed without the transaction ID, which
     // indications don't echo, so one wait per (service, client, message) at a time.
     private struct IndicationKey: Hashable { let service: UInt8; let client: UInt8; let message: UInt16 }
     private final class IndicationWaiter {
-        let done = DispatchSemaphore(value: 0)
+        let indication = BlockingValue<QMIMessage>()
         let match: (QMIMessage) -> Bool
-        var indication: QMIMessage?
         init(_ match: @escaping (QMIMessage) -> Bool) { self.match = match }
     }
 
@@ -88,20 +90,16 @@ public final class QMIDevice {
     private var ctlTX: UInt8 = 0
     private var serviceTX: UInt16 = 0
 
-    public init(modem: QDModem) throws {
+    public init(modem: QDModem) {
         self.modem = modem
-        do {
-            try modem.startControlChannel { [weak self] data in self?.received([UInt8](data)) }
-        } catch {
-            throw QMIHostError.open("\(error.localizedDescription)")
-        }
+        modem.startControlChannel { [weak self] data in self?.received([UInt8](data)) }
     }
 
     public static func open(interface: Int? = nil, vendorIDs: [UInt16] = QMIDevice.vendorIDs()) throws -> QMIDevice {
         do {
             let modem = try QDModem.open(withVendorIDs: vendorIDs.map { NSNumber(value: $0) },
                                          interfaceNumber: interface ?? -1)
-            return try QMIDevice(modem: modem)
+            return QMIDevice(modem: modem)
         } catch let e as QMIHostError {
             throw e
         } catch let e as QDError where e.code == .notFound {
@@ -125,18 +123,14 @@ public final class QMIDevice {
             let w = waiters.removeValue(forKey: Key(service: msg.service.rawValue, client: msg.clientID,
                                                   tx: msg.transactionID, message: msg.messageID))
             lock.unlock()
-            if let w {
-                w.response = msg
-                w.done.signal()
-            }
+            w?.put(msg)
         case .indication:
             let ik = IndicationKey(service: msg.service.rawValue, client: msg.clientID, message: msg.messageID)
             lock.lock()
             if let w = indicationWaiters[ik], w.match(msg) {
                 indicationWaiters[ik] = nil
                 lock.unlock()
-                w.indication = msg
-                w.done.signal()
+                w.indication.put(msg)
                 return                              // a reply: not for onIndication
             }
             lock.unlock()
@@ -178,7 +172,7 @@ public final class QMIDevice {
             lock.lock(); waiters[key] = nil; lock.unlock()
             throw QMIHostError.transport(error.localizedDescription)
         }
-        guard w.done.wait(timeout: .now() + timeout) == .success, let resp = w.response else {
+        guard let resp = w.wait(timeout: timeout) else {
             lock.lock(); waiters[key] = nil; lock.unlock()
             throw QMIHostError.timeout(service, message)
         }
@@ -211,7 +205,7 @@ public final class QMIDevice {
             drop()
             throw error
         }
-        guard w.done.wait(timeout: .now() + indicationTimeout) == .success, let ind = w.indication else {
+        guard let ind = w.indication.wait(timeout: indicationTimeout) else {
             drop()
             throw QMIHostError.timeout(service, message)
         }
@@ -223,7 +217,7 @@ public final class QMIDevice {
     private let cancelLock = NSLock()
     private var cancelled = false
     public func cancel() { cancelLock.lock(); cancelled = true; cancelLock.unlock() }
-    public var isCancelled: Bool { cancelLock.lock(); defer { cancelLock.unlock() }; return cancelled }
+    private var isCancelled: Bool { cancelLock.lock(); defer { cancelLock.unlock() }; return cancelled }
 
     // Set when the modem announces its QMI stack with a CTL Sync indication (it does so when
     // the firmware finishes booting after a reset or replug).
@@ -264,6 +258,50 @@ public final class QMIDevice {
         let (svc, cid) = try CTL.parseAllocatedClient(resp)
         guard svc == service else { throw QMIHostError.transport("allocated \(svc), asked for \(service)") }
         return QMIClient(device: self, service: service, id: cid)
+    }
+
+    // MARK: Datapath
+
+    // WDA Set Data Format: raw IP, QMAP both ways (PLAN.md §4.2). `inspect` sees the grant
+    // before it is checked. Returns the WDA client, which holds the format; released if the
+    // grant is unusable.
+    public func setDataFormat(flowControl: Bool = false,
+                              inspect: ((WDA.Granted) -> Void)? = nil) throws -> (wda: QMIClient, granted: WDA.Granted) {
+        let wda = try allocateClient(.wda)
+        var req = WDA.Request(endpointInterface: UInt32(modem.interfaceNumber))
+        if flowControl { req.flowControl = true }
+        let g: WDA.Granted
+        do {
+            g = WDA.parseGranted(try wda.request(WDA.setDataFormat, req.tlvs))
+        } catch {
+            wda.release()
+            throw error
+        }
+        inspect?(g)
+        if let problem = g.datapathProblem {
+            wda.release()
+            throw QMIHostError.transport("unusable data format: \(problem)")
+        }
+        return (wda, g)
+    }
+
+    // Starts QDModem's datapath with the sizes the modem granted. `batch`: batched utun I/O;
+    // `onBatchFallback` hears why batching was turned off (on the datapath queue).
+    public func startDatapath(_ g: WDA.Granted, batch: Bool, onBatchFallback: ((String) -> Void)? = nil) throws {
+        modem.batchUtunIO = batch
+        modem.batchFallbackHandler = onBatchFallback
+        try modem.startDatapath(withDownlinkSize: UInt(g.downlinkMaxSize ?? 16384),
+                                uplinkSize: UInt(g.uplinkMaxSize ?? 0),
+                                uplinkDatagrams: UInt(g.uplinkMaxDatagrams ?? 0))
+    }
+
+    // Both: the data format, then the datapath. If starting the datapath fails the WDA client
+    // is kept; the caller closes the device.
+    public func bringUpDatapath(flowControl: Bool = false, batch: Bool,
+                                onBatchFallback: ((String) -> Void)? = nil) throws -> (wda: QMIClient, granted: WDA.Granted) {
+        let f = try setDataFormat(flowControl: flowControl)
+        try startDatapath(f.granted, batch: batch, onBatchFallback: onBatchFallback)
+        return f
     }
 }
 

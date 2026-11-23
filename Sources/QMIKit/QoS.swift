@@ -17,8 +17,7 @@ public enum QoS {
     public static let getQoSIDs: UInt16 = 0x0036
 
     public static func bindDataPortRequest(interface: UInt32, muxID: UInt8) -> [TLV] {
-        var ep = ByteWriter(); ep.u32(WDA.endpointHSUSB); ep.u32(interface)
-        return [TLV(0x10, ep.bytes), .u8(0x11, muxID)]
+        [TLV(0x10, WDA.endpoint(interface: interface)), .u8(0x11, muxID)]
     }
 
     public static func clientIPPrefRequest(family: UInt8) -> [TLV] { [.u8(0x01, family)] }
@@ -84,10 +83,8 @@ public enum QoS {
     // MARK: Queries
 
     public static func parseQoSIDs(_ m: QMIMessage) -> [UInt32] {
-        guard let v = m[tlv: 0x10] else { return [] }
-        var r = ByteReader(v)
-        guard let n = try? r.u8() else { return [] }
-        return (0..<n).compactMap { _ in try? r.u32() }
+        var r = ByteReader(m[tlv: 0x10] ?? [])
+        return r.partialList { try $0.u32() }
     }
 
     // Get Granted QoS: 0x11 / 0x12 uplink / downlink granted flow, nested (see parseFlow).
@@ -102,8 +99,11 @@ public enum QoS {
     // The default bearer's QCI from Get QoS Info for QoS ID 0: flow record 0x11 (77 bytes,
     // u64 valid mask first, LTE QCI as the last u32 when mask bit 14 is set), else 5G QCI 0x16.
     public static func parseDefaultQCI(_ m: QMIMessage) -> UInt32? {
-        if let f = m[tlv: 0x11], f.count >= 77, le32(f, 0) & 0x4000 != 0 { return le32(f, 73) }
-        return m[tlv: 0x16].flatMap { $0.count >= 4 ? le32($0, 0) : nil }
+        if let f = m[tlv: 0x11], f.count >= 77 {
+            var mask = ByteReader(f), qci = ByteReader(f, offset: 73)
+            if try! mask.u32() & 0x4000 != 0 { return try! qci.u32() }
+        }
+        return m.u32(tlv: 0x16)
     }
 
     // MARK: Event Report
@@ -123,9 +123,10 @@ public enum QoS {
 
     public static func parseEventReport(_ m: QMIMessage) -> [Report] {
         m.tlvs.filter { $0.type == 0x10 }.compactMap { t in
-            let inner = Dictionary(nested(t.value).map { ($0.type, $0.value) }, uniquingKeysWith: { a, _ in a })
+            let inner = nested(t.value).valuesByType
             guard let head = inner[0x10], head.count >= 6 else { return nil }
-            let id = le32(head, 0), state = head[5]
+            var r = ByteReader(head)
+            let id = try! r.u32(), state = head[5]
             var report = Report(qosID: id, state: state)
             guard state == 1 || state == 2 else { return report }
             var b = Bearer(qosID: id)
@@ -144,11 +145,14 @@ public enum QoS {
     // or 0x12 (two u32) on older firmware, and 0x1F QCI (u8). A zero rate is "not set".
     static func parseFlow(_ v: [UInt8]) -> Flow {
         guard let spec = nested(v).first(where: { $0.type == 0x10 })?.value else { return Flow() }
-        let t = Dictionary(nested(spec).map { ($0.type, $0.value) }, uniquingKeysWith: { a, _ in a })
+        let t = nested(spec).valuesByType
         var f = Flow()
-        if let r = t[0x20], r.count >= 16 { f.rates = Bitrates(max: nonzero(le64(r, 0)), guaranteed: nonzero(le64(r, 8))) }
-        else if let r = t[0x12], r.count >= 8 {
-            f.rates = Bitrates(max: nonzero(UInt64(le32(r, 0))), guaranteed: nonzero(UInt64(le32(r, 4))))
+        if let v = t[0x20], v.count >= 16 {
+            var r = ByteReader(v)
+            f.rates = Bitrates(max: nonzero(try! r.u64()), guaranteed: nonzero(try! r.u64()))
+        } else if let v = t[0x12], v.count >= 8 {
+            var r = ByteReader(v)
+            f.rates = Bitrates(max: nonzero(UInt64(try! r.u32())), guaranteed: nonzero(UInt64(try! r.u32())))
         }
         f.qci = t[0x1F]?.first.map(UInt32.init)
         return f
@@ -164,10 +168,11 @@ public enum QoS {
     }
 
     static func parseFilter(_ v: [UInt8]) -> PacketFilter? {
-        let t = Dictionary(nested(v).map { ($0.type, $0.value) }, uniquingKeysWith: { a, _ in a })
+        let t = nested(v).valuesByType
+        var p = ByteReader(t[0x22] ?? [])
         guard let version = t[0x11]?.first, version == 4 || version == 6,
-              let id = t[0x23]?.first, let p = t[0x22], p.count >= 2 else { return nil }
-        var f = PacketFilter(id: id, precedence: UInt16(p[0]) | UInt16(p[1]) << 8, ipVersion: version)
+              let id = t[0x23]?.first, let precedence = try? p.u16() else { return nil }
+        var f = PacketFilter(id: id, precedence: precedence, ipVersion: version)
         if let a = t[0x12], a.count == 8 { f.source = v4Prefix(a, 0) }
         if let a = t[0x13], a.count == 8 { f.destination = v4Prefix(a, 0) }
         if let a = t[0x16], a.count == 17 { f.source = v6Prefix(a, 0) }
@@ -181,34 +186,21 @@ public enum QoS {
 
     // MARK: Bytes
 
-    static func nested(_ v: [UInt8]) -> [TLV] {
-        var r = ByteReader(v), out: [TLV] = []
-        while !r.isAtEnd {
-            guard let type = try? r.u8(), let len = try? r.u16(), let value = try? r.take(Int(len)) else { break }
-            out.append(TLV(type, value))
-        }
-        return out
-    }
+    static func nested(_ v: [UInt8]) -> [TLV] { TLV.decodePartialList(v) }
 
     private static func nonzero(_ v: UInt64) -> UInt64? { v == 0 ? nil : v }
 
-    private static func le64(_ b: [UInt8], _ o: Int) -> UInt64 {
-        (0..<8).reduce(UInt64(0)) { $0 | UInt64(b[o + $1]) << (8 * UInt64($1)) }
-    }
-
-    private static func le32(_ b: [UInt8], _ o: Int) -> UInt32 {
-        (0..<4).reduce(UInt32(0)) { $0 | UInt32(b[o + $1]) << (8 * UInt32($1)) }
-    }
-
+    // Port and range, u16 each (4 bytes).
     private static func portRange(_ b: [UInt8], _ o: Int) -> ClosedRange<UInt16> {
-        let port = UInt16(b[o]) | UInt16(b[o + 1]) << 8
-        let range = UInt16(b[o + 2]) | UInt16(b[o + 3]) << 8
+        var r = ByteReader(b, offset: o)
+        let port = try! r.u16(), range = try! r.u16()
         return port...(port &+ range < port ? .max : port + range)
     }
 
-    // IPv4 address and netmask, both u32 little-endian.
+    // IPv4 address and netmask, both u32 little-endian (8 bytes).
     private static func v4Prefix(_ b: [UInt8], _ o: Int) -> Prefix {
-        Prefix(address: IPv4(qmi: Array(b[o..<o + 4]))!.description, length: le32(b, o + 4).nonzeroBitCount)
+        var mask = ByteReader(b, offset: o + 4)
+        return Prefix(address: IPv4(qmi: Array(b[o..<o + 4]))!.description, length: try! mask.u32().nonzeroBitCount)
     }
 
     // IPv6 address (16 bytes, network order) and prefix length.

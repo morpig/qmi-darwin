@@ -23,3 +23,35 @@ final class UtunTests: XCTestCase {
         XCTAssertEqual(Utun.ipv6Commands("utun9", old: nil, new: nil), [])
     }
 }
+
+final class ShellTests: XCTestCase {
+    // More than a pipe's buffer (64 KB): read while the command runs, or it never exits.
+    func testLargeOutput() throws {
+        let out = try Shell.run("/bin/sh", ["-c", "head -c 300000 /dev/zero | tr '\\0' x"])
+        XCTAssertEqual(out.count, 300_000)
+    }
+
+    func testFailureCarriesOutput() {
+        XCTAssertThrowsError(try Shell.run("/bin/sh", ["-c", "echo nope >&2; exit 3"])) { e in
+            XCTAssertEqual("\(e)", "/bin/sh -c echo nope >&2; exit 3: nope")
+        }
+    }
+}
+
+final class BlockingValueTests: XCTestCase {
+    func testValueFromAnotherThread() {
+        let v = BlockingValue<Int>()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { v.put(7); v.put(8) }
+        XCTAssertEqual(v.wait(timeout: 5), 7)
+    }
+
+    func testLatePutIsDropped() {
+        let v = BlockingValue<Int?>()
+        XCTAssertTrue(v.wait(timeout: 0.01) == nil)
+        v.put(1)                                    // after the timeout: ignored
+        let w = BlockingValue<Int?>()
+        w.put(nil)
+        let got: Int?? = w.wait(timeout: 0)
+        XCTAssertTrue(got != nil && got! == nil)    // an optional value is told from no value
+    }
+}

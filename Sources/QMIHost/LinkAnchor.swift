@@ -15,32 +15,32 @@ public enum LinkAnchor {
     static let ipv4 = "192.0.0.8"
     static let ipv6 = "fdd8:1c41:77ae::8"            // random global ID, fixed
 
-    public static var exists: Bool { if_nametoindex(name) != 0 }
+    private static var exists: Bool { if_nametoindex(name) != 0 }
 
     // Brings the interface to exactly these families; removes it when neither is wanted.
     public static func set(v4: Bool, v6: Bool) throws {
         guard v4 || v6 else { down(); return }
         let ifconfig = "/sbin/ifconfig"
         if !exists {
-            _ = try Utun.run(ifconfig, [name, "create"])
-            _ = try? Utun.run(ifconfig, [name, "inet6", "-ifdisabled"])
+            try Shell.run(ifconfig, [name, "create"])
+            _ = try? Shell.run(ifconfig, [name, "inet6", "-ifdisabled"])
         }
         let (has4, has6) = current()
-        if v4, !has4 { _ = try Utun.run(ifconfig, [name, "inet", ipv4, "netmask", "255.255.255.255", "alias"]) }
-        if !v4, has4 { _ = try? Utun.run(ifconfig, [name, "inet", ipv4, "-alias"]) }
-        if v6, !has6 { _ = try Utun.run(ifconfig, [name, "inet6", ipv6, "prefixlen", "128", "alias"]) }
-        if !v6, has6 { _ = try? Utun.run(ifconfig, [name, "inet6", ipv6, "-alias"]) }
-        _ = try Utun.run(ifconfig, [name, "up"])
+        if v4, !has4 { try Shell.run(ifconfig, [name, "inet", ipv4, "netmask", "255.255.255.255", "alias"]) }
+        if !v4, has4 { _ = try? Shell.run(ifconfig, [name, "inet", ipv4, "-alias"]) }
+        if v6, !has6 { try Shell.run(ifconfig, [name, "inet6", ipv6, "prefixlen", "128", "alias"]) }
+        if !v6, has6 { _ = try? Shell.run(ifconfig, [name, "inet6", ipv6, "-alias"]) }
+        try Shell.run(ifconfig, [name, "up"])
     }
 
     public static func down() {
         guard exists else { return }
-        _ = try? Utun.run("/sbin/ifconfig", [name, "destroy"])
+        _ = try? Shell.run("/sbin/ifconfig", [name, "destroy"])
     }
 
     // Which of our two addresses the interface has now.
     static func current() -> (v4: Bool, v6: Bool) {
-        guard let out = try? Utun.run("/sbin/ifconfig", [name]) else { return (false, false) }
+        guard let out = try? Shell.run("/sbin/ifconfig", [name]) else { return (false, false) }
         return (out.contains("inet \(ipv4) "), out.contains("inet6 \(ipv6) "))
     }
 }

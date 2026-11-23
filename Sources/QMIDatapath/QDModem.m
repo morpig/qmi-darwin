@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,11 +165,12 @@ static NSNumber *regNumber(io_service_t s, CFStringRef key) {
     dispatch_queue_t _ioQueue;      // IOUSBHost completions + all datapath state
     dispatch_queue_t _ctlQueue;     // synchronous GET_ENCAPSULATED_RESPONSE
     void (^_controlHandler)(NSData *);
-    BOOL _closed;
+    atomic_bool _closed;            // read on both queues and the caller's thread
     NSUInteger _intMaxPacket;
 
     // Datapath state: touched only on _ioQueue.
     BOOL _running;
+    BOOL _started;                  // startDatapath got past its checks; never cleared (one start per open)
     NSUInteger _dlSize, _ulSize, _ulDatagrams;
     int _fd[256];
     dispatch_source_t _src[256];
@@ -414,7 +416,8 @@ static BOOL isQMIInterface(io_service_t s) {
     return data;
 }
 
-- (BOOL)startControlChannel:(void (^)(NSData *))handler error:(NSError **)error {
+// A failed DTR request is only logged: not every modem needs it, and the open goes on.
+- (void)startControlChannel:(void (^)(NSData *))handler {
     _controlHandler = [handler copy];
 
     // SET_CONTROL_LINE_STATE with DTR: recent Qualcomm firmware (Quectel
@@ -436,28 +439,27 @@ static BOOL isQMIInterface(io_service_t s) {
     }
     QDLOG("discarded %d stale control messages", stale);
     [self armInterrupt];
-    return YES;
 }
 
 // Reads until the modem's queue is empty. One RESPONSE_AVAILABLE can stand for many queued
 // messages (a QoS change queues 40+ indications at once), and whatever is left behind waits for
 // the next notification, a response included. Batches of 32, so the queue stays fair.
 - (void)drainResponses {
-    for (int i = 0; i < 32 && !_closed; i++) {
+    for (int i = 0; i < 32 && !atomic_load(&_closed); i++) {
         NSData *d = [self getEncapsulatedResponse];
         if (d.length == 0) return;
         if (_controlHandler) _controlHandler(d);
     }
-    if (!_closed) dispatch_async(_ctlQueue, ^{ [self drainResponses]; });
+    if (!atomic_load(&_closed)) dispatch_async(_ctlQueue, ^{ [self drainResponses]; });
 }
 
 - (void)armInterrupt {
-    if (_closed) return;
+    if (atomic_load(&_closed)) return;
     // Exactly wMaxPacketSize (8 on RM551E): an 8-byte RESPONSE_AVAILABLE fills the packet, so
     // a larger buffer would wait for a short packet that never comes.
     NSMutableData *buf = [NSMutableData dataWithLength:_intMaxPacket ?: 8];
     BOOL ok = qd_enqueue(_intPipe, buf, ^(IOReturn status, NSUInteger n) {
-        if (self->_closed || status == kIOReturnAborted || status == kIOReturnNoDevice) return;
+        if (atomic_load(&self->_closed) || status == kIOReturnAborted || status == kIOReturnNoDevice) return;
         QDLOG("interrupt: status 0x%08x, %lu bytes", status, (unsigned long)n);
         if (status == kIOReturnSuccess) {
             const uint8_t *p = buf.bytes;
@@ -478,6 +480,8 @@ static BOOL isQMIInterface(io_service_t s) {
 
 // MARK: - Datapath
 
+// One start per open: once stopped (unplug, a failed start or -close) it stays stopped, since
+// reads it posted may still be on the pipe until -close aborts them.
 - (BOOL)startDatapathWithDownlinkSize:(NSUInteger)downlinkSize
                            uplinkSize:(NSUInteger)uplinkSize
                       uplinkDatagrams:(NSUInteger)uplinkDatagrams
@@ -486,6 +490,12 @@ static BOOL isQMIInterface(io_service_t s) {
     __block NSError *err = nil;
     dispatch_sync(_ioQueue, ^{
         if (self->_running) return;
+        if (self->_started || atomic_load(&self->_closed)) {
+            ok = NO;
+            err = QDError(QDErrorStopped, @"the datapath was stopped; reopen the modem to start it again");
+            return;
+        }
+        self->_started = YES;
         self->_dlSize = downlinkSize ?: 16384;
         // Without granted UL aggregation, send one datagram per transfer.
         BOOL agg = uplinkSize >= kMaxPacket + 16 && uplinkDatagrams > 1;
@@ -494,6 +504,12 @@ static BOOL isQMIInterface(io_service_t s) {
 
         for (int i = 0; i < kOutSlots; i++) {
             self->_outBuf[i] = malloc(self->_ulSize + 8);
+            if (!self->_outBuf[i]) {
+                ok = NO;
+                err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOMEM userInfo:nil];
+                [self abandonStart];
+                return;
+            }
             self->_outFree[i] = i;
         }
         self->_outFreeCount = kOutSlots;
@@ -510,13 +526,27 @@ static BOOL isQMIInterface(io_service_t s) {
             NSError *e = nil;
             NSMutableData *b = [self->_iface ioDataWithCapacity:self->_dlSize error:&e];
             if (!b) b = [NSMutableData dataWithLength:self->_dlSize];
-            if (![self submitIn:b]) { ok = NO; err = QDError(QDErrorQueueReads, @"could not queue bulk IN reads"); }
+            if (![self submitIn:b]) {
+                ok = NO;
+                err = QDError(QDErrorQueueReads, @"could not queue bulk IN reads");
+                [self abandonStart];
+                return;
+            }
         }
         self->_g.in_posted_min = self->_inPosted;
         for (int m = 0; m < 256; m++) [self updateSource:(uint8_t)m];
     });
     if (!ok && error) *error = err;
     return ok;
+}
+
+// Undoes a partial start (on _ioQueue). With _running NO, submitIn's retry stops, completions
+// of reads already posted drop their data, and no read source resumes. No OUT transfer has
+// been made yet, so the OUT buffers can go.
+- (void)abandonStart {
+    _running = NO;
+    for (int i = 0; i < kOutSlots; i++) { free(_outBuf[i]); _outBuf[i] = NULL; }
+    _outFreeCount = 0;
 }
 
 - (BOOL)submitIn:(NSMutableData *)buf {
@@ -673,12 +703,16 @@ static BOOL isQMIInterface(io_service_t s) {
         size_t len = f->payload_len;
         uint8_t pad = qd_qmap_pad_for(len);
         uint8_t *frame = calloc(1, 4 + len + pad);
-        memcpy(frame + 4, f->payload, len);
-        frame[5] = (frame[5] & ~0x03) |
-            ((name == kQMAPFlowDisable || name == kQMAPFlowEnable) ? kQMAPCmdAck : kQMAPCmdUnsupported);
-        qd_qmap_write_header(frame, true, f->mux_id, len, pad);
-        NSMutableData *d = [NSMutableData dataWithBytesNoCopy:frame length:4 + len + pad freeWhenDone:YES];
-        qd_enqueue(_outPipe, d, ^(IOReturn st, NSUInteger done) { (void)d; });
+        if (frame) {
+            memcpy(frame + 4, f->payload, len);
+            frame[5] = (frame[5] & ~0x03) |
+                ((name == kQMAPFlowDisable || name == kQMAPFlowEnable) ? kQMAPCmdAck : kQMAPCmdUnsupported);
+            qd_qmap_write_header(frame, true, f->mux_id, len, pad);
+            NSMutableData *d = [NSMutableData dataWithBytesNoCopy:frame length:4 + len + pad freeWhenDone:YES];
+            qd_enqueue(_outPipe, d, ^(IOReturn st, NSUInteger done) { (void)d; });
+        } else {
+            QDLOG("no memory for the QMAP command reply on mux 0x%02x", f->mux_id);
+        }
     }
     void (^h)(uint8_t, uint8_t, uint8_t) = self.commandFrameHandler;
     if (h) h(f->mux_id, name, type);
@@ -729,11 +763,16 @@ static BOOL isQMIInterface(io_service_t s) {
         self->_fd[muxID] = fd;
         self->_everAttached = YES;
         memset(&self->_mux[muxID], 0, sizeof(qd_mux_stats));
+        // Without a stage (out of memory) the mux reads one packet at a time.
         const size_t stride = kMaxPacket + 4;
         qd_ul_stage *st = calloc(1, sizeof *st);
-        st->buf = malloc(stride * kULBatchMax);
-        for (int i = 0; i < kULBatchMax; i++) {
-            st->iov[i] = (struct iovec){ .iov_base = st->buf + i * stride, .iov_len = stride };
+        if (st && !(st->buf = malloc(stride * kULBatchMax))) { free(st); st = NULL; }
+        if (st) {
+            for (int i = 0; i < kULBatchMax; i++) {
+                st->iov[i] = (struct iovec){ .iov_base = st->buf + i * stride, .iov_len = stride };
+            }
+        } else {
+            QDLOG("no memory for mux 0x%02x's uplink stage; reading one packet at a time", muxID);
         }
         self->_stage[muxID] = st;
         dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, self->_ioQueue);
@@ -815,7 +854,7 @@ static BOOL isQMIInterface(io_service_t s) {
 
 - (void)uplinkReadable:(uint8_t)mux {
     if (![self canSend:mux]) return;
-    if (_ulBatch || qd_staged(_stage[mux])) { [self uplinkBatch:mux]; return; }
+    if ((_ulBatch && _stage[mux]) || qd_staged(_stage[mux])) { [self uplinkBatch:mux]; return; }
     int fd = _fd[mux];
     for (int reads = 0; reads < kULTurnPackets; reads++) {
         if (![self takeSlot]) return;
@@ -924,12 +963,10 @@ static BOOL isQMIInterface(io_service_t s) {
     // frame's padding by 4 bytes instead (always room: 8 spare bytes per buffer).
     if (_bulkOutMaxPacketSize && len % _bulkOutMaxPacketSize == 0) {
         uint8_t *h = base + _curLastHeader;
-        uint8_t pad = (h[0] & 0x3f) + 4;
-        size_t frame_len = (((size_t)h[2] << 8) | h[3]) + 4;
+        uint8_t pad = h[0] & 0x3f;
+        size_t plen = (((size_t)h[2] << 8) | h[3]) - pad;
         memset(base + len, 0, 4);
-        h[0] = (h[0] & 0xc0) | (pad & 0x3f);
-        h[2] = (uint8_t)(frame_len >> 8);
-        h[3] = (uint8_t)(frame_len & 0xff);
+        qd_qmap_write_header(h, false, h[1], plen, pad + 4);
         len += 4;
     }
 
@@ -1027,8 +1064,7 @@ static BOOL isQMIInterface(io_service_t s) {
 }
 
 - (void)close {
-    if (_closed) return;
-    _closed = YES;
+    if (atomic_exchange(&_closed, true)) return;
     dispatch_group_t gone = dispatch_group_create();
     dispatch_sync(_ioQueue, ^{
         self->_running = NO;

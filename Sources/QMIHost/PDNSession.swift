@@ -25,7 +25,6 @@ public struct PDNConfig: CustomStringConvertible {
 // One PDN: a WDS client per IP family, all bound to the same mux (PLAN.md §4.2).
 public final class PDNSession {
     public let config: PDNConfig
-    public let dataInterface: UInt8
     public private(set) var settings: [UInt8: WDS.RuntimeSettings] = [:]
     public private(set) var failures: [UInt8: String] = [:]
     public private(set) var ends: [UInt8: WDS.CallEnd] = [:]
@@ -34,10 +33,9 @@ public final class PDNSession {
     private var clients: [UInt8: QMIClient] = [:]
     private var handles: [UInt8: UInt32] = [:]
 
-    public init(device: QMIDevice, config: PDNConfig, dataInterface: UInt8) {
+    public init(device: QMIDevice, config: PDNConfig) {
         self.device = device
         self.config = config
-        self.dataInterface = dataInterface
     }
 
     public var clientIDs: Set<UInt8> { Set(clients.values.map(\.id)) }
@@ -79,7 +77,7 @@ public final class PDNSession {
     private func connect(family: UInt8) throws {
         let wds = try device.allocateClient(.wds)
         clients[family] = wds
-        try wds.request(WDS.bindMuxDataPort, WDS.bindMuxDataPortRequest(interface: UInt32(dataInterface), muxID: config.muxID))
+        try wds.request(WDS.bindMuxDataPort, WDS.bindMuxDataPortRequest(interface: UInt32(device.modem.interfaceNumber), muxID: config.muxID))
         try wds.request(WDS.setIPFamily, [.u8(0x01, family)])
 
         let resp = try wds.request(WDS.startNetworkInterface,
@@ -115,7 +113,7 @@ public final class PDNSession {
     public func isConnected() -> Bool {
         for (family, wds) in clients where settings[family] != nil {
             guard let r = try? wds.request(WDS.getPacketServiceStatus, timeout: 5),
-                  let v = r[tlv: 0x01], v.first == 2 else { return false }
+                  WDS.parsePacketServiceStatus(r)?.connection == 2 else { return false }
         }
         return !clients.isEmpty
     }
@@ -145,8 +143,4 @@ public final class PDNSession {
         clients.removeAll()
         handles.removeAll()
     }
-}
-
-extension QMIProtocolError {
-    public static let invalidHandle = QMIProtocolError(rawValue: 0x0009)
 }

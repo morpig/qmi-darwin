@@ -30,7 +30,7 @@ final class GNSSAssist {
     }
 
     private let device: QMIDevice
-    private let log: (String, QMIDLogLevel) -> Void
+    private let log: LogSink
     // The inject message this modem takes; 0x00A7 until it answers NotSupported.
     private var injectMessage = LOC.injectXTRAData
     // Get Data Source only gives server URLs and size limits, and the RM520N never answers it.
@@ -38,7 +38,7 @@ final class GNSSAssist {
     private var sourceSilent = false
     static let sourceTimeout: TimeInterval = 2     // it answers in ~30 ms, when it answers
 
-    init(device: QMIDevice, log: @escaping (String, QMIDLogLevel) -> Void) {
+    init(device: QMIDevice, log: @escaping LogSink) {
         self.device = device
         self.log = log
     }
@@ -61,7 +61,7 @@ final class GNSSAssist {
             }
             do {
                 return Snapshot(supported: true, servers: source.servers, validity: try validity(c))
-            } catch QMIHostError.protocolError(let e, _) where e.rawValue == 1 {
+            } catch QMIHostError.protocolError(let e, _) where e == .malformedMessage {
                 // MalformedMessage (AT+QGPSXTRADATA? answers ERROR alike) after a load left unfinished.
                 return Snapshot(supported: true, servers: source.servers, unreadable: true)
             }
@@ -90,7 +90,7 @@ final class GNSSAssist {
             do {
                 try inject(c, data, partSize: partSize)
             } catch Failure.failed(let p, let n, let e) where p < n {
-                log("XTRA: part \(p) of \(n) failed (\(e)); loading again from part 1", .notice)
+                log(.notice, "XTRA: part \(p) of \(n) failed (\(e)); loading again from part 1")
                 do {
                     try inject(c, data, partSize: partSize)
                 } catch {
@@ -98,8 +98,8 @@ final class GNSSAssist {
                 }
             }
             let v = try validity(c)
-            log(String(format: "XTRA: loaded %d bytes in %.1f s, valid %@", data.count, Date().timeIntervalSince(started),
-                       v.map { "from \(ISO8601DateFormatter().string(from: $0.start)) for \($0.hours) h" } ?? "?"), .notice)
+            log(.notice, String(format: "XTRA: loaded %d bytes in %.1f s, valid %@", data.count, Date().timeIntervalSince(started),
+                                v.map { "from \(ISO8601DateFormatter().string(from: $0.start)) for \($0.hours) h" } ?? "?"))
             return QMIDXTRA(supported: true, validFrom: v?.start, validHours: v?.hours, servers: source.servers)
         }
     }
@@ -119,7 +119,7 @@ final class GNSSAssist {
                     LOC.injectedPart($0).map { $0 == n } ?? true
                 }
             } catch QMIHostError.protocolError(.notSupported, _) where n == 1 && injectMessage == LOC.injectXTRAData {
-                log("XTRA: Inject XTRA Data not supported; using Inject Predicted Orbits Data", .info)
+                log(.info, "XTRA: Inject XTRA Data not supported; using Inject Predicted Orbits Data")
                 injectMessage = LOC.injectPredictedOrbitsData
                 parts = LOC.injectRequests(data, message: injectMessage, partSize: partSize)
                 continue
@@ -156,7 +156,7 @@ final class GNSSAssist {
             return LOC.parseSource(ind)
         } catch QMIHostError.timeout {
             sourceSilent = true
-            log("XTRA: the modem doesn't answer Get Data Source; going on without its server list", .info)
+            log(.info, "XTRA: the modem doesn't answer Get Data Source; going on without its server list")
             return LOC.XTRASource(servers: [])
         }
     }
@@ -169,7 +169,7 @@ final class GNSSAssist {
     private func reply(_ c: QMIClient, _ message: UInt16, _ tlvs: [TLV] = []) throws -> QMIMessage {
         let ind = try c.requestIndication(message, tlvs, timeout: 5, indicationTimeout: 5)
         if let s = LOC.indicationStatus(ind), s != .success {
-            throw QMIHostError.transport(String(format: "loc 0x%04x: %@", message, s.description))
+            throw QMIHostError.failed(String(format: "loc 0x%04x: %@", message, s.description))
         }
         return ind
     }

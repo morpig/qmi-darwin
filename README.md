@@ -194,8 +194,9 @@ qmictl sharing                              Internet Sharing over the PDN: state
 qmictl reload | restart
 ```
 
-With qmid stopped, `qmictl probe | modem-status | profiles | plmn-name | nas-survey | profile-write | run`
-talk to the modem directly, for development. Run `qmictl --help` to see all options.
+With qmid stopped, `qmictl probe | modem-status | profiles | plmn-name | nas-survey | ambr-survey |
+reattach | profile-write | loc-survey | loc-inject | loc-fix | run` talk to the modem directly, for
+development (each takes `--iface N`, `--vendor HEX` and `-v`). Run `qmictl --help` to see all options.
 
 Client apps use the `QMIDAPI` library (XPC: status, events, connect/disconnect, policy,
 config, logs, radio, airplane mode, restart, bands, modes). Apps that only need to read state can watch the SCDynamicStore keys instead.

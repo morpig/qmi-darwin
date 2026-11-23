@@ -8,7 +8,7 @@ final class ConfigTests: XCTestCase {
         try JSONDecoder().decode(QMIDConfig.self, from: Data(json.utf8))
     }
 
-    private func pdn(_ name: String, profile: Int? = nil, apn: String? = "x", role: String? = nil,
+    private func pdn(_ name: String, profile: Int? = nil, apn: String? = "x", role: QMIDRole? = nil,
                      attach: Bool? = nil, auth: String? = nil, policy: String? = nil) -> QMIDConfig.PDN {
         QMIDConfig.PDN(name: name, profile: profile, apn: apn, family: nil, policy: policy, autoconnect: nil,
                        role: role, attach: attach, username: nil, password: nil, auth: auth)
@@ -24,7 +24,7 @@ final class ConfigTests: XCTestCase {
         """)
         XCTAssertNoThrow(try c.validate())
         XCTAssertEqual(c.pdns.map(\.families), [[4, 6], [6], [4]])
-        XCTAssertEqual(c.pdns.map(\.effectiveRole), ["internet", "ims", "other"])
+        XCTAssertEqual(c.pdns.map(\.effectiveRole), [.internet, .ims, .other])
         XCTAssertEqual(c.pdns.map(\.isAttach), [true, false, false])
         XCTAssertEqual(c.pdns[1].profile, 2)
     }
@@ -46,8 +46,72 @@ final class ConfigTests: XCTestCase {
         invalid([pdn("a", policy: "always")])                          // unknown policy
         invalid([pdn("a", profile: 2), pdn("b", profile: 2)])          // same pinned profile
         invalid([pdn("a", attach: true), pdn("b", attach: true)])      // two attach PDNs
-        invalid([pdn("internet"), pdn("b", role: "internet")])         // both default to attach
-        invalid((0..<9).map { pdn("p\($0)", role: "other") })          // more than 8 PDNs
+        invalid([pdn("internet"), pdn("b", role: .internet)])         // both default to attach
+        invalid((0..<9).map { pdn("p\($0)", role: .other) })          // more than 8 PDNs
+    }
+
+    func testRoleAndFamilyDecode() throws {
+        let c = try QMIDConfig.decode(Data("""
+        { "pdns": [ { "name": "a", "role": "internet", "family": "ipv6", "apn": "a" },
+                    { "name": "b", "role": "other", "apn": "b" } ] }
+        """.utf8))
+        XCTAssertEqual(c.pdns.map(\.role), [.internet, .other])
+        XCTAssertEqual(c.pdns.map(\.family), [.ipv6, nil])
+        XCTAssertEqual(c.pdns.map(\.families), [[6], [4, 6]])
+        // Written back with the same names.
+        let again = try QMIDConfig.decode(c.encoded())
+        XCTAssertEqual(again, c)
+        let json = String(decoding: c.encoded(), as: UTF8.self)
+        XCTAssertTrue(json.contains(#""role" : "internet""#), json)
+        XCTAssertTrue(json.contains(#""family" : "ipv6""#), json)
+    }
+
+    func testBadRoleOrFamilyNamesThePDN() {
+        func message(_ json: String) -> String? {
+            do { _ = try QMIDConfig.decode(Data(json.utf8)); return nil } catch { return "\(error)" }
+        }
+        XCTAssertEqual(message(#"{ "pdns": [ { "name": "corp", "apn": "c", "role": "intenet" } ] }"#),
+                       "config: corp bad role intenet")
+        XCTAssertEqual(message(#"{ "pdns": [ { "name": "corp", "apn": "c", "family": "ipv5" } ] }"#),
+                       "config: corp bad family ipv5")
+        XCTAssertEqual(message(#"{ "pdns": [ { "apn": "c" } ] }"#), "config: pdns[0].name is missing")
+        XCTAssertEqual(message(#"{ "pdns": [ { "name": "corp", "profile": "one" } ] }"#), "config: pdns[0].profile must be Int")
+        // Bad JSON says where.
+        XCTAssertTrue(message("{\n \"pdns\": x }")?.contains("line 2") == true)
+        // Validation errors: no "transport:".
+        XCTAssertEqual(message(#"{ "pdns": [ { "name": "corp" } ] }"#), "config: corp needs profile or apn")
+    }
+
+    func testSUPLEndpoint() {
+        func ep(_ s: String) -> String? {
+            QMIDConfig.SUPLSettings.endpoint(s).map { "\($0.host) \($0.port)" }
+        }
+        XCTAssertEqual(ep("supl.example.test:7275"), "supl.example.test 7275")
+        XCTAssertEqual(ep("192.0.2.1:7275"), "192.0.2.1 7275")
+        XCTAssertEqual(ep("[2001:db8::1]:7275"), "2001:db8::1 7275")
+        XCTAssertNil(ep("2001:db8::1:7275"))                   // ambiguous without brackets
+        XCTAssertNil(ep("[supl.example.test]:7275"))
+        XCTAssertNil(ep("[2001:db8::1]"))
+        XCTAssertNil(ep("supl.example.test"))
+        XCTAssertNil(ep(":7275"))
+        XCTAssertNil(ep("[]:7275"))
+        XCTAssertNil(ep("supl.example.test:0"))
+        XCTAssertNil(ep("supl.example.test:70000"))
+        XCTAssertEqual(QMIDConfig.SUPLSettings(enabled: nil, server: nil).endpoint?.port, 7275)
+        XCTAssertThrowsError(try QMIDConfig.decode(Data(#"{ "pdns": [ { "name": "internet", "profile": 1 } ], "supl": { "server": "2001:db8::1:7275" } }"#.utf8)))
+        XCTAssertNoThrow(try QMIDConfig.decode(Data(#"{ "pdns": [ { "name": "internet", "profile": 1 } ], "supl": { "server": "[2001:db8::1]:7275" } }"#.utf8)))
+    }
+
+    func testSIMValidators() {
+        XCTAssertTrue(SIMIdentity.isMCCMNC("00101"))
+        XCTAssertTrue(SIMIdentity.isMCCMNC("001001"))
+        XCTAssertFalse(SIMIdentity.isMCCMNC("0010"))
+        XCTAssertFalse(SIMIdentity.isMCCMNC("0010a"))
+        XCTAssertFalse(SIMIdentity.isMCCMNC("００１０１"))          // full-width digits: isNumber, not ASCII
+        XCTAssertTrue(SIMIdentity.isICCIDPrefix("8900"))
+        XCTAssertFalse(SIMIdentity.isICCIDPrefix(""))
+        XCTAssertFalse(SIMIdentity.isICCIDPrefix(String(repeating: "1", count: 23)))
+        XCTAssertEqual("\(SIMIdentity(mccmnc: "00101", iccid: "8900000000000000001"))", "001-01 …0001")
     }
 
     func testOneShotKeys() throws {
@@ -72,7 +136,7 @@ final class ConfigTests: XCTestCase {
         func invalid(_ p: QMIDConfig.PDN, file: StaticString = #filePath, line: UInt = #line) {
             XCTAssertThrowsError(try QMIDConfig(interface: nil, pdns: [p]).validate(), file: file, line: line)
         }
-        var p = pdn("e", role: "other")
+        var p = pdn("e", role: .other)
         p.redial = false
         p.autoconnect = true
         invalid(p)                                                     // one-shot can't autoconnect
@@ -83,7 +147,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertNoThrow(try QMIDConfig(interface: nil, pdns: [p]).validate())
         p.redial = nil
         invalid(p)                                                     // maxUptime needs redial false
-        var t = pdn("t", role: "other")
+        var t = pdn("t", role: .other)
         t.apnType = ["default", "sos"]
         invalid(t)                                                     // unknown APN type
     }
@@ -95,9 +159,11 @@ final class ConfigTests: XCTestCase {
     }
 
     func testRoleDefaults() {
-        XCTAssertEqual(pdn("internet").effectiveRole, "internet")
-        XCTAssertEqual(pdn("ims").effectiveRole, "ims")
-        XCTAssertEqual(pdn("mms").effectiveRole, "other")
+        XCTAssertEqual(pdn("internet").effectiveRole, .internet)
+        XCTAssertEqual(pdn("ims").effectiveRole, .ims)
+        XCTAssertEqual(pdn("mms").effectiveRole, .other)
+        XCTAssertEqual(pdn("other").effectiveRole, .other)
+        XCTAssertEqual(pdn("internet", role: .other).effectiveRole, .other)
         XCTAssertTrue(pdn("internet").isAttach)
         XCTAssertFalse(pdn("internet", attach: false).isAttach)
         XCTAssertFalse(pdn("ims").isAttach)
@@ -340,11 +406,11 @@ final class CarrierConfigTests: XCTestCase {
 extension ConfigTests {
     // reload keeps a PDN's call when only its policy changed; anything else redials it.
     func testReloadKeepsPDNWhenOnlyPolicyChanged() {
-        let a = pdn("internet", apn: "internet", role: "internet", policy: "prefer-wifi")
+        let a = pdn("internet", apn: "internet", role: .internet, policy: "prefer-wifi")
         XCTAssertTrue(Manager.sameExceptPolicy(a, a))
-        XCTAssertTrue(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: "internet", policy: "never")))
-        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet2", role: "internet", policy: "prefer-wifi")))
-        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: "internet", auth: "chap", policy: "prefer-wifi")))
+        XCTAssertTrue(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: .internet, policy: "never")))
+        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet2", role: .internet, policy: "prefer-wifi")))
+        XCTAssertFalse(Manager.sameExceptPolicy(a, pdn("internet", apn: "internet", role: .internet, auth: "chap", policy: "prefer-wifi")))
         var b = a
         b.autoconnect = false
         XCTAssertFalse(Manager.sameExceptPolicy(a, b))

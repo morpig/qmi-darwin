@@ -37,7 +37,7 @@ int qd_utun_open(char ifname[16]) {
 
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) goto fail;
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) goto fail;
     return fd;
 
 fail:;

@@ -1,8 +1,9 @@
 import Foundation
 
 // Typed views of qmid's dictionaries. Unknown keys are ignored and missing optional keys
-// stay nil, so newer or older qmid versions decode fine. qmid builds its dictionaries from the
-// same types (`dictionary`), so both sides share one definition of every key.
+// stay nil, so newer or older qmid versions decode fine; values this version doesn't know are
+// kept as raw strings (stateName, ratName, …) with a typed accessor that is nil for them.
+// `dictionary` encodes a model with the same keys, for qmid and for tests.
 
 // The modem as qmid sees it (QMIDKey.modem).
 public enum QMIDModemState: String {
@@ -16,6 +17,12 @@ public enum QMIDPolicy: String, CaseIterable {
     case preferCellular = "prefer-cellular"
     case lastResort = "last-resort"
     case never = "never"
+}
+
+// What a PDN is for (QMIDKey.role, the config's "role"): the internet PDN gets the system
+// proxies and Internet Sharing; ims carries P-CSCF addresses.
+public enum QMIDRole: String, CaseIterable {
+    case internet, ims, other
 }
 
 public struct QMIDPDN: Equatable {
@@ -54,9 +61,12 @@ public struct QMIDPDN: Equatable {
     // While connected: the technology its data goes over, as QMIDBandPreference.modes names
     // ("nr", "lte", …). Per PDN: in EN-DC one APN can be on the NR leg while another stays on LTE.
     public var rat: String?
+    // status() only: the PDN's datapath counters, while its mux is attached.
+    public var counters: QMIDCounters?
 
     public var isConnected: Bool { state == .connected }
     public var policyKind: QMIDPolicy? { policy.flatMap(QMIDPolicy.init(rawValue:)) }
+    public var roleKind: QMIDRole? { role.flatMap(QMIDRole.init(rawValue:)) }
 
     // IPv6 address without the prefix length, for binding sockets.
     public var ipv6Address: String? { ipv6.map { String($0.split(separator: "/").first ?? Substring($0)) } }
@@ -101,6 +111,7 @@ public struct QMIDPDN: Equatable {
         bearers = (d[QMIDKey.bearers] as? [NSDictionary]).map { $0.compactMap(QMIDBearer.init) }
         linkHeld = d[QMIDKey.linkHeld] as? Bool ?? false
         rat = d[QMIDKey.rat] as? String
+        counters = (d[QMIDKey.counters] as? NSDictionary).map(QMIDCounters.init)
     }
 
     public var dictionary: NSDictionary {
@@ -127,8 +138,37 @@ public struct QMIDPDN: Equatable {
         d[QMIDKey.ambr] = ambr?.dictionary
         d[QMIDKey.bearers] = bearers?.map(\.dictionary)
         d[QMIDKey.rat] = rat
+        d[QMIDKey.counters] = counters?.dictionary
         return d as NSDictionary
     }
+}
+
+// Datapath counters by name (status(): per PDN and datapath-wide). Diagnostics: the names
+// can change between qmid versions; the accessors cover the per-PDN ones.
+public struct QMIDCounters: Equatable {
+    public var values: [String: UInt64]
+
+    public init(_ values: [String: UInt64] = [:]) { self.values = values }
+
+    public init(_ d: NSDictionary) {
+        var v: [String: UInt64] = [:]
+        for (k, n) in d { if let k = k as? String, let n = n as? NSNumber { v[k] = n.uint64Value } }
+        values = v
+    }
+
+    public var dictionary: NSDictionary { values.mapValues { NSNumber(value: $0) } as NSDictionary }
+
+    public subscript(name: String) -> UInt64? { values[name] }
+
+    public var rxPackets: UInt64? { values["rx_packets"] }
+    public var rxBytes: UInt64? { values["rx_bytes"] }
+    public var rxDrops: UInt64? { values["rx_drops"] }
+    public var txPackets: UInt64? { values["tx_packets"] }
+    public var txBytes: UInt64? { values["tx_bytes"] }
+    public var txDrops: UInt64? { values["tx_drops"] }
+    public var flowDisables: UInt64? { values["flow_disables"] }      // QMAP flow-disable commands
+    public var flowDisabledMs: UInt64? { values["flow_disabled_ms"] } // total time uplink was held
+    public var flowDisabled: Bool? { values["flow_disabled"].map { $0 != 0 } }
 }
 
 // Why a PDN isn't up, as a word (QMIDPDN.reason); `error` has it in words.
@@ -471,10 +511,30 @@ public struct QMIDStatus: Equatable {
     public var airplaneMode: Bool
     public var gnss: QMIDGNSS?
     public var sharing: QMIDSharing?          // nil unless config "sharing" is set
+    public var datapath: QMIDCounters?        // datapath-wide counters, while the modem is open
 
     public var modemState: QMIDModemState? { QMIDModemState(rawValue: modem) }
     public var isModemReady: Bool { modemState == .ready }
     public func pdn(_ name: String) -> QMIDPDN? { pdns.first { $0.name == name } }
+
+    public init(apiVersion: Int? = qmidAPIVersion, version: String? = nil, modem: String = QMIDModemState.absent.rawValue,
+                modemError: String? = nil, network: String? = nil, pdns: [QMIDPDN] = [], sim: QMIDSIM? = nil,
+                plmn: QMIDPLMN? = nil, imei: String? = nil, airplaneMode: Bool = false, gnss: QMIDGNSS? = nil,
+                sharing: QMIDSharing? = nil, datapath: QMIDCounters? = nil) {
+        self.apiVersion = apiVersion
+        self.version = version
+        self.modem = modem
+        self.modemError = modemError
+        self.network = network
+        self.pdns = pdns
+        self.sim = sim
+        self.plmn = plmn
+        self.imei = imei
+        self.airplaneMode = airplaneMode
+        self.gnss = gnss
+        self.sharing = sharing
+        self.datapath = datapath
+    }
 
     public init(_ d: NSDictionary) {
         apiVersion = d[QMIDKey.apiVersion] as? Int
@@ -489,7 +549,95 @@ public struct QMIDStatus: Equatable {
         airplaneMode = d[QMIDKey.airplaneMode] as? Bool ?? false
         gnss = (d[QMIDKey.gnss] as? NSDictionary).map(QMIDGNSS.init)
         sharing = (d[QMIDKey.sharing] as? NSDictionary).flatMap(QMIDSharing.init)
+        datapath = (d[QMIDKey.datapath] as? NSDictionary).map(QMIDCounters.init)
     }
+
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.modem: modem, QMIDKey.pdns: pdns.map(\.dictionary),
+                                QMIDKey.airplaneMode: airplaneMode]
+        d[QMIDKey.apiVersion] = apiVersion
+        d[QMIDKey.version] = version
+        d[QMIDKey.modemError] = modemError
+        d[QMIDKey.network] = network
+        d[QMIDKey.sim] = sim?.dictionary
+        d[QMIDKey.plmn] = plmn?.dictionary
+        d[QMIDKey.imei] = imei
+        d[QMIDKey.gnss] = gnss?.dictionary
+        d[QMIDKey.sharing] = sharing?.dictionary
+        d[QMIDKey.datapath] = datapath?.dictionary
+        return d as NSDictionary
+    }
+}
+
+// The modem's state as "modem" events carry it (QMIDClient.onModem). status() has the same
+// fields at its top level.
+public struct QMIDModem: Equatable {
+    public var state: String                  // QMIDModemState raw value; see stateKind
+    public var network: String?               // "registered, ps attached, lte"
+    public var error: String?
+    public var airplaneMode: Bool
+
+    public var stateKind: QMIDModemState? { QMIDModemState(rawValue: state) }
+
+    public init(state: String, network: String? = nil, error: String? = nil, airplaneMode: Bool = false) {
+        self.state = state
+        self.network = network
+        self.error = error
+        self.airplaneMode = airplaneMode
+    }
+
+    public init(state: QMIDModemState, network: String? = nil, error: String? = nil, airplaneMode: Bool = false) {
+        self.init(state: state.rawValue, network: network, error: error, airplaneMode: airplaneMode)
+    }
+
+    // From a "modem" event (or status(), which has the same keys).
+    public init(_ d: NSDictionary) {
+        state = d[QMIDKey.modem] as? String ?? "unknown"
+        network = d[QMIDKey.network] as? String
+        error = d[QMIDKey.modemError] as? String
+        airplaneMode = d[QMIDKey.airplaneMode] as? Bool ?? false
+    }
+
+    // The fields without the event type; airplaneMode only when on.
+    public var dictionary: NSDictionary {
+        var d: [String: Any] = [QMIDKey.modem: state]
+        d[QMIDKey.network] = network
+        d[QMIDKey.modemError] = error
+        if airplaneMode { d[QMIDKey.airplaneMode] = true }
+        return d as NSDictionary
+    }
+}
+
+// Event dictionaries as qmid sends them (QMIDEvents.qmidEvent), built from the models.
+public enum QMIDEventDictionary {
+    private static func event(_ type: String, _ fields: [String: Any?] = [:]) -> NSDictionary {
+        var d: [String: Any] = [QMIDKey.type: type]
+        for (k, v) in fields { if let v { d[k] = v } }
+        return d as NSDictionary
+    }
+
+    public static func modem(_ m: QMIDModem) -> NSDictionary {
+        let d = NSMutableDictionary(dictionary: m.dictionary)
+        d[QMIDKey.type] = QMIDEventType.modem
+        return d
+    }
+    public static func pdn(_ p: QMIDPDN) -> NSDictionary { event(QMIDEventType.pdn, [QMIDKey.pdn: p.dictionary]) }
+    public static var config: NSDictionary { event(QMIDEventType.config) }
+    public static func sim(_ s: QMIDSIM?) -> NSDictionary { event(QMIDEventType.sim, [QMIDKey.sim: s?.dictionary]) }
+    public static func plmn(_ p: QMIDPLMN?) -> NSDictionary { event(QMIDEventType.plmn, [QMIDKey.plmn: p?.dictionary]) }
+    public static func bearers(pdn: String, _ bearers: [QMIDBearer]) -> NSDictionary {
+        event(QMIDEventType.bearers, [QMIDKey.pdn: pdn, QMIDKey.bearers: bearers.map(\.dictionary)])
+    }
+    public static func gnss(_ g: QMIDGNSS) -> NSDictionary { event(QMIDEventType.gnss, [QMIDKey.gnss: g.dictionary]) }
+    public static func sharing(_ s: QMIDSharing?) -> NSDictionary { event(QMIDEventType.sharing, [QMIDKey.sharing: s?.dictionary]) }
+    public static func radio(_ r: QMIDRadio?) -> NSDictionary { event(QMIDEventType.radio, [QMIDKey.radio: r?.dictionary]) }
+    public static func location(_ l: QMIDLocation) -> NSDictionary { event(QMIDEventType.location, [QMIDKey.location: l.dictionary]) }
+    public static func satellites(_ s: QMIDSatellites) -> NSDictionary {
+        let d = NSMutableDictionary(dictionary: s.dictionary)
+        d[QMIDKey.type] = QMIDEventType.satellites
+        return d
+    }
+    public static func nmea(_ sentence: String) -> NSDictionary { event(QMIDEventType.nmea, [QMIDKey.nmea: sentence]) }
 }
 
 public enum QMIDEvent: Equatable {
@@ -519,6 +667,8 @@ public struct QMIDError: Error, CustomStringConvertible, Equatable {
     public var message: String
     // connect: the PDN as the failed attempt left it (reason, causes); nil for other calls.
     public var pdn: QMIDPDN?
+    // QMIDClient.sync: qmid didn't answer in time.
+    public var timedOut = false
     public init(_ message: String) { self.message = message }
     public var description: String { message }
 
@@ -585,8 +735,8 @@ public struct QMIDRadio: Equatable {
     public var nrRRC: QMIDRRCState?       // the NR RRC connection; nil without NR
     public var raw: [String]?             // radio(raw: true): the modem's TLVs, "0x0043 0x13: 00 15 …"
 
-    public var serving: [QMIDCell] { cells.filter { $0.role != .neighbor } }
-    public var neighbors: [QMIDCell] { cells.filter { $0.role == .neighbor } }
+    public var serving: [QMIDCell] { cells.filter { $0.roleKind == .primary || $0.roleKind == .secondary } }
+    public var neighbors: [QMIDCell] { cells.filter { $0.roleKind == .neighbor } }
 
     public init(cells: [QMIDCell] = [], endcAvailable: Bool? = nil, lteRRC: QMIDRRCState? = nil,
                 nrRRC: QMIDRRCState? = nil, raw: [String]? = nil) {
@@ -625,8 +775,8 @@ public struct QMIDCell: Equatable {
     public enum RAT: String { case lte, nr }
     public enum Role: String { case primary, secondary, neighbor }
 
-    public var rat: RAT
-    public var role: Role
+    public var ratName: String            // raw value, kept when unknown; see ratKind
+    public var roleName: String           // raw value, kept when unknown; see roleKind
     public var channel: Int?              // EARFCN / NR-ARFCN (downlink)
     public var band: Int?                 // 3GPP band number: 3 for B3, 41 for n41
     public var pci: Int?
@@ -641,16 +791,31 @@ public struct QMIDCell: Equatable {
     public var scellIndex: Int?           // LTE secondary cell: the RRC sCellIndex (1–7)
     public var pscell: Bool?              // NR: true on the NR leg of EN-DC (the PSCell); nil on NR SCells
 
+    // nil for a technology or role this version doesn't know (the cell is kept).
+    public var ratKind: RAT? { RAT(rawValue: ratName) }
+    public var roleKind: Role? { Role(rawValue: roleName) }
+
+    @available(*, deprecated, message: "use ratKind (nil for a technology this version doesn't know) or ratName")
+    public var rat: RAT {
+        get { ratKind ?? .lte }
+        set { ratName = newValue.rawValue }
+    }
+
+    @available(*, deprecated, message: "use roleKind (nil for a role this version doesn't know) or roleName")
+    public var role: Role {
+        get { roleKind ?? .neighbor }
+        set { roleName = newValue.rawValue }
+    }
+
     public init(rat: RAT, role: Role) {
-        self.rat = rat
-        self.role = role
+        ratName = rat.rawValue
+        roleName = role.rawValue
     }
 
     public init?(_ d: NSDictionary) {
-        guard let rat = (d[QMIDKey.rat] as? String).flatMap(RAT.init),
-              let role = (d[QMIDKey.role] as? String).flatMap(Role.init) else { return nil }
-        self.rat = rat
-        self.role = role
+        guard let rat = d[QMIDKey.rat] as? String, let role = d[QMIDKey.role] as? String else { return nil }
+        ratName = rat
+        roleName = role
         channel = d[QMIDKey.channel] as? Int
         band = d[QMIDKey.band] as? Int
         pci = d[QMIDKey.pci] as? Int
@@ -667,7 +832,7 @@ public struct QMIDCell: Equatable {
     }
 
     public var dictionary: NSDictionary {
-        var d: [String: Any] = [QMIDKey.rat: rat.rawValue, QMIDKey.role: role.rawValue]
+        var d: [String: Any] = [QMIDKey.rat: ratName, QMIDKey.role: roleName]
         d[QMIDKey.channel] = channel
         d[QMIDKey.band] = band
         d[QMIDKey.pci] = pci
@@ -890,18 +1055,23 @@ public struct QMIDSatellite: Equatable {
     public var system: String                 // "gps", "beidou", …; "system N" when unknown
     public var id: Int
     public var signal: String?
-    public var tracking: Bool                 // false: searching
+    public var stateName: String              // "tracking" | "searching"; raw value, kept when unknown
     public var elevation: Double?
     public var azimuth: Double?
     public var cn0: Double?
     public var used: Bool
+
+    public var tracking: Bool {               // false: searching (or a state this version doesn't know)
+        get { stateName == "tracking" }
+        set { stateName = newValue ? "tracking" : "searching" }
+    }
 
     public init(system: String, id: Int, signal: String? = nil, tracking: Bool, elevation: Double? = nil,
                 azimuth: Double? = nil, cn0: Double? = nil, used: Bool = false) {
         self.system = system
         self.id = id
         self.signal = signal
-        self.tracking = tracking
+        stateName = tracking ? "tracking" : "searching"
         self.elevation = elevation
         self.azimuth = azimuth
         self.cn0 = cn0
@@ -913,7 +1083,7 @@ public struct QMIDSatellite: Equatable {
         self.system = system
         self.id = id
         signal = d[QMIDKey.signal] as? String
-        tracking = d[QMIDKey.state] as? String == "tracking"
+        stateName = d[QMIDKey.state] as? String ?? "searching"
         elevation = d[QMIDKey.elevation] as? Double
         azimuth = d[QMIDKey.azimuth] as? Double
         cn0 = d[QMIDKey.cn0] as? Double
@@ -921,7 +1091,7 @@ public struct QMIDSatellite: Equatable {
     }
 
     public var dictionary: NSDictionary {
-        var d: [String: Any] = [QMIDKey.system: system, QMIDKey.id: id, QMIDKey.state: tracking ? "tracking" : "searching",
+        var d: [String: Any] = [QMIDKey.system: system, QMIDKey.id: id, QMIDKey.state: stateName,
                                 QMIDKey.used: used]
         d[QMIDKey.signal] = signal
         d[QMIDKey.elevation] = elevation
@@ -1015,7 +1185,8 @@ public struct QMIDGNSSAssist: Equatable {
     public var firstFixDistance: Double?      // m between the injected position and the first fix
 
     public init(time: Date, result: Result, source: String = "supl", server: String? = nil, cell: String? = nil,
-                uncertainty: Double? = nil, duration: Double? = nil, error: String? = nil) {
+                uncertainty: Double? = nil, duration: Double? = nil, error: String? = nil,
+                firstFixAfter: Double? = nil, firstFixDistance: Double? = nil) {
         self.time = time
         self.result = result
         self.source = source
@@ -1024,6 +1195,8 @@ public struct QMIDGNSSAssist: Equatable {
         self.uncertainty = uncertainty
         self.duration = duration
         self.error = error
+        self.firstFixAfter = firstFixAfter
+        self.firstFixDistance = firstFixDistance
     }
 
     public init(_ d: NSDictionary) {
@@ -1064,16 +1237,24 @@ public struct QMIDSharing: Equatable {
     }
 
     public var pdn: String
-    public var state: State
+    public var stateName: String              // raw value, kept when unknown; see stateKind
     public var interface: String?             // the PDN's utun, while on
     public var bridge: String?                // the shared network's interface, while on
     public var sharedTo: [String]             // interfaces shared to ("en0")
     public var clients: Int                   // devices on the shared network
 
+    public var stateKind: State? { State(rawValue: stateName) }   // nil for a state this version doesn't know
+
+    @available(*, deprecated, message: "use stateKind (nil for a state this version doesn't know) or stateName")
+    public var state: State {
+        get { stateKind ?? .waiting }
+        set { stateName = newValue.rawValue }
+    }
+
     public init(pdn: String, state: State, interface: String? = nil, bridge: String? = nil,
                 sharedTo: [String] = [], clients: Int = 0) {
         self.pdn = pdn
-        self.state = state
+        stateName = state.rawValue
         self.interface = interface
         self.bridge = bridge
         self.sharedTo = sharedTo
@@ -1081,10 +1262,9 @@ public struct QMIDSharing: Equatable {
     }
 
     public init?(_ d: NSDictionary) {
-        guard let p = d[QMIDKey.pdn] as? String,
-              let s = (d[QMIDKey.state] as? String).flatMap(State.init(rawValue:)) else { return nil }
+        guard let p = d[QMIDKey.pdn] as? String, let s = d[QMIDKey.state] as? String else { return nil }
         pdn = p
-        state = s
+        stateName = s
         interface = d[QMIDKey.interface] as? String
         bridge = d[QMIDKey.bridge] as? String
         sharedTo = d[QMIDKey.sharedTo] as? [String] ?? []
@@ -1092,10 +1272,278 @@ public struct QMIDSharing: Equatable {
     }
 
     public var dictionary: NSDictionary {
-        var d: [String: Any] = [QMIDKey.pdn: pdn, QMIDKey.state: state.rawValue, QMIDKey.sharedTo: sharedTo,
+        var d: [String: Any] = [QMIDKey.pdn: pdn, QMIDKey.state: stateName, QMIDKey.sharedTo: sharedTo,
                                 QMIDKey.clients: clients]
         d[QMIDKey.interface] = interface
         d[QMIDKey.bridge] = bridge
         return d as NSDictionary
+    }
+}
+
+// profiles(): what qmid did with the modem's data profiles at its last sync, and what the
+// modem holds now. Diagnostics, mostly text. On the wire an array of entries (QMIDKey,
+// "profiles()"); empty (all nil / []) while the modem isn't open.
+public struct QMIDProfileReport: Equatable {
+    // One PDN's profile at the last sync.
+    public struct PDN: Equatable {
+        public var pdn: String
+        public var action: String             // "in sync", "created", "updated: …", "write failed: …"
+        public var failed: Bool               // writing the profile failed
+        public var profile: Int?              // modem profile index
+        public var attach: Bool               // it is the LTE attach profile
+        public var settings: String?          // the modem profile as now set
+
+        public init(pdn: String, action: String = "", failed: Bool = false, profile: Int? = nil,
+                    attach: Bool = false, settings: String? = nil) {
+            self.pdn = pdn
+            self.action = action
+            self.failed = failed
+            self.profile = profile
+            self.attach = attach
+            self.settings = settings
+        }
+
+        public init?(_ d: NSDictionary) {
+            guard let p = d[QMIDKey.pdn] as? String else { return nil }
+            pdn = p
+            action = d[QMIDKey.action] as? String ?? ""
+            failed = d[QMIDKey.failed] as? Bool ?? false
+            profile = d[QMIDKey.profile] as? Int
+            attach = d[QMIDKey.attach] as? Bool ?? false
+            settings = d[QMIDKey.settings] as? String
+        }
+
+        public var dictionary: NSDictionary {
+            var d: [String: Any] = [QMIDKey.pdn: pdn, QMIDKey.action: action]
+            if failed { d[QMIDKey.failed] = true }
+            d[QMIDKey.profile] = profile
+            if attach { d[QMIDKey.attach] = true }
+            d[QMIDKey.settings] = settings
+            return d as NSDictionary
+        }
+    }
+
+    // What qmid sends as `sim` before it has read the SIM.
+    public static let simNotRead = "not read yet"
+
+    public var sim: String?                   // the SIM as identified, or simNotRead; nil: no report
+    public var carrier: String?               // "<name> by <matchedBy>" | "no match"; nil without "carriers"
+    public var attachAPN: String?             // the default bearer's APN, " (chosen by the network)" appended when so
+    public var pending: String?               // the prepareSIM card
+    public var pdns: [PDN]
+    public var error: String?                 // the last sync's error
+    public var learned: [String]              // default bearer APNs seen, "home mccmnc: apn"
+    public var modemProfiles: [String]?       // the modem's profiles, one line each; nil when unread
+    public var autoconnect: String?
+    public var attachProfile: Int?            // the LTE attach profile index
+
+    public init(sim: String? = nil, carrier: String? = nil, attachAPN: String? = nil, pending: String? = nil,
+                pdns: [PDN] = [], error: String? = nil, learned: [String] = [], modemProfiles: [String]? = nil,
+                autoconnect: String? = nil, attachProfile: Int? = nil) {
+        self.sim = sim
+        self.carrier = carrier
+        self.attachAPN = attachAPN
+        self.pending = pending
+        self.pdns = pdns
+        self.error = error
+        self.learned = learned
+        self.modemProfiles = modemProfiles
+        self.autoconnect = autoconnect
+        self.attachProfile = attachProfile
+    }
+
+    // Each entry is told apart by its leading key; `attach` is a Bool in PDN entries and the
+    // attach profile index in its own entry.
+    public init(_ list: NSArray) {
+        self.init()
+        for case let e as NSDictionary in list {
+            if let p = PDN(e) {
+                pdns.append(p)
+            } else if let s = e[QMIDKey.sim] as? String {
+                sim = s
+                carrier = e[QMIDKey.carrier] as? String
+                attachAPN = e[QMIDKey.attachAPN] as? String
+                pending = e[QMIDKey.pending] as? String
+            } else if let l = e[QMIDKey.learned] as? [String] {
+                learned = l
+            } else if let m = e[QMIDKey.modem] as? [String] {
+                modemProfiles = m
+            } else if let a = e[QMIDKey.autoconnect] as? String {
+                autoconnect = a
+            } else if let a = e[QMIDKey.attach] as? Int {
+                attachProfile = a
+            } else if let err = e[QMIDKey.error] as? String {
+                error = err
+            }
+        }
+    }
+
+    public var array: NSArray {
+        var out: [NSDictionary] = []
+        if let sim {
+            var e: [String: Any] = [QMIDKey.sim: sim]
+            e[QMIDKey.carrier] = carrier
+            e[QMIDKey.attachAPN] = attachAPN
+            e[QMIDKey.pending] = pending
+            out.append(e as NSDictionary)
+        }
+        out += pdns.map(\.dictionary)
+        if let error { out.append([QMIDKey.error: error]) }
+        if !learned.isEmpty { out.append([QMIDKey.learned: learned]) }
+        if let modemProfiles { out.append([QMIDKey.modem: modemProfiles]) }
+        if let autoconnect { out.append([QMIDKey.autoconnect: autoconnect]) }
+        if let attachProfile { out.append([QMIDKey.attach: attachProfile]) }
+        return out as NSArray
+    }
+}
+
+// SCDynamicStore State:/Network/QMI/Modem (QMIDStoreKey.modem), fields QMIDStoreField.
+public struct QMIDStoreModem: Equatable {
+    public var state: String                  // QMIDModemState raw value; "running" from `qmictl run`
+    public var network: String?
+    public var vendorID: Int?                 // USB, while a modem is open
+    public var productID: Int?
+    public var interface: Int?                // the QMI interface number
+    public var lastError: String?
+    public var airplaneMode: Bool
+    public var sim: QMIDSIM?                  // never with identities (any local user can read the store)
+    public var plmn: QMIDPLMN?
+
+    public init(state: String, network: String? = nil, vendorID: Int? = nil, productID: Int? = nil,
+                interface: Int? = nil, lastError: String? = nil, airplaneMode: Bool = false,
+                sim: QMIDSIM? = nil, plmn: QMIDPLMN? = nil) {
+        self.state = state
+        self.network = network
+        self.vendorID = vendorID
+        self.productID = productID
+        self.interface = interface
+        self.lastError = lastError
+        self.airplaneMode = airplaneMode
+        self.sim = sim
+        self.plmn = plmn
+    }
+
+    public init(_ d: NSDictionary) {
+        state = d[QMIDStoreField.state] as? String ?? "unknown"
+        network = d[QMIDStoreField.network] as? String
+        vendorID = d[QMIDStoreField.vendorID] as? Int
+        productID = d[QMIDStoreField.productID] as? Int
+        interface = d[QMIDStoreField.interface] as? Int
+        lastError = d[QMIDStoreField.lastError] as? String
+        airplaneMode = d[QMIDStoreField.airplaneMode] as? Bool ?? false
+        sim = QMIDSIM(d[QMIDStoreField.sim] as? NSDictionary)
+        plmn = QMIDPLMN(d[QMIDStoreField.plmn] as? NSDictionary)
+    }
+
+    // airplaneMode only when on.
+    public var dictionary: [String: Any] {
+        var d: [String: Any] = [QMIDStoreField.state: state]
+        d[QMIDStoreField.network] = network
+        d[QMIDStoreField.vendorID] = vendorID
+        d[QMIDStoreField.productID] = productID
+        d[QMIDStoreField.interface] = interface
+        d[QMIDStoreField.lastError] = lastError
+        if airplaneMode { d[QMIDStoreField.airplaneMode] = true }
+        d[QMIDStoreField.sim] = sim?.dictionary
+        d[QMIDStoreField.plmn] = plmn?.dictionary
+        return d
+    }
+}
+
+// SCDynamicStore State:/Network/QMI/PDN/<name> (QMIDStoreKey.pdn), fields QMIDStoreField. The
+// addresses and settings are there while connected; state, policy and the IDs always.
+public struct QMIDStorePDN: Equatable {
+    public var state: String                  // QMIDPDN.State raw value
+    public var serviceID: String
+    public var muxID: Int
+    public var policy: String                 // QMIDPolicy raw value
+    public var interfaceName: String?
+    public var profile: Int?
+    public var apn: String?
+    public var mtu: Int?
+    public var ipv4Address: String?
+    public var ipv6Address: String?           // "addr/prefix"
+    public var pcscfv4: [String]
+    public var pcscfv6: [String]
+    public var lastError: String?
+    public var rat: String?
+    public var qci: Int?
+    public var ambr: QMIDAMBR?
+
+    public init(state: String, serviceID: String, muxID: Int, policy: String, interfaceName: String? = nil,
+                profile: Int? = nil, apn: String? = nil, mtu: Int? = nil, ipv4Address: String? = nil,
+                ipv6Address: String? = nil, pcscfv4: [String] = [], pcscfv6: [String] = [], lastError: String? = nil,
+                rat: String? = nil, qci: Int? = nil, ambr: QMIDAMBR? = nil) {
+        self.state = state
+        self.serviceID = serviceID
+        self.muxID = muxID
+        self.policy = policy
+        self.interfaceName = interfaceName
+        self.profile = profile
+        self.apn = apn
+        self.mtu = mtu
+        self.ipv4Address = ipv4Address
+        self.ipv6Address = ipv6Address
+        self.pcscfv4 = pcscfv4
+        self.pcscfv6 = pcscfv6
+        self.lastError = lastError
+        self.rat = rat
+        self.qci = qci
+        self.ambr = ambr
+    }
+
+    public init?(_ d: NSDictionary) {
+        guard let id = d[QMIDStoreField.serviceID] as? String else { return nil }
+        serviceID = id
+        state = d[QMIDStoreField.state] as? String ?? "unknown"
+        muxID = d[QMIDStoreField.muxID] as? Int ?? 0
+        policy = d[QMIDStoreField.policy] as? String ?? ""
+        interfaceName = d[QMIDStoreField.interfaceName] as? String
+        profile = d[QMIDStoreField.profile] as? Int
+        apn = d[QMIDStoreField.apn] as? String
+        mtu = d[QMIDStoreField.mtu] as? Int
+        ipv4Address = d[QMIDStoreField.ipv4Address] as? String
+        ipv6Address = d[QMIDStoreField.ipv6Address] as? String
+        pcscfv4 = d[QMIDStoreField.pcscfv4] as? [String] ?? []
+        pcscfv6 = d[QMIDStoreField.pcscfv6] as? [String] ?? []
+        lastError = d[QMIDStoreField.lastError] as? String
+        rat = d[QMIDStoreField.rat] as? String
+        qci = d[QMIDStoreField.qci] as? Int
+        if let a = d[QMIDStoreField.ambr] as? NSDictionary, let ul = (a[QMIDStoreField.uplink] as? NSNumber)?.uint64Value,
+           let dl = (a[QMIDStoreField.downlink] as? NSNumber)?.uint64Value {
+            ambr = QMIDAMBR(uplink: ul, downlink: dl)
+        }
+    }
+
+    public var dictionary: [String: Any] {
+        var d: [String: Any] = [QMIDStoreField.state: state, QMIDStoreField.serviceID: serviceID,
+                                QMIDStoreField.muxID: muxID, QMIDStoreField.policy: policy]
+        d[QMIDStoreField.interfaceName] = interfaceName
+        d[QMIDStoreField.profile] = profile
+        d[QMIDStoreField.apn] = apn
+        d[QMIDStoreField.mtu] = mtu
+        d[QMIDStoreField.ipv4Address] = ipv4Address
+        d[QMIDStoreField.ipv6Address] = ipv6Address
+        if !pcscfv4.isEmpty { d[QMIDStoreField.pcscfv4] = pcscfv4 }
+        if !pcscfv6.isEmpty { d[QMIDStoreField.pcscfv6] = pcscfv6 }
+        d[QMIDStoreField.lastError] = lastError
+        d[QMIDStoreField.rat] = rat
+        d[QMIDStoreField.qci] = qci
+        d[QMIDStoreField.ambr] = ambr.map {
+            [QMIDStoreField.uplink: NSNumber(value: $0.uplink), QMIDStoreField.downlink: NSNumber(value: $0.downlink)]
+        }
+        return d
+    }
+}
+
+// A build's version as qmid reports it (QMIDKey.version): "0.27.0 (20261123120000)", from a
+// bundle's CFBundleShortVersionString and CFBundleVersion. nil without a short version (a dev
+// build run outside a bundle).
+public enum QMIDVersion {
+    public static func string(bundle: Bundle = .main) -> String? { string(info: bundle.infoDictionary) }
+
+    public static func string(info: [String: Any]?) -> String? {
+        guard let short = info?["CFBundleShortVersionString"] as? String else { return nil }
+        return "\(short) (\(info?["CFBundleVersion"] as? String ?? "?"))"
     }
 }

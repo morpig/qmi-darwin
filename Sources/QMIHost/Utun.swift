@@ -33,7 +33,7 @@ public final class Utun {
         for r in routes.reversed() {
             var del = r
             del[1] = "delete"
-            _ = try? Self.run("/sbin/route", del)
+            _ = try? Shell.run("/sbin/route", del)
         }
         routes.removeAll()
         let old = fd
@@ -45,18 +45,18 @@ public final class Utun {
         if let a = s.ipv4Address {
             // Point-to-point: the peer is the WDS gateway, or our own address if none.
             let peer = s.ipv4Gateway ?? a
-            try Self.run("/sbin/ifconfig", [name, "inet", "\(a)", "\(peer)", "netmask", "255.255.255.255", "up"])
+            try Shell.run("/sbin/ifconfig", [name, "inet", "\(a)", "\(peer)", "netmask", "255.255.255.255", "up"])
         } else if let old = ipv4 {
             // A utun kept across a redial whose new call has no IPv4.
-            try Self.run("/sbin/ifconfig", [name, "inet", "\(old)", "delete"])
+            try Shell.run("/sbin/ifconfig", [name, "inet", "\(old)", "delete"])
         }
         ipv4 = s.ipv4Address
         for args in Self.ipv6Commands(name, old: ipv6, new: s.ipv6Address) {
-            try Self.run("/sbin/ifconfig", args)
+            try Shell.run("/sbin/ifconfig", args)
         }
         ipv6 = s.ipv6Address
         if let mtu = s.mtu, mtu >= 1280, mtu <= 2000 {
-            try Self.run("/sbin/ifconfig", [name, "mtu", "\(mtu)"])
+            try Shell.run("/sbin/ifconfig", [name, "mtu", "\(mtu)"])
         }
     }
 
@@ -75,31 +75,14 @@ public final class Utun {
     public func addHostRoute(_ host: String) throws {
         let inet6 = host.contains(":")
         let args = ["-n", "add", inet6 ? "-inet6" : "-inet", "-host", host, "-interface", name]
-        try Self.run("/sbin/route", args)
+        try Shell.run("/sbin/route", args)
         routes.append(args)
     }
 
     // Scoped default routes, so sockets bound with IP_BOUND_IF (curl --interface) use this utun.
     public func addScopedDefault(inet6: Bool) throws {
         let args = ["-n", "add", inet6 ? "-inet6" : "-inet", "-ifscope", name, "default", "-interface", name]
-        try Self.run("/sbin/route", args)
+        try Shell.run("/sbin/route", args)
         routes.append(args)
-    }
-
-    @discardableResult
-    static func run(_ path: String, _ args: [String]) throws -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        try p.run()
-        p.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard p.terminationStatus == 0 else {
-            throw QMIHostError.transport("\(path) \(args.joined(separator: " ")): \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
-        }
-        return out
     }
 }

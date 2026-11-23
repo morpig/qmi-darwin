@@ -31,7 +31,7 @@ public enum LOC {
 
     // TLV 0x01 of a reply indication.
     public static func indicationStatus(_ m: QMIMessage) -> IndicationStatus? {
-        u32(m[tlv: 0x01]).map(IndicationStatus.init(rawValue:))
+        m.u32(tlv: 0x01).map(IndicationStatus.init(rawValue:))
     }
 
     // MARK: - XTRA (predicted orbits)
@@ -52,8 +52,7 @@ public enum LOC {
     public static func parseValidity(_ m: QMIMessage) -> XTRAValidity? {
         guard let v = m[tlv: 0x10], v.count >= 10 else { return nil }
         var r = ByteReader(v)
-        guard let lo = try? r.u32(), let hi = try? r.u32(), let hours = try? r.u16() else { return nil }
-        let start = UInt64(hi) << 32 | UInt64(lo)
+        guard let start = try? r.u64(), let hours = try? r.u16() else { return nil }
         guard start > 0, hours > 0 else { return nil }
         return XTRAValidity(start: Date(timeIntervalSince1970: TimeInterval(start)), hours: Int(hours))
     }
@@ -80,13 +79,9 @@ public enum LOC {
             s.maxFileSize = (try? r.u32()).map { Int($0) }
             s.maxPartSize = (try? r.u32()).map { Int($0) }
         }
-        if let v = m[tlv: 0x11], !v.isEmpty {
+        if let v = m[tlv: 0x11] {
             var r = ByteReader(v)
-            let n = (try? r.u8()) ?? 0
-            for _ in 0..<n {
-                guard let len = try? r.u8(), let b = try? r.take(Int(len)) else { break }
-                s.servers.append(String(decoding: b, as: UTF8.self))
-            }
+            s.servers = r.partialList { String(decoding: try $0.take(Int(try $0.u8())), as: UTF8.self) }
         }
         return s
     }
@@ -114,8 +109,7 @@ public enum LOC {
     // Inject indication: the status, 0x10 the part it answers. The last part's also carries
     // 0x11 (u64; 0x1F on the RM551E, 0x1B on the RM520N: apparently the constellations used).
     public static func injectedPart(_ m: QMIMessage) -> Int? {
-        guard let v = m[tlv: 0x10], v.count >= 2 else { return nil }
-        return Int(UInt16(v[0]) | UInt16(v[1]) << 8)
+        m.u16(tlv: 0x10).map { Int($0) }
     }
 
     // MARK: - Sessions
@@ -153,9 +147,7 @@ public enum LOC {
 
     public static func injectUTCTimeRequest(_ date: Date, uncertaintyMs: UInt32) -> [TLV] {
         var w = ByteWriter()
-        let ms = UInt64(max(0, date.timeIntervalSince1970 * 1000))
-        w.u32(UInt32(truncatingIfNeeded: ms))
-        w.u32(UInt32(truncatingIfNeeded: ms >> 32))
+        w.u64(UInt64(max(0, date.timeIntervalSince1970 * 1000)))
         return [TLV(0x01, w.bytes), .u32(0x02, uncertaintyMs)]
     }
 
@@ -164,21 +156,18 @@ public enum LOC {
     // No timestamp TLV: the time goes in with Inject UTC Time.
     public static let injectPosition: UInt16 = 0x0039
 
-    public enum PositionSource: UInt32 { case gnss = 0, cellID = 1, enhancedCellID = 2, wifi = 3, terrestrial = 4, hybrid = 5, other = 6 }
-
-    // `uncertainty`: circular, m; `confidence`: % (1–99); reliability "medium" (3).
+    // `uncertainty`: circular, m; `confidence`: % (1–99); reliability "medium" (3); source
+    // (0x1D) cell ID (1).
     public static func injectPositionRequest(latitude: Double, longitude: Double, uncertainty: Float,
-                                             confidence: UInt8 = 68, source: PositionSource = .cellID) -> [TLV] {
-        func f64(_ type: UInt8, _ v: Double) -> TLV {
-            var w = ByteWriter(); w.u32(UInt32(v.bitPattern & 0xffff_ffff)); w.u32(UInt32(v.bitPattern >> 32)); return TLV(type, w.bytes)
-        }
+                                             confidence: UInt8 = 68) -> [TLV] {
+        func f64(_ type: UInt8, _ v: Double) -> TLV { var w = ByteWriter(); w.f64(v); return TLV(type, w.bytes) }
         return [f64(0x10, latitude), f64(0x11, longitude), .u32(0x12, uncertainty.bitPattern),
-                .u8(0x13, confidence), .u32(0x14, 3), .u32(0x1D, source.rawValue)]
+                .u8(0x13, confidence), .u32(0x14, 3), .u32(0x1D, 1)]
     }
 
     // Engine State: TLV 0x01 is the state (1 on, 2 off), not a status.
     public static func parseEngineOn(_ m: QMIMessage) -> Bool? {
-        u32(m[tlv: 0x01]).flatMap { $0 == 1 ? true : $0 == 2 ? false : nil }
+        m.u32(tlv: 0x01).flatMap { $0 == 1 ? true : $0 == 2 ? false : nil }
     }
 
     // NMEA: TLV 0x01, the sentence.
@@ -234,7 +223,8 @@ public enum LOC {
             guard status == 2 || status == 3 else { continue }
             func float(_ at: Int, _ bit: UInt32) -> Float? {
                 guard valid & bit != 0 else { return nil }
-                return Float(bitPattern: (0..<4).reduce(UInt32(0)) { $0 | UInt32(list[o + at + $1]) << (8 * UInt32($1)) })
+                var f = ByteReader(list, offset: o + at)
+                return try? f.f32()
             }
             out.append(Satellite(system: system, id: id, signal: i < types.count ? types[i] : nil, tracking: status == 3,
                                  elevation: float(16, 1 << 5), azimuth: float(20, 1 << 6), cn0: float(24, 1 << 7)))
@@ -256,7 +246,7 @@ public enum LOC {
         public var time: Date?                // the modem's UTC; see timeKnown
         public var timeSource: UInt32?        // 0 invalid, 13 unknown, 7 navigation solution, …
         public var technology: UInt32?        // mask: 1 satellite, 2 cellular, 4 Wi-Fi, 8 sensors, …
-        public var used: [(id: UInt16, signal: UInt64?)] = []
+        public var used: [UsedSatellite] = []
 
         // Whether `time` can be believed. Before its first fix a modem reported a UTC 12 h off,
         // source "unknown"; a fix's own time is always good.
@@ -264,14 +254,13 @@ public enum LOC {
             status == 0 || (timeSource.map { $0 != 0 && $0 != 13 } ?? false)
         }
 
-        public static func == (a: Position, b: Position) -> Bool {
-            a.status == b.status && a.latitude == b.latitude && a.longitude == b.longitude
-                && a.horizontalAccuracy == b.horizontalAccuracy && a.altitude == b.altitude
-                && a.altitudeMSL == b.altitudeMSL && a.verticalAccuracy == b.verticalAccuracy
-                && a.speed == b.speed && a.verticalSpeed == b.verticalSpeed && a.heading == b.heading
-                && a.time == b.time && a.timeSource == b.timeSource && a.technology == b.technology
-                && a.used.map(\.id) == b.used.map(\.id) && a.used.map(\.signal) == b.used.map(\.signal)
-        }
+    }
+
+    // A satellite signal a fix used.
+    public struct UsedSatellite: Equatable {
+        public var id: UInt16
+        public var signal: UInt64?
+        public init(id: UInt16, signal: UInt64?) { self.id = id; self.signal = signal }
     }
 
     // Position Report: 0x01 session status, 0x10 latitude, 0x11 longitude (doubles), 0x12
@@ -280,9 +269,9 @@ public enum LOC {
     // 0x25 UTC (u64 ms), 0x29 time source, 0x2C satellites used (u8 count, u16 IDs; once per signal), 0x37 their
     // signal types (u8 count, u64 each).
     public static func parsePosition(_ m: QMIMessage) -> Position? {
-        guard let status = u32(m[tlv: 0x01]) else { return nil }
-        func f(_ t: UInt8) -> Float? { u32(m[tlv: t]).map(Float.init(bitPattern:)) }
-        func d(_ t: UInt8) -> Double? { m[tlv: t].flatMap { $0.count >= 8 ? Double(bitPattern: u64($0)) : nil } }
+        guard let status = m.u32(tlv: 0x01) else { return nil }
+        func f(_ t: UInt8) -> Float? { m.u32(tlv: t).map(Float.init(bitPattern:)) }
+        func d(_ t: UInt8) -> Double? { m.u64(tlv: t).map(Double.init(bitPattern:)) }
         var p = Position(status: status)
         p.latitude = d(0x10)
         p.longitude = d(0x11)
@@ -293,31 +282,23 @@ public enum LOC {
         p.verticalAccuracy = f(0x1C)
         p.verticalSpeed = f(0x1F)
         p.heading = f(0x20)
-        p.technology = u32(m[tlv: 0x23])
-        p.time = m[tlv: 0x25].flatMap { $0.count >= 8 ? Date(timeIntervalSince1970: TimeInterval(u64($0)) / 1000) : nil }
-        p.timeSource = u32(m[tlv: 0x29])
-        if let v = m[tlv: 0x2C], let n = v.first {
+        p.technology = m.u32(tlv: 0x23)
+        p.time = m.u64(tlv: 0x25).map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
+        p.timeSource = m.u32(tlv: 0x29)
+        if let v = m[tlv: 0x2C] {
             let types = u64s(m[tlv: 0x37])
-            var r = ByteReader(v, offset: 1)
-            for i in 0..<Int(n) {
-                guard let id = try? r.u16() else { break }
-                p.used.append((id, i < types.count ? types[i] : nil))
+            var r = ByteReader(v)
+            p.used = r.partialList { try $0.u16() }.enumerated().map {
+                UsedSatellite(id: $1, signal: $0 < types.count ? types[$0] : nil)
             }
         }
         return p
     }
 
-    static func u64(_ v: [UInt8]) -> UInt64 {
-        (0..<8).reduce(UInt64(0)) { $0 | UInt64(v[$1]) << (8 * UInt64($1)) }
-    }
-
     // A u8 count, then that many u64.
     static func u64s(_ v: [UInt8]?) -> [UInt64] {
-        guard let v, let n = v.first else { return [] }
-        return (0..<Int(n)).compactMap { i in
-            let o = 1 + i * 8
-            return o + 8 <= v.count ? u64(Array(v[o..<(o + 8)])) : nil
-        }
+        var r = ByteReader(v ?? [])
+        return r.partialList { try $0.u64() }
     }
 
     // MARK: - Events
@@ -328,14 +309,7 @@ public enum LOC {
 
     public static func registerEventsRequest(_ mask: UInt64) -> [TLV] {
         var w = ByteWriter()
-        w.u32(UInt32(truncatingIfNeeded: mask))
-        w.u32(UInt32(truncatingIfNeeded: mask >> 32))
+        w.u64(mask)
         return [TLV(0x01, w.bytes), .u32(0x11, 1)]
-    }
-
-    static func u32(_ v: [UInt8]?) -> UInt32? {
-        guard let v, v.count >= 4 else { return nil }
-        var r = ByteReader(v)
-        return try? r.u32()
     }
 }

@@ -59,13 +59,16 @@ typedef NS_ERROR_ENUM(QDErrorDomain, QDErrorCode) {
     QDErrorDeviceRequest = 4,
     QDErrorOpenInterface = 5,
     QDErrorOpenPipes = 6,
+    QDErrorStopped = 7,             // datapath already stopped (unplug, failed start, close)
 };
 
 @interface QDModem : NSObject
 
 // Opens the QMI interface of the first modem of one of vendorIDs (in list order, then by USB
 // location): exactly interfaceNumber if >= 0, else its first QMI-looking interface (see
-// +isQMIInterface: in QDModem.m).
+// isQMIInterface() in QDModem.m).
+// -close must be called when done: pending USB completions and read sources hold the modem,
+// so it isn't deallocated (and closed) while they're active.
 + (nullable instancetype)openWithVendorIDs:(NSArray<NSNumber *> *)vendorIDs
                            interfaceNumber:(NSInteger)interfaceNumber
                                      error:(NSError **)error;
@@ -87,12 +90,14 @@ typedef NS_ERROR_ENUM(QDErrorDomain, QDErrorCode) {
 - (BOOL)sendEncapsulatedCommand:(NSData *)message error:(NSError **)error;
 
 // Starts listening for responses; handler runs on an internal serial queue, one QMUX message each.
-- (BOOL)startControlChannel:(void (^)(NSData *message))handler error:(NSError **)error;
+// Raises DTR first (logged, not fatal, if the modem refuses) and discards stale messages.
+- (void)startControlChannel:(void (^)(NSData *message))handler;
 
 // MARK: Datapath
 
 // downlinkSize: granted DL aggregation size (bytes per bulk IN transfer).
 // uplinkSize/uplinkDatagrams: granted UL aggregation; 0 means no UL aggregation.
+// Once per open: a no-op while running; QDErrorStopped after an unplug, a failed start or -close.
 - (BOOL)startDatapathWithDownlinkSize:(NSUInteger)downlinkSize
                            uplinkSize:(NSUInteger)uplinkSize
                       uplinkDatagrams:(NSUInteger)uplinkDatagrams

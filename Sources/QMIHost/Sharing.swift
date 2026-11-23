@@ -31,7 +31,7 @@ public final class Sharing {
         public var subnet = "192.168.2.0"       // SharingNetworkNumberStart
         public var mask = "255.255.255.0"       // SharingNetworkMask
 
-        public init() {}
+        init() {}
 
         init(_ d: [String: Any]?) {
             guard let d else { return }
@@ -49,7 +49,7 @@ public final class Sharing {
     // onNATChange runs on queue whenever com.apple.nat.plist is committed or applied.
     public init(queue: DispatchQueue, onNATChange: @escaping () -> Void) throws {
         guard let p = SCPreferencesCreate(nil, "qmid-sharing" as CFString, Self.natPrefsID as CFString) else {
-            throw QMIHostError.transport("SCPreferencesCreate \(Self.natPrefsID): \(String(cString: SCErrorString(SCError())))")
+            throw QMIHostError.systemConfiguration("SCPreferencesCreate \(Self.natPrefsID)")
         }
         nat = p
         self.onNATChange = onNATChange
@@ -72,16 +72,16 @@ public final class Sharing {
     // Turns Internet Sharing back on with its current settings (as the Sharing settings'
     // switch does); its configd plugin follows the file.
     public func enableNAT() throws {
-        guard SCPreferencesLock(nat, true) else { throw Self.error("lock \(Self.natPrefsID)") }
+        guard SCPreferencesLock(nat, true) else { throw QMIHostError.systemConfiguration("lock \(Self.natPrefsID)") }
         defer { SCPreferencesUnlock(nat) }
         SCPreferencesSynchronize(nat)
         guard var d = SCPreferencesGetValue(nat, "NAT" as CFString) as? [String: Any] else {
-            throw QMIHostError.transport("\(Self.natPrefsID) has no NAT settings")
+            throw QMIHostError.failed("\(Self.natPrefsID) has no NAT settings")
         }
         d["Enabled"] = 1
         guard SCPreferencesSetValue(nat, "NAT" as CFString, d as CFDictionary),
               SCPreferencesCommitChanges(nat), SCPreferencesApplyChanges(nat) else {
-            throw Self.error("write \(Self.natPrefsID)")
+            throw QMIHostError.systemConfiguration("write \(Self.natPrefsID)")
         }
     }
 
@@ -118,16 +118,16 @@ public final class Sharing {
             let existing = SCPreferencesPathGetValue(p, path as CFString) as? [String: Any]
             if !isCurrent(existing, pdn: pdn) {
                 guard SCPreferencesPathSetValue(p, path as CFString, serviceEntity(pdn: pdn, device: device) as CFDictionary) else {
-                    throw error("write \(path)")
+                    throw QMIHostError.systemConfiguration("write \(path)")
                 }
                 changes.append(existing == nil ? "added" : "repaired")
             }
             guard let set = SCPreferencesGetValue(p, "CurrentSet" as CFString) as? String else {
-                throw QMIHostError.transport("no current network set")
+                throw QMIHostError.failed("no current network set")
             }
             let link = "\(set)/Network/Service/\(id)"
             if SCPreferencesPathGetLink(p, link as CFString) as String? != path {
-                guard SCPreferencesPathSetLink(p, link as CFString, path as CFString) else { throw error("link \(link)") }
+                guard SCPreferencesPathSetLink(p, link as CFString, path as CFString) else { throw QMIHostError.systemConfiguration("link \(link)") }
                 changes.append("linked into \(set)")
             }
             return changes.isEmpty ? nil : changes.joined(separator: ", ")
@@ -160,12 +160,12 @@ public final class Sharing {
 
     // Runs body with the network preferences locked; commits and applies if it changed anything.
     private static func withPrefs<T>(_ body: (SCPreferences) throws -> T) throws -> T {
-        guard let p = SCPreferencesCreate(nil, "qmid" as CFString, nil) else { throw error("open network preferences") }
-        guard SCPreferencesLock(p, true) else { throw error("lock network preferences") }
+        guard let p = SCPreferencesCreate(nil, "qmid" as CFString, nil) else { throw QMIHostError.systemConfiguration("open network preferences") }
+        guard SCPreferencesLock(p, true) else { throw QMIHostError.systemConfiguration("lock network preferences") }
         defer { SCPreferencesUnlock(p) }
         let result = try body(p)
         if hasChanges(p) {
-            guard SCPreferencesCommitChanges(p), SCPreferencesApplyChanges(p) else { throw error("save network preferences") }
+            guard SCPreferencesCommitChanges(p), SCPreferencesApplyChanges(p) else { throw QMIHostError.systemConfiguration("save network preferences") }
         }
         return result
     }
@@ -179,10 +179,6 @@ public final class Sharing {
             if a != b { return true }
         }
         return false
-    }
-
-    static func error(_ what: String) -> QMIHostError {
-        QMIHostError.transport("\(what): \(String(cString: SCErrorString(SCError())))")
     }
 
     // MARK: The shared network
@@ -223,13 +219,15 @@ public final class Sharing {
                 guard rtm.rtm_msglen > 0 else { off = len; return }
                 guard rtm.rtm_index == UInt16(index), rtm.rtm_rmx.rmx_expire != 0 else { continue }
                 // rt_msghdr, then sockaddr_in (destination), then sockaddr_dl (gateway).
+                let end = off + Int(rtm.rtm_msglen)
                 var sa = off + MemoryLayout<rt_msghdr>.size
+                guard sa < end, end <= len else { continue }
                 let dstLen = Int(raw[sa])
                 sa += dstLen > 0 ? (dstLen + 3) & ~3 : 4
-                guard sa + 8 <= off + Int(rtm.rtm_msglen) else { continue }
+                guard sa + 8 <= end else { continue }
                 let nlen = Int(raw[sa + 5]), alen = Int(raw[sa + 6])     // sdl_nlen, sdl_alen
                 let mac = sa + 8 + nlen
-                guard alen == 6, mac + 6 <= off + Int(rtm.rtm_msglen), raw[mac] & 1 == 0 else { continue }
+                guard alen == 6, mac + 6 <= end, raw[mac] & 1 == 0 else { continue }
                 macs.insert(Array(raw[mac..<(mac + 6)]))
             }
         }

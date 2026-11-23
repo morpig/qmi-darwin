@@ -28,9 +28,8 @@ public enum CTL {
     public static func parseVersions(_ m: QMIMessage) throws -> [ServiceVersion] {
         guard let v = m[tlv: 0x01] else { throw DecodeError.invalid("version info: no TLV 0x01") }
         var r = ByteReader(v)
-        let count = Int(try r.u8("count"))
-        return try (0..<count).map { _ in
-            ServiceVersion(service: QMIService(rawValue: try r.u8()), major: try r.u16(), minor: try r.u16())
+        return try r.list(count: .u8, "count") {
+            ServiceVersion(service: QMIService(rawValue: try $0.u8()), major: try $0.u16(), minor: try $0.u16())
         }
     }
 
@@ -44,7 +43,6 @@ public enum CTL {
 
 public enum WDA {
     public static let setDataFormat: UInt16 = 0x0020
-    public static let getDataFormat: UInt16 = 0x0021
 
     public enum LinkLayer: UInt32 { case ethernet = 1, rawIP = 2 }
     public enum Aggregation: UInt32 {
@@ -54,6 +52,12 @@ public enum WDA {
 
     // Endpoint type in data-port TLVs.
     public static let endpointHSUSB: UInt32 = 2
+
+    // A data-port endpoint TLV value: endpoint type (HS-USB), then the interface number.
+    public static func endpoint(interface: UInt32) -> [UInt8] {
+        var w = ByteWriter(); w.u32(endpointHSUSB); w.u32(interface)
+        return w.bytes
+    }
 
     public struct Request {
         public var linkLayer: LinkLayer = .rawIP
@@ -84,10 +88,7 @@ public enum WDA {
                 .u32(0x15, downlinkMaxDatagrams),
                 .u32(0x16, downlinkMaxSize)
             ]
-            if let iface = endpointInterface {
-                var w = ByteWriter(); w.u32(endpointHSUSB); w.u32(iface)
-                t.append(TLV(0x17, w.bytes))
-            }
+            if let iface = endpointInterface { t.append(TLV(0x17, WDA.endpoint(interface: iface))) }
             if let fc = flowControl { t.append(.u8(0x1A, fc ? 1 : 0)) }
             t.append(.u32(0x1B, uplinkMaxDatagrams))
             t.append(.u32(0x1C, uplinkMaxSize))
@@ -124,7 +125,7 @@ public enum WDA {
     }
 
     public static func parseGranted(_ m: QMIMessage) -> Granted {
-        func u32(_ t: UInt8) -> UInt32? { m[tlv: t].flatMap { var r = ByteReader($0); return try? r.u32() } }
+        func u32(_ t: UInt8) -> UInt32? { m.u32(tlv: t) }
         return Granted(
             qosFormat: m[tlv: 0x10].flatMap { $0.first.map { $0 != 0 } },
             linkLayer: u32(0x11), uplinkAggregation: u32(0x12), downlinkAggregation: u32(0x13),
@@ -180,10 +181,7 @@ public enum WDS {
     }
 
     public static func parseAMBR(_ m: QMIMessage) -> AMBR? {
-        func u64(_ t: UInt8) -> UInt64? {
-            guard let v = m[tlv: t], v.count == 8 else { return nil }
-            return (0..<8).reduce(UInt64(0)) { $0 | UInt64(v[$1]) << (8 * UInt64($1)) }
-        }
+        func u64(_ t: UInt8) -> UInt64? { m[tlv: t]?.count == 8 ? m.u64(tlv: t) : nil }
         guard let ul = u64(0x10), let dl = u64(0x11) else { return nil }
         return AMBR(uplink: ul, downlink: dl)
     }
@@ -192,8 +190,7 @@ public enum WDS {
     public static func ambrIndicationRequest() -> [TLV] { [.u8(0x3B, 1)] }
 
     public static func bindMuxDataPortRequest(interface: UInt32, muxID: UInt8) -> [TLV] {
-        var ep = ByteWriter(); ep.u32(WDA.endpointHSUSB); ep.u32(interface)
-        return [TLV(0x10, ep.bytes), .u8(0x11, muxID), .u32(0x13, 1)]   // client type 1 = tethered
+        [TLV(0x10, WDA.endpoint(interface: interface)), .u8(0x11, muxID), .u32(0x13, 1)]   // client type 1 = tethered
     }
 
     public static func startRequest(profile: UInt8?, apn: String?, family: UInt8) -> [TLV] {
@@ -204,7 +201,7 @@ public enum WDS {
     }
 
     public static func parseHandle(_ m: QMIMessage) -> UInt32? {
-        m[tlv: 0x01].flatMap { var r = ByteReader($0); return try? r.u32() }
+        m.u32(tlv: 0x01)
     }
 
     public struct CallEnd: CustomStringConvertible, Equatable {
@@ -362,7 +359,7 @@ public enum WDS {
 
     public static func parseCallEnd(_ m: QMIMessage) -> CallEnd {
         var e = CallEnd()
-        if let v = m[tlv: 0x10] { var r = ByteReader(v); e.reason = try? r.u16() }
+        e.reason = m.u16(tlv: 0x10)
         if let v = m[tlv: 0x11] { var r = ByteReader(v); e.verboseType = try? r.u16(); e.verboseReason = try? r.u16() }
         return e
     }
@@ -414,7 +411,7 @@ public enum WDS {
         }
         s.apn = m[tlv: 0x14].map { String(decoding: $0, as: UTF8.self) }
         s.ipFamily = m[tlv: 0x2B]?.first
-        s.mtu = m[tlv: 0x29].flatMap { var r = ByteReader($0); return try? r.u32() }
+        s.mtu = m.u32(tlv: 0x29)
         s.ipv4Address = v4(0x1E)
         s.ipv4Gateway = v4(0x20)
         s.ipv4SubnetMask = v4(0x21)
@@ -422,18 +419,9 @@ public enum WDS {
         s.ipv6Address = v6p(0x25)
         s.ipv6Gateway = v6p(0x26)
         s.ipv6DNS = [v6(0x27), v6(0x28)].compactMap { $0 }.filter { !$0.isZero }
-        if let v = m[tlv: 0x23] {
-            var r = ByteReader(v)
-            if let n = try? r.u8() {
-                s.pcscfIPv4 = (0..<Int(n)).compactMap { _ in (try? r.take(4)).flatMap(IPv4.init(qmi:)) }
-            }
-        }
-        if let v = m[tlv: 0x2E] {
-            var r = ByteReader(v)
-            if let n = try? r.u8() {
-                s.pcscfIPv6 = (0..<Int(n)).compactMap { _ in (try? r.take(16)).map(IPv6.init) }
-            }
-        }
+        var v4s = ByteReader(m[tlv: 0x23] ?? []), v6s = ByteReader(m[tlv: 0x2E] ?? [])
+        s.pcscfIPv4 = v4s.partialList { IPv4(qmi: try $0.take(4))! }
+        s.pcscfIPv6 = v6s.partialList { IPv6(try $0.take(16)) }
         return s
     }
 
@@ -463,7 +451,6 @@ public enum NAS {
 
     public struct ServingSystem: Equatable {
         public var registration: UInt8
-        public var csAttached: Bool
         public var psAttached: Bool
         public var radioInterfaces: [UInt8]
         public var mcc: UInt16?
@@ -499,10 +486,7 @@ public enum NAS {
 
     public static func parseHomeNetwork(_ m: QMIMessage) throws -> HomeNetwork {
         guard let v = m[tlv: 0x01] else { throw DecodeError.invalid("home network: no TLV 0x01") }
-        var r = ByteReader(v)
-        let mcc = try r.u16("mcc"), mnc = try r.u16("mnc")
-        var name: String?
-        if let len = try? r.u8(), let b = try? r.take(Int(len)), !b.isEmpty { name = String(decoding: b, as: UTF8.self) }
+        let (mcc, mnc, name) = try parsePLMN(v)
         // TLV 0x13: is-3GPP, MNC includes PCS digit (the 3-digit flag). Without it, only an MNC
         // above 99 tells.
         let pcs = m[tlv: 0x13].flatMap { $0.count >= 2 ? $0[1] != 0 : nil } ?? false
@@ -580,7 +564,8 @@ public enum NAS {
     }
 
     // TLV 0x10, the SIM's Service Provider Name (EF_SPN): display condition, length, name as
-    // stored on the SIM (8-bit GSM alphabet, or UCS-2 after a 0x80 byte).
+    // stored on the SIM: the GSM default alphabet one character per byte, or UCS-2 after a 0x80
+    // byte. The 8-bit form is decoded as Latin-1, which agrees with GSM on letters, digits and space.
     public static func parseSPN(_ m: QMIMessage) -> String? {
         guard let v = m[tlv: 0x10] else { return nil }
         var r = ByteReader(v)
@@ -740,9 +725,7 @@ public enum NAS {
     public static func parseBandPreference(_ m: QMIMessage) -> BandPreference {
         var p = BandPreference()
         // Bit N of a little-endian bit field = band N + 1.
-        func bands(_ v: [UInt8]) -> [Int] {
-            (0..<v.count * 8).filter { v[$0 / 8] & (1 << ($0 % 8)) != 0 }.map { $0 + 1 }
-        }
+        func bands(_ v: [UInt8]) -> [Int] { v.bitIndexes.map { $0 + 1 } }
         if let v = m[tlv: 0x11], v.count >= 2 {
             let mask = UInt16(v[0]) | UInt16(v[1]) << 8
             p.modes = modeBits.filter { mask & $0.bit != 0 }.map(\.name)
@@ -900,7 +883,7 @@ public enum NAS {
                 var c = Cell(rat: .lte, role: .primary)
                 c.tac = UInt32(tac)
                 c.cellID = UInt64(eci)
-                c.channel = m[tlv: 0x27].flatMap { var x = ByteReader($0); return try? x.u32() } ?? UInt32(earfcn)
+                c.channel = m.u32(tlv: 0x27) ?? UInt32(earfcn)
                 c.pci = pci
                 lte = c
                 measured += parseLTECells(&r, channel: c.channel!)
@@ -909,11 +892,8 @@ public enum NAS {
         // 0x14, LTE inter-frequency: idle, frequency count, then per frequency EARFCN, 3 bytes
         // reselection parameters, its cells. 0x28: the EARFCNs as 32 bits, in the same order.
         if let m = cellLocation, let v = m[tlv: 0x14] {
-            var wide: [UInt32] = []
-            if let x = m[tlv: 0x28] {
-                var r = ByteReader(x)
-                for _ in 0..<((try? r.u8()) ?? 0) { if let e = try? r.u32() { wide.append(e) } }
-            }
+            var x = ByteReader(m[tlv: 0x28] ?? [])
+            let wide = x.partialList { try $0.u32() }
             var r = ByteReader(v)
             if (try? r.u8()) != nil, let n = try? r.u8() {
                 for i in 0..<Int(n) {
@@ -946,9 +926,10 @@ public enum NAS {
         }
 
         // Get LTE CPHY CA Info. PCell 0x13: PCI, EARFCN, bandwidth, band (QMI enum, activeBand).
-        // Secondary cells 0x19 (EARFCN as 32 bits) or else 0x15: count, then PCI, EARFCN,
-        // bandwidth, band, state
-        // (0 deconfigured, 1 deactivated = configured, 2 activated), sCellIndex. 0x19 entries carry one byte more.
+        // Secondary cells 0x19 or else 0x15: count, then per entry PCI (2), EARFCN (0x15: 2,
+        // 0x19: 4), bandwidth (4), band (2), state (4; 0 deconfigured, 1 deactivated =
+        // configured, 2 activated), sCellIndex (1): 15 bytes in 0x15; 0x19 entries are taken as
+        // 18 bytes, the one after sCellIndex not read.
         var secondaries: [Cell] = []
         if let m = ca {
             if let v = m[tlv: 0x13], var c = lte {
@@ -961,9 +942,7 @@ public enum NAS {
             }
             let (list, wide) = m[tlv: 0x19].map { ($0, true) } ?? m[tlv: 0x15].map { ($0, false) } ?? ([], false)
             var r = ByteReader(list)
-            let n = Int((try? r.u8()) ?? 0)
-            for _ in 0..<n {
-                guard let e = try? r.take(wide ? 18 : 15) else { break }
+            for e in r.partialList({ try $0.take(wide ? 18 : 15) }) {
                 var x = ByteReader(e)
                 let pci = try! x.u16()
                 let earfcn = wide ? try! x.u32() : UInt32(try! x.u16())
@@ -990,8 +969,7 @@ public enum NAS {
         var nrBand: Int?
         if let v = rfBand?[tlv: 0x01] {
             var r = ByteReader(v)
-            for _ in 0..<((try? r.u8()) ?? 0) {
-                guard let rat = try? r.u8(), let b = try? r.u16(), (try? r.u16()) != nil else { break }
+            for (rat, b) in r.partialList({ r -> (UInt8, UInt16) in let x = (try r.u8(), try r.u16()); _ = try r.u16(); return x }) {
                 if rat == 8, var c = lte, c.band == nil { c.band = activeBand(b)?.band; lte = c }
                 if rat == 12 { nrBand = activeBand(b)?.band }
             }
@@ -1000,8 +978,7 @@ public enum NAS {
         var nrBandwidth: Double?
         if let v = rfBand?[tlv: 0x12] {
             var r = ByteReader(v)
-            for _ in 0..<((try? r.u8()) ?? 0) {
-                guard let rat = try? r.u8(), let bw = try? r.u32() else { break }
+            for (rat, bw) in r.partialList({ (try $0.u8(), try $0.u32()) }) {
                 if rat == 8, var c = lte, c.bandwidthMHz == nil { c.bandwidthMHz = bandwidth(bw); lte = c }
                 if rat == 12 { nrBandwidth = bandwidth(bw) }
             }
@@ -1034,7 +1011,7 @@ public enum NAS {
             _ = try! r.take(3)
             let tac = try! r.take(3)
             nr.tac = tac.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
-            nr.cellID = UInt64(try! r.u32()) | UInt64(try! r.u32()) << 32
+            nr.cellID = try! r.u64()
             nr.pci = try! r.u16()
             nrSeen = true
         }
@@ -1054,8 +1031,7 @@ public enum NAS {
         var otherCarriers: [(centre: Double, width: Double)] = []      // kHz
         if let v = coex?[tlv: 0x22], let ssb = nr.channel.flatMap(nrFrequencyKHz) {
             var r = ByteReader(v)
-            for _ in 0..<((try? r.u8()) ?? 0) {
-                guard let e = try? r.take(16) else { break }
+            for e in r.partialList({ try $0.take(16) }) {
                 var x = ByteReader(e)
                 let centre = Double(try! x.u32()), width = Double(try! x.u32()) / 1000, dir = try! x.u32()
                 guard dir == 2, width > 0, !otherCarriers.contains(where: { $0.centre == centre }) else { continue }
@@ -1074,11 +1050,8 @@ public enum NAS {
         // SCells known by their centre only.
         var nrSCells: [Cell] = []
         if nrSeen, let own = nr.channel {
-            var configured: [UInt32] = []
-            if let v = arfcnList?[tlv: 0x1C] {
-                var r = ByteReader(v)
-                for _ in 0..<((try? r.u8()) ?? 0) { if let a = try? r.u32() { configured.append(a) } }
-            }
+            var r = ByteReader(arfcnList?[tlv: 0x1C] ?? [])
+            let configured = r.partialList { try $0.u32() }
             for ch in configured where ch != own {
                 var c = Cell(rat: .nr, role: .secondary)
                 c.channel = ch
@@ -1102,7 +1075,7 @@ public enum NAS {
         if let v = sysInfo?[tlv: 0x4A], v.first == 2 { nr.role = .primary }
         if let v = sysInfo?[tlv: 0x4E], let b = v.first { info.endcAvailable = b != 0 }
         for (t, set) in [(UInt8(0x19), { (x: UInt32) in info.lteRRC = x }), (0x1B, { info.nrRRC = $0 })] {
-            if let v = arfcnList?[tlv: t], v.count == 4 { var r = ByteReader(v); if let x = try? r.u32() { set(x) } }
+            if arfcnList?[tlv: t]?.count == 4, let x = arfcnList?.u32(tlv: t) { set(x) }
         }
 
         if let lte { info.cells.append(lte) }
@@ -1147,8 +1120,7 @@ public enum NAS {
     // SRXLEV (16 bits each; signal in 0.1 dB).
     static func parseLTECells(_ r: inout ByteReader, channel: UInt32) -> [(channel: UInt32, cell: Cell)] {
         var out: [(channel: UInt32, cell: Cell)] = []
-        for _ in 0..<((try? r.u8()) ?? 0) {
-            guard let e = try? r.take(10) else { break }
+        for e in r.partialList({ try $0.take(10) }) {
             var x = ByteReader(e)
             var c = Cell(rat: .lte, role: .neighbor)
             c.channel = channel
@@ -1199,21 +1171,29 @@ public enum NAS {
     public static func parseServingSystem(_ m: QMIMessage) throws -> ServingSystem {
         guard let v = m[tlv: 0x01] else { throw DecodeError.invalid("serving system: no TLV 0x01") }
         var r = ByteReader(v)
-        let reg = try r.u8(), cs = try r.u8(), ps = try r.u8()
+        let reg = try r.u8()
+        _ = try r.u8()                                           // CS attach state
+        let ps = try r.u8()
         _ = try r.u8()                                           // selected network
         let n = Int(try r.u8())
         let rats = try r.take(n)
-        var s = ServingSystem(registration: reg, csAttached: cs == 1, psAttached: ps == 1, radioInterfaces: rats)
+        var s = ServingSystem(registration: reg, psAttached: ps == 1, radioInterfaces: rats)
         if let v = m[tlv: 0x10], let b = v.first, b <= 1 { s.roaming = b == 0 }
-        if let p = m[tlv: 0x12] {
-            var pr = ByteReader(p)
-            s.mcc = try? pr.u16()
-            s.mnc = try? pr.u16()
-            if let len = try? pr.u8(), let name = try? pr.take(Int(len)) {
-                s.operatorName = String(decoding: name, as: UTF8.self)
-            }
+        if let p = m[tlv: 0x12], let plmn = try? parsePLMN(p) {
+            s.mcc = plmn.mcc
+            s.mnc = plmn.mnc
+            s.operatorName = plmn.name
         }
         return s
+    }
+
+    // Current PLMN (Serving System 0x12) and Home Network (0x01): MCC, MNC (u16 each), then
+    // the description (u8 length + bytes); an absent or empty description is nil.
+    static func parsePLMN(_ v: [UInt8]) throws -> (mcc: UInt16, mnc: UInt16, name: String?) {
+        var r = ByteReader(v)
+        let mcc = try r.u16("mcc"), mnc = try r.u16("mnc")
+        guard let len = try? r.u8(), let b = try? r.take(Int(len)), !b.isEmpty else { return (mcc, mnc, nil) }
+        return (mcc, mnc, String(decoding: b, as: UTF8.self))
     }
 }
 
@@ -1244,10 +1224,8 @@ public enum DMS {
 
     public static func parseBandCapabilities(_ m: QMIMessage) -> (lte: [Int], nr: [Int]) {
         func list(_ t: UInt8) -> [Int] {
-            guard let v = m[tlv: t] else { return [] }
-            var r = ByteReader(v)
-            let n = Int((try? r.u16()) ?? 0)
-            return (0..<n).compactMap { _ in (try? r.u16()).map(Int.init) }
+            var r = ByteReader(m[tlv: t] ?? [])
+            return r.partialList(count: .u16) { Int(try $0.u16()) }
         }
         return (list(0x12), list(0x13))
     }
@@ -1366,22 +1344,33 @@ public enum UIM {
     }
 
     public struct Card: Equatable {
-        public var state: UInt8                  // 0 absent, 1 present, 2 error
-        public var applications: [(type: UInt8, state: UInt8)]
+        public enum State: Equatable { case absent, present, error, unknown }
+
+        public struct Application: Equatable {
+            public var type: UInt8                // 1 SIM, 2 USIM, …
+            public var state: UInt8               // 7 ready
+        }
+
         // PIN1 of the USIM (or SIM) application, or the universal PIN when it replaces PIN1:
         // state 0 not initialized, 1 enabled not verified, 2 enabled verified, 3 disabled,
         // 4 blocked (PUK needed), 5 permanently blocked.
-        public var pin: (state: UInt8, retries: UInt8, pukRetries: UInt8)?
-
-        public static func == (a: Card, b: Card) -> Bool {
-            a.state == b.state && a.applications.map { [$0.type, $0.state] } == b.applications.map { [$0.type, $0.state] }
-                && a.pin.map { [$0.state, $0.retries, $0.pukRetries] } == b.pin.map { [$0.state, $0.retries, $0.pukRetries] }
+        public struct PIN: Equatable {
+            public var state: UInt8
+            public var retries: UInt8
+            public var pukRetries: UInt8
         }
+
+        public var state: UInt8                  // 0 absent, 1 present, 2 error
+        public var applications: [Application]
+        public var pin: PIN?
+
+        public var cardState: State { [0: .absent, 1: .present, 2: .error][state] ?? .unknown }
+        public var isPresent: Bool { cardState == .present }
 
         public var stateName: String { [0: "absent", 1: "present", 2: "error"][state] ?? "state \(state)" }
 
         // Application state 7 = ready.
-        public var isReady: Bool { state == 1 && applications.contains { $0.state == 7 } }
+        public var isReady: Bool { isPresent && applications.contains { $0.state == 7 } }
     }
 
     public static func parseCardStatus(_ m: QMIMessage) throws -> [Card] {
@@ -1394,18 +1383,19 @@ public enum UIM {
             let state = try r.u8("card state")
             let upin = try r.take(4, "upin")            // upin state, retries, puk retries, error code
             let apps = Int(try r.u8("apps"))
-            var list: [(UInt8, UInt8)] = []
-            var pin: (state: UInt8, retries: UInt8, pukRetries: UInt8)?
+            var list: [Card.Application] = []
+            var pin: Card.PIN?
             for _ in 0..<apps {
                 let type = try r.u8("app type"), appState = try r.u8("app state")
                 _ = try r.take(4, "perso")              // perso state, feature, retries, unblock retries
                 let aidLen = Int(try r.u8("aid len"))
                 _ = try r.take(aidLen, "aid")
                 let pins = try r.take(7, "pins")        // upin replaces, pin1 x3, pin2 x3
-                list.append((type, appState))
+                list.append(Card.Application(type: type, state: appState))
                 // Type 1 SIM, 2 USIM; the USIM's wins.
                 if type == 2 || (type == 1 && pin == nil) {
-                    pin = pins[0] != 0 ? (upin[0], upin[1], upin[2]) : (pins[1], pins[2], pins[3])
+                    pin = pins[0] != 0 ? Card.PIN(state: upin[0], retries: upin[1], pukRetries: upin[2])
+                                       : Card.PIN(state: pins[1], retries: pins[2], pukRetries: pins[3])
                 }
             }
             out.append(Card(state: state, applications: list, pin: pin))

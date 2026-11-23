@@ -18,6 +18,8 @@ public let qmidAPIVersion = 1
     func disconnect(_ pdn: String, reply: @escaping (String?) -> Void)
     func setPolicy(_ pdn: String, policy: String, reply: @escaping (String?) -> Void)
     func reload(reply: @escaping (String?) -> Void)
+    // What qmid did with the modem's data profiles (QMIDProfileReport); empty while the modem
+    // isn't open.
     func profiles(reply: @escaping (NSArray) -> Void)
     // qmid.json as UTF-8 JSON (the built-in default if the file doesn't exist).
     func getConfig(reply: @escaping (Data?, String?) -> Void)
@@ -31,8 +33,9 @@ public let qmidAPIVersion = 1
     // away, from the binary now in the app bundle. Used after an app update.
     func restart(reply: @escaping (String?) -> Void)
     // Starts pushing qmid's log to this connection as events of type "log", at `level`
-    // (QMIDLogLevel raw value) and above. qmid first sends the lines it still holds (a ring of
-    // about 2000) newer than `since` (Unix time; 0 for all), then new ones. A debug subscriber
+    // (QMIDLogLevel raw value) and above. qmid first sends the lines it still holds (the last
+    // 2000 or so at info and above, plus as many trace lines for a debug subscriber) newer than
+    // `since` (Unix time; 0 for all), then new ones. A debug subscriber
     // turns the QMI message trace on while it stays subscribed. Nothing is redacted.
     // Calling it again changes the level; unsubscribeLogs stops it.
     func subscribeLogs(_ level: Int, since: Double, reply: @escaping (Bool) -> Void)
@@ -111,7 +114,7 @@ public enum QMIDKey {
     public static let modemError = "modemError"
     public static let network = "network"             // e.g. "registered, ps attached, lte"
     public static let pdns = "pdns"                   // [PDN dictionary]
-    public static let datapath = "datapath"           // counters
+    public static let datapath = "datapath"           // datapath-wide counters (QMIDCounters), while the modem is open
     public static let sim = "sim"                     // SIM dictionary, absent until the SIM is read
     public static let plmn = "plmn"                   // PLMN dictionary, absent while not registered
     public static let imei = "imei"                   // the modem's IMEI (XPC only)
@@ -172,7 +175,7 @@ public enum QMIDKey {
     public static let blocked = "blocked"             // ["ipv4: 3GPP #51: PDN type IPv6 only allowed", ...]
     public static let reason = "reason"               // error as a word: QMIDReason raw value
     public static let causes = "causes"               // [cause dictionary]: error's call end causes
-    public static let counters = "counters"
+    public static let counters = "counters"           // status() only: the PDN's datapath counters (QMIDCounters)
     public static let qci = "qci"                     // default bearer's QCI (Int)
     public static let ambr = "ambr"                   // APN-AMBR: {uplink, downlink} in bps
     public static let bearers = "bearers"             // [bearer dictionary]: in status() and "bearers" events
@@ -292,8 +295,21 @@ public enum QMIDKey {
     public static let firstFixAfter = "firstFixAfter" // assist: s from the session's start to its first fix
     public static let firstFixDistance = "firstFixDistance" // assist: m between the injected position and the first fix
 
+    // profiles() (QMIDProfileReport): an array of entries, each with one of these leading keys
+    // sim                                            // String: the SIM as qmid identified it; also carrier, attachAPN, pending
+    public static let pending = "pending"             // String: the prepareSIM card
+    // pdn                                            // String: a PDN's entry; also action, failed, profile, attach, settings
+    public static let action = "action"               // String: what the last sync did ("in sync", "created", …)
+    public static let failed = "failed"               // Bool: writing the profile failed
+    public static let attach = "attach"               // PDN entry: Bool, it is the LTE attach profile; own entry: Int, the attach profile index
+    public static let settings = "settings"           // String: the modem profile as now set
+    // error                                          // String: the last sync's error
+    public static let learned = "learned"             // [String]: default bearer APNs seen, "home mccmnc: apn"
+    // modem                                          // [String]: the modem's profiles, one line each
+    public static let autoconnect = "autoconnect"     // String: the modem's autoconnect setting
+
     // events
-    public static let type = "type"                   // "modem" | "pdn" | "config" | "log" | "sim" | "plmn" | "bearers"
+    public static let type = "type"                   // QMIDEventType
     public static let pdn = "pdn"                     // PDN dictionary for type "pdn"; PDN name for type "bearers"
 
     // "log" events: a batch of entries, plus how many were dropped before them because the
@@ -306,11 +322,13 @@ public enum QMIDKey {
     public static let message = "message"
 }
 
+// Event types (QMIDKey.type). To subscribe() connections unless noted. Clients must ignore
+// types they don't know.
 public enum QMIDEventType {
-    public static let modem = "modem"
-    public static let pdn = "pdn"
-    public static let config = "config"
-    public static let log = "log"
+    public static let modem = "modem"                 // keys QMIDKey.modem, network, modemError, airplaneMode (QMIDModem)
+    public static let pdn = "pdn"                     // key QMIDKey.pdn (PDN dictionary)
+    public static let config = "config"               // no keys: the config changed
+    public static let log = "log"                     // keys QMIDKey.entries, dropped; only after subscribeLogs
     public static let sim = "sim"                     // key QMIDKey.sim, absent when no SIM is known
     public static let plmn = "plmn"                   // key QMIDKey.plmn, absent while not registered
     public static let bearers = "bearers"             // keys QMIDKey.pdn (name) and QMIDKey.bearers
@@ -324,9 +342,42 @@ public enum QMIDEventType {
 }
 
 // Status keys qmid publishes in SCDynamicStore (readable without XPC, e.g. with
-// SCDynamicStoreCopyValue or `scutil`), mirrored from the same data.
+// SCDynamicStoreCopyValue or `scutil`), mirrored from the same data. Their values:
+// QMIDStoreModem and QMIDStorePDN, with the fields in QMIDStoreField.
 public enum QMIDStoreKey {
     public static let modem = "State:/Network/QMI/Modem"
     public static func pdn(_ name: String) -> String { "State:/Network/QMI/PDN/\(name)" }
     public static let pdnPattern = "State:/Network/QMI/PDN/.*"
+}
+
+// Field names of the SCDynamicStore values (configd style: capitalised, unlike QMIDKey).
+public enum QMIDStoreField {
+    // both
+    public static let state = "State"                 // modem: QMIDModemState ("running" from qmictl); PDN: QMIDPDN.State
+    public static let lastError = "LastError"
+    // State:/Network/QMI/Modem
+    public static let network = "Network"
+    public static let vendorID = "VendorID"           // USB IDs and the QMI interface number
+    public static let productID = "ProductID"
+    public static let interface = "Interface"
+    public static let airplaneMode = "AirplaneMode"   // Bool, only when on
+    public static let sim = "SIM"                     // SIM dictionary (QMIDKey fields), without identities
+    public static let plmn = "PLMN"                   // PLMN dictionary (QMIDKey fields)
+    // State:/Network/QMI/PDN/<name>
+    public static let serviceID = "ServiceID"
+    public static let interfaceName = "InterfaceName"
+    public static let muxID = "MuxID"
+    public static let policy = "Policy"               // QMIDPolicy raw value
+    public static let profile = "Profile"
+    public static let apn = "APN"
+    public static let mtu = "MTU"
+    public static let ipv4Address = "IPv4Address"
+    public static let ipv6Address = "IPv6Address"     // "addr/prefix"
+    public static let pcscfv4 = "PCSCFv4"             // [String]
+    public static let pcscfv6 = "PCSCFv6"
+    public static let rat = "RAT"
+    public static let qci = "QCI"
+    public static let ambr = "AMBR"                   // {Uplink, Downlink} bps
+    public static let uplink = "Uplink"
+    public static let downlink = "Downlink"
 }

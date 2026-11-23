@@ -66,7 +66,10 @@ final class SharingTests: XCTestCase {
         let st = QMIDStatus([QMIDKey.modem: "ready", QMIDKey.sharing: s.dictionary])
         XCTAssertEqual(st.sharing, s)
         XCTAssertNil(QMIDStatus([QMIDKey.modem: "ready"]).sharing)
-        XCTAssertEqual(QMIDSharing([QMIDKey.pdn: "internet", QMIDKey.state: "not-selected"])?.state, .notSelected)
-        XCTAssertNil(QMIDSharing([QMIDKey.pdn: "internet", QMIDKey.state: "future-state"]))
+        XCTAssertEqual(QMIDSharing([QMIDKey.pdn: "internet", QMIDKey.state: "not-selected"])?.stateKind, .notSelected)
+        // A state this version doesn't know: kept by name, no kind.
+        let future = QMIDSharing([QMIDKey.pdn: "internet", QMIDKey.state: "future-state"])
+        XCTAssertEqual(future?.stateName, "future-state")
+        XCTAssertNil(future?.stateKind)
     }
 }

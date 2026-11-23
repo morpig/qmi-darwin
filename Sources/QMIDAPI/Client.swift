@@ -4,6 +4,7 @@ import Foundation
 //
 //   let qmid = QMIDClient()
 //   qmid.onEvent = { event in ... }          // main queue by default
+//   qmid.onModem = { modem in ... }          // modem state, network, airplane mode
 //   qmid.onSIM = { sim in ... }              // SIM and default bearer APN
 //   qmid.onPLMN = { plmn in ... }            // registered network and operator names
 //   qmid.onBearers = { pdn, bearers in ... } // dedicated bearers (QCI, rates, TFT) of a PDN
@@ -15,11 +16,23 @@ import Foundation
 //   qmid.onLocation = { loc in ... }         // GNSS positions, after startLocation
 //   qmid.startLocation(satellites: true)     // GNSS on while this client wants it; kept across restarts
 //
+// Command-line tools can block on a call with sync (on a client whose queue isn't the
+// calling thread's):
+//
+//   let qmid = QMIDClient(queue: DispatchQueue(label: "qmid"))
+//   let status = qmid.sync(timeout: 5) { qmid.status($0) }
+//
 // qmid is started by launchd on demand, so the first call works even if it isn't running.
 // If qmid restarts (crash, update), the connection is re-established and the subscription
 // renewed; `onAvailabilityChange` reports the gap.
 public final class QMIDClient: NSObject, QMIDEvents {
+    // Events of types modem, pdn and config, and of types this client has no callback for (as
+    // .unknown); also sim, plmn, bearers, gnss, sharing and radio, which their own callbacks
+    // get too. Not log, location, satellites or nmea: those go only to their callbacks.
     public var onEvent: ((QMIDEvent) -> Void)?
+    // The modem's state, network and airplane mode: after subscribe() and whenever they
+    // change. onEvent sees these as .modem.
+    public var onModem: ((QMIDModem) -> Void)?
     public var onAvailabilityChange: ((Bool) -> Void)?
     // Log lines after subscribeLogs. If this client fell behind and qmid dropped lines, a
     // notice entry saying how many comes first.
@@ -70,6 +83,7 @@ public final class QMIDClient: NSObject, QMIDEvents {
         lock.lock()
         subscribed = false
         logLevel = nil
+        locationOptions = nil
         let c = connection
         connection = nil
         lock.unlock()
@@ -104,9 +118,12 @@ public final class QMIDClient: NSObject, QMIDEvents {
         return c
     }
 
+    // The queue is captured, not self: a failure must reach its completion (and an async
+    // caller's continuation) even when the client is gone.
     private func proxy(_ fail: @escaping (QMIDError) -> Void) -> QMIDControl? {
-        currentConnection().remoteObjectProxyWithErrorHandler { [weak self] error in
-            self?.queue.async { fail(QMIDError(xpc: error)) }
+        let queue = self.queue
+        return currentConnection().remoteObjectProxyWithErrorHandler { error in
+            queue.async { fail(QMIDError(xpc: error)) }
         } as? QMIDControl
     }
 
@@ -161,9 +178,11 @@ public final class QMIDClient: NSObject, QMIDEvents {
             let location = self.locationOptions
             self.lock.unlock()
             let p = self.proxy { _ in self.resubscribe(after: 3) }
+            // qmid replies to startLocation with nil while the connection lives; a failed
+            // call goes through the proxy's error handler above.
             if let location {
                 p?.startLocation(location) { err in
-                    if err == nil { self.setAvailable(true) } else if !events && level == nil { self.resubscribe(after: 3) }
+                    if err == nil { self.setAvailable(true) }
                 }
             }
             if events {
@@ -180,45 +199,37 @@ public final class QMIDClient: NSObject, QMIDEvents {
         }
     }
 
+    // One case per type: its callback, and whether onEvent sees it too (see onEvent).
     public func qmidEvent(_ event: NSDictionary) {
-        if event[QMIDKey.type] as? String == QMIDEventType.log {
+        let type = event[QMIDKey.type] as? String
+        var toEvent = true
+        switch type {
+        case QMIDEventType.log?:
+            toEvent = false
             var entries = (event[QMIDKey.entries] as? [NSDictionary] ?? []).compactMap(QMIDLogEntry.init)
             if let n = event[QMIDKey.dropped] as? Int, n > 0 {
                 let t = entries.first?.time ?? Date()
                 entries.insert(QMIDLogEntry(time: t, level: .notice, category: "client",
                                             message: "\(n) log lines dropped (client fell behind)"), at: 0)
             }
-            guard let last = entries.last else { return }
-            lock.lock(); lastLogTime = max(lastLogTime, last.time.timeIntervalSince1970); lock.unlock()
-            queue.async { entries.forEach { self.onLog?($0) } }
-            return
-        }
-        if event[QMIDKey.type] as? String == QMIDEventType.sim {
+            if let last = entries.last {
+                lock.lock(); lastLogTime = max(lastLogTime, last.time.timeIntervalSince1970); lock.unlock()
+                queue.async { entries.forEach { self.onLog?($0) } }
+            }
+        case QMIDEventType.modem?:
+            let m = QMIDModem(event)
+            queue.async { self.onModem?(m) }
+        case QMIDEventType.sim?:
             let sim = QMIDSIM(event[QMIDKey.sim] as? NSDictionary)
             queue.async { self.onSIM?(sim) }
-        }
-        if event[QMIDKey.type] as? String == QMIDEventType.plmn {
+        case QMIDEventType.plmn?:
             let plmn = QMIDPLMN(event[QMIDKey.plmn] as? NSDictionary)
             queue.async { self.onPLMN?(plmn) }
-        }
-        if event[QMIDKey.type] as? String == QMIDEventType.bearers, let pdn = event[QMIDKey.pdn] as? String {
-            let bearers = (event[QMIDKey.bearers] as? [NSDictionary] ?? []).compactMap(QMIDBearer.init)
-            queue.async { self.onBearers?(pdn, bearers) }
-        }
-        switch event[QMIDKey.type] as? String {
-        case QMIDEventType.location?:
-            if let d = event[QMIDKey.location] as? NSDictionary {
-                let l = QMIDLocation(d)
-                queue.async { self.onLocation?(l) }
+        case QMIDEventType.bearers?:
+            if let pdn = event[QMIDKey.pdn] as? String {
+                let bearers = (event[QMIDKey.bearers] as? [NSDictionary] ?? []).compactMap(QMIDBearer.init)
+                queue.async { self.onBearers?(pdn, bearers) }
             }
-            return
-        case QMIDEventType.satellites?:
-            let s = QMIDSatellites(event)
-            queue.async { self.onSatellites?(s) }
-            return
-        case QMIDEventType.nmea?:
-            if let n = event[QMIDKey.nmea] as? String { queue.async { self.onNMEA?(n) } }
-            return
         case QMIDEventType.gnss?:
             if let d = event[QMIDKey.gnss] as? NSDictionary {
                 let g = QMIDGNSS(d)
@@ -231,10 +242,23 @@ public final class QMIDClient: NSObject, QMIDEvents {
         case QMIDEventType.radio?:
             let r = (event[QMIDKey.radio] as? NSDictionary).map(QMIDRadio.init)
             queue.async { self.onRadio?(r) }
+        case QMIDEventType.location?:
+            toEvent = false
+            if let d = event[QMIDKey.location] as? NSDictionary {
+                let l = QMIDLocation(d)
+                queue.async { self.onLocation?(l) }
+            }
+        case QMIDEventType.satellites?:
+            toEvent = false
+            let s = QMIDSatellites(event)
+            queue.async { self.onSatellites?(s) }
+        case QMIDEventType.nmea?:
+            toEvent = false
+            if let n = event[QMIDKey.nmea] as? String { queue.async { self.onNMEA?(n) } }
         default:
-            break
+            break                               // pdn, config, newer types: onEvent only
         }
-        guard let e = QMIDEvent(event) else { return }
+        guard toEvent, let e = QMIDEvent(event) else { return }
         queue.async { self.onEvent?(e) }
     }
 
@@ -246,6 +270,7 @@ public final class QMIDClient: NSObject, QMIDEvents {
                                QMIDKey.nmea: nmea]
         lock.lock(); locationOptions = o; lock.unlock()
         proxy { e in completion?(.failure(e)) }?.startLocation(o) { err in
+            if err == nil { self.setAvailable(true) }
             if let completion { self.finish(err, completion) }
         }
     }
@@ -301,6 +326,11 @@ public final class QMIDClient: NSObject, QMIDEvents {
 
     public func reload(_ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         proxy { completion(.failure($0)) }?.reload { self.finish($0, completion) }
+    }
+
+    // What qmid did with the modem's data profiles; an empty report while the modem isn't open.
+    public func profiles(_ completion: @escaping (Result<QMIDProfileReport, QMIDError>) -> Void) {
+        proxy { completion(.failure($0)) }?.profiles { list in self.queue.async { completion(.success(QMIDProfileReport(list))) } }
     }
 
     public func restart(_ completion: @escaping (Result<Void, QMIDError>) -> Void) {
@@ -385,6 +415,36 @@ public final class QMIDClient: NSObject, QMIDEvents {
         proxy { completion(.failure($0)) }?.prepareUninstall { self.finish($0, completion) }
     }
 
+    // MARK: Blocking calls
+
+    // Makes one call and waits for its completion, at most `timeout` seconds; on timeout a
+    // failure with timedOut set (a late reply is dropped). For command-line tools: the client's
+    // queue must not be the calling thread's, or the completion could never run.
+    //
+    //   let r = qmid.sync(timeout: 5) { qmid.status($0) }
+    public func sync<T>(timeout: TimeInterval = 10,
+                        _ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) -> Result<T, QMIDError> {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        let lock = NSLock()
+        let done = DispatchSemaphore(value: 0)
+        var out: Result<T, QMIDError>?
+        var over = false
+        call { r in
+            lock.lock()
+            if !over && out == nil { out = r }
+            lock.unlock()
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + timeout)
+        lock.lock()
+        defer { lock.unlock() }
+        over = true
+        if let out { return out }
+        var e = QMIDError("qmid did not answer within \(String(format: "%g", timeout)) s")
+        e.timedOut = true
+        return .failure(e)
+    }
+
     private func finish(_ err: String?, _ completion: @escaping (Result<Void, QMIDError>) -> Void) {
         queue.async { completion(err.map { .failure(QMIDError($0)) } ?? .success(())) }
     }
@@ -405,6 +465,7 @@ public extension QMIDClient {
     func setPolicy(pdn: String, policy: String) async throws { try await bridge { self.setPolicy(pdn: pdn, policy: policy, $0) } }
     func setPolicy(pdn: String, policy: QMIDPolicy) async throws { try await setPolicy(pdn: pdn, policy: policy.rawValue) }
     func reload() async throws { try await bridge { self.reload($0) } }
+    func profiles() async throws -> QMIDProfileReport { try await bridge { self.profiles($0) } }
     func restart() async throws { try await bridge { self.restart($0) } }
     func getConfig() async throws -> Data { try await bridge { self.getConfig($0) } }
     func setConfig(_ json: Data) async throws { try await bridge { self.setConfig(json, $0) } }

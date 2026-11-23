@@ -47,6 +47,38 @@ public struct TLV: Equatable {
     public static func u16(_ type: UInt8, _ v: UInt16) -> TLV { var w = ByteWriter(); w.u16(v); return TLV(type, w.bytes) }
     public static func u32(_ type: UInt8, _ v: UInt32) -> TLV { var w = ByteWriter(); w.u32(v); return TLV(type, w.bytes) }
     public static func string(_ type: UInt8, _ s: String) -> TLV { TLV(type, Array(s.utf8)) }
+
+    // A run of TLVs (type u8, length u16, value), as in a QMUX SDU and nested in some TLVs.
+    // Throws if one is cut short.
+    public static func decodeList(_ bytes: [UInt8]) throws -> [TLV] {
+        var r = ByteReader(bytes), out: [TLV] = []
+        while !r.isAtEnd {
+            let type = try r.u8("tlv type")
+            let len = Int(try r.u16("tlv len"))
+            out.append(TLV(type, try r.take(len, "tlv 0x\(String(format: "%02x", type))")))
+        }
+        return out
+    }
+
+    // The same, lenient: the TLVs up to the first one cut short.
+    public static func decodePartialList(_ bytes: [UInt8]) -> [TLV] {
+        var r = ByteReader(bytes), out: [TLV] = []
+        while !r.isAtEnd {
+            guard let type = try? r.u8(), let len = try? r.u16(), let value = try? r.take(Int(len)) else { break }
+            out.append(TLV(type, value))
+        }
+        return out
+    }
+
+    // "0x10 (4): 01 00 00 00"
+    public var dump: String { String(format: "0x%02x (%d): ", type, value.count) + value.hex }
+}
+
+public extension Array where Element == TLV {
+    // Value by type; the first of a type wins.
+    var valuesByType: [UInt8: [UInt8]] {
+        Dictionary(map { ($0.type, $0.value) }, uniquingKeysWith: { a, _ in a })
+    }
 }
 
 // QMI result TLV (0x02) error codes. Values from the public QMI definitions.
@@ -55,12 +87,12 @@ public struct QMIProtocolError: RawRepresentable, Hashable, CustomStringConverti
     public init(rawValue: UInt16) { self.rawValue = rawValue }
 
     public static let none = QMIProtocolError(rawValue: 0x0000)
+    public static let malformedMessage = QMIProtocolError(rawValue: 0x0001)
+    public static let invalidHandle = QMIProtocolError(rawValue: 0x0009)
     public static let invalidClientID = QMIProtocolError(rawValue: 0x0007)
     public static let callFailed = QMIProtocolError(rawValue: 0x000E)
     public static let outOfCall = QMIProtocolError(rawValue: 0x000F)
     public static let noEffect = QMIProtocolError(rawValue: 0x001A)
-    public static let deviceNotReady = QMIProtocolError(rawValue: 0x0034)
-    public static let invalidDataFormat = QMIProtocolError(rawValue: 0x002D)
     public static let notSupported = QMIProtocolError(rawValue: 0x005E)
 
     static let names: [UInt16: String] = [
@@ -113,6 +145,17 @@ public struct QMIMessage {
 
     public subscript(tlv type: UInt8) -> [UInt8]? {
         tlvs.first { $0.type == type }?.value
+    }
+
+    // A TLV's value as one little-endian number from its start; nil if absent or too short.
+    public func u8(tlv type: UInt8) -> UInt8? { self[tlv: type]?.first }
+    public func u16(tlv type: UInt8) -> UInt16? { self[tlv: type].flatMap { var r = ByteReader($0); return try? r.u16() } }
+    public func u32(tlv type: UInt8) -> UInt32? { self[tlv: type].flatMap { var r = ByteReader($0); return try? r.u32() } }
+    public func u64(tlv type: UInt8) -> UInt64? { self[tlv: type].flatMap { var r = ByteReader($0); return try? r.u64() } }
+
+    // One line per TLV, `prefix` then TLV.dump; a response's result TLV (0x02) left out.
+    public func tlvDump(prefix: String = "") -> [String] {
+        tlvs.filter { kind != .response || $0.type != 0x02 }.map { prefix + $0.dump }
     }
 
     public var result: QMIResult? {
@@ -179,13 +222,7 @@ public struct QMIMessage {
         }
         let msgID = try r.u16("message id")
         let tlvLength = Int(try r.u16("tlv length"))
-        var t = ByteReader(try r.take(tlvLength, "tlvs"))
-        var tlvs: [TLV] = []
-        while !t.isAtEnd {
-            let type = try t.u8("tlv type")
-            let len = Int(try t.u16("tlv len"))
-            tlvs.append(TLV(type, try t.take(len, "tlv 0x\(String(format: "%02x", type))")))
-        }
+        let tlvs = try TLV.decodeList(try r.take(tlvLength, "tlvs"))
         return QMIMessage(service: service, clientID: client, kind: kind,
                           transactionID: tx, messageID: msgID, tlvs: tlvs)
     }

@@ -54,10 +54,7 @@ do {
 }
 manager.logSink = { log($1, level: $0) }
 // From the app bundle's Info.plist when qmid runs from Contents/MacOS (nil for a dev build).
-let qmidVersion: String? = {
-    guard let info = Bundle.main.infoDictionary, let short = info["CFBundleShortVersionString"] as? String else { return nil }
-    return "\(short) (\(info["CFBundleVersion"] as? String ?? "?"))"
-}()
+let qmidVersion = QMIDVersion.string()
 manager.version = qmidVersion
 manager.debugEnabled = debugWanted
 manager.restartProcess = {

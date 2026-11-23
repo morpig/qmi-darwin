@@ -1,4 +1,5 @@
 import Foundation
+import QMIDAPI
 import QMIKit
 
 // The QoS side of one connected PDN (docs/QMI-bearers.md): its default bearer's QCI,
@@ -9,8 +10,9 @@ import QMIKit
 // both. Dedicated bearers follow the Event Reports (each create or modify report has the whole
 // bearer). A snapshot at connect and after wake reads what exists already: the QoS IDs with
 // their granted QCI and rates (filters arrive with the bearer's next report), the default
-// bearer's QCI and the AMBR. Snapshot queries run on their own queue, since the modem can be
-// slow to answer while the network changes bearers; results come back on `callbackQueue`.
+// bearer's QCI and the AMBR. Setting up the clients (init) blocks the caller, which reads
+// indicationClientID right after; snapshot queries run on their own queue, since the modem can
+// be slow to answer while the network changes bearers; results come back on `callbackQueue`.
 final class PDNQoS {
     struct State: Equatable {
         var qci: UInt32?
@@ -19,7 +21,7 @@ final class PDNQoS {
     }
 
     private let name: String
-    private let log: (String) -> Void
+    private let log: (String) -> Void       // at .info, on callbackQueue
     private let callbackQueue: DispatchQueue
     private let work = DispatchQueue(label: "qmid.qos")
     private var client: QMIClient?
@@ -27,9 +29,9 @@ final class PDNQoS {
 
     private static let timeout: TimeInterval = 8
 
-    init(device: QMIDevice, session: PDNSession, callbackQueue: DispatchQueue, log: @escaping (String) -> Void) {
+    init(device: QMIDevice, session: PDNSession, callbackQueue: DispatchQueue, log: @escaping LogSink) {
         name = session.config.name
-        self.log = { m in callbackQueue.async { log(m) } }   // the Manager's log runs on its queue
+        self.log = { m in callbackQueue.async { log(.info, m) } }
         self.callbackQueue = callbackQueue
         guard let family = session.settings.keys.sorted().first else { return }
         do {
@@ -40,13 +42,13 @@ final class PDNQoS {
             try c.request(QoS.setClientIPPref, QoS.clientIPPrefRequest(family: family))
             try c.request(QoS.eventReport, QoS.eventReportRequest())
         } catch {
-            log("\(name): qos: \(error)")
+            log(.info, "\(name): qos: \(error)")
             client?.release()
             client = nil
         }
         ambrClient = session.client(family: family)
         do { try ambrClient?.request(WDS.indicationRegister, WDS.ambrIndicationRequest()) }
-        catch { log("\(name): AMBR indication: \(error)") }
+        catch { log(.info, "\(name): AMBR indication: \(error)") }
     }
 
     // The QoS client, whose Event Reports are ours.

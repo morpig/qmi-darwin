@@ -44,26 +44,27 @@ usage (through qmid):
   qmictl xtra load FILE                     load an XTRA file (as downloaded from a server above)
   qmictl sharing                            Internet Sharing over a PDN (config "sharing"): state, clients
 
-usage (direct to the modem; stop qmid first):
-  qmictl probe        [--iface N] [--vendor HEX]... [-v]
-  qmictl modem-status [--iface N] [-v]
-  qmictl profiles     [--iface N] [-v]     modem profiles, autoconnect, LTE attach PDN list
-  qmictl plmn-name    [--iface N] [-v]     operator long/short name: network (NITZ) and modem's own
-  qmictl nas-survey   [--iface N] [-v]     raw TLVs of the NAS cell, signal, band and CA messages
-  qmictl ambr-survey  [--iface N] [-v]     raw TLVs of WDS/QoS messages that may carry the APN-AMBR (profile 1)
-  qmictl reattach     [--iface N] [-v]     low power, then online: attach again with the attach profile
-  qmictl loc-survey   [--register HEX] [--reg-tlv T:HEX] [--listen S] [-v]
-                                           LOC: XTRA source / validity, engine lock, raw indications
-  qmictl loc-inject FILE [--msg 35|a7] [--part-size N] [--stop-after N] [--listen S] [-v]
-                                           LOC: load an XTRA file part by part, timing each ack
-  qmictl loc-fix      [--timeout S] [--after-fix S] [--log FILE] [--no-register]
-                      [--release-test S] [--no-stop] [-v]
+usage (direct to the modem; stop qmid first). DEV: [--iface N] [--vendor HEX]... [-v]
+  qmictl probe        DEV                  QMI services and versions
+  qmictl modem-status DEV                  firmware, IMEI, SIM, registration, default bearer APN
+  qmictl profiles     DEV                  modem profiles, autoconnect, LTE attach PDN list
+  qmictl plmn-name    DEV                  operator long/short name: network (NITZ) and modem's own
+  qmictl nas-survey   DEV                  raw TLVs of the NAS cell, signal, band and CA messages
+  qmictl ambr-survey  DEV                  raw TLVs of WDS/QoS messages that may carry the APN-AMBR (profile 1)
+  qmictl reattach     DEV                  low power, then online: attach again with the attach profile
+  qmictl loc-survey   DEV [--register HEX] [--reg-tlv T:HEX]... [--supl] [--call ID[:TT=HEX,...]]...
+                      [--listen S]         LOC: XTRA source / validity, engine lock, raw indications
+  qmictl loc-inject   FILE DEV [--msg 35|a7] [--part-size N] [--part-timeout S] [--stop-after N]
+                      [--listen S]         LOC: load an XTRA file part by part, timing each ack
+  qmictl loc-fix      DEV [--timeout S] [--after-fix S] [--log FILE] [--no-register] [--release-test S]
+                      [--no-stop] [--mask HEX] [--inject-file FILE]
                                            LOC: 1 Hz session, satellites, time to first fix
-  qmictl profile-write INDEX|new KEY=VALUE...   create/modify a profile; keys: apn, pdp
-                      (ipv4|ipv6|ipv4v6), user, pass, auth (none|pap|chap|pap-chap),
+  qmictl profile-write INDEX|new KEY=VALUE... DEV
+                                           create/modify a profile; keys: apn, pdp
+                      (ipv4|ipv6|ipv4v6|ppp|non-ip), user, pass, auth (none|pap|chap|pap-chap),
                       pcscf-pco, pcscf-dhcp, imcn, disabled (0|1), type (default,ims,...)
-  qmictl run --pdn NAME:PROFILE:MUX[:FAMILIES[:POLICY]] [--pdn ...] [--iface N]
-             [--publish] [--route HOST]... [--scoped] [--stats SECONDS] [--dry-run] [-v]
+  qmictl run --pdn NAME:PROFILE:MUX[:FAMILIES[:POLICY]] [--pdn ...] DEV
+             [--publish] [--route HOST]... [--scoped] [--stats SECONDS] [--dry-run]
              [--no-batch] [--fc-test SECONDS] [--stall-test SECONDS] [--flow-control]
 
   PROFILE   3GPP profile index (AT+CGDCONT cid), or apn=NAME
@@ -73,6 +74,7 @@ usage (direct to the modem; stop qmid first):
             (default: never for a PDN named ims, prefer-wifi otherwise)
   --iface   QMI USB interface number (default: found by its descriptor)
   --vendor  extra USB vendor ID to look for, e.g. 1234 (known modem makers are built in)
+  -v        QMI trace
   --publish publish each PDN as a network service in SCDynamicStore
   --route   host route via the first PDN's utun (removed on exit)
   --scoped  scoped default routes via each utun (for IP_BOUND_IF / curl --interface)
@@ -85,92 +87,82 @@ usage (direct to the modem; stop qmid first):
   --flow-control  ask the modem for QMAP flow control in Set Data Format (experimental)
 """
 
-struct Options {
-    var command = ""
-    var iface: Int?
-    var vendors: [UInt16] = []
-    var verbose = false
-    var pdns: [PDNConfig] = []
-    var routes: [String] = []
-    var scoped = false
-    var statsInterval: Double = 0
-    var dryRun = false
-    var publish = false
-    var noBatch = false
-    var fcTest: Double = 0
-    var stallTest: Double = 0
-    var flowControl = false
-    var policies: [String: QMIDPolicy] = [:]
-}
-
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("qmictl: \(message)\n".utf8))
     exit(1)
 }
 
-func parsePDN(_ spec: String) -> PDNConfig {
-    let parts = spec.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-    guard parts.count >= 3 else { fail("bad --pdn \(spec)") }
-    var profile: UInt8?
-    var apn: String?
-    if parts[1].hasPrefix("apn=") { apn = String(parts[1].dropFirst(4)) }
-    else if let p = UInt8(parts[1]) { profile = p }
-    else { fail("bad profile in \(spec)") }
-    let muxText = parts[2].lowercased()
-    guard let mux = muxText.hasPrefix("0x") ? UInt8(muxText.dropFirst(2), radix: 16) : UInt8(muxText) else {
-        fail("bad mux in \(spec)")
+// MARK: - Arguments
+
+// A command's arguments, taken front to back.
+struct Args {
+    private var rest: ArraySlice<String>
+
+    init(_ args: [String]) { rest = args[...] }
+
+    mutating func next() -> String? { rest.popFirst() }
+
+    // The value after `option`.
+    mutating func value(_ option: String) -> String {
+        guard let v = rest.popFirst() else { fail("\(option) needs a value") }
+        return v
     }
-    let fam = parts.count > 3 ? parts[3] : "46"
-    let families: [UInt8] = fam == "4" ? [4] : fam == "6" ? [6] : [4, 6]
-    return PDNConfig(name: parts[0], profile: profile, apn: apn, muxID: mux, families: families)
+
+    mutating func number(_ option: String) -> Double {
+        let v = value(option)
+        guard let n = Double(v) else { fail("bad \(option) \(v)") }
+        return n
+    }
+
+    mutating func int(_ option: String) -> Int {
+        let v = value(option)
+        guard let n = Int(v) else { fail("bad \(option) \(v)") }
+        return n
+    }
+
+    // Hex, with or without 0x.
+    mutating func hex(_ option: String) -> UInt64 {
+        let v = value(option)
+        guard let n = UInt64(v.lowercased().replacingOccurrences(of: "0x", with: ""), radix: 16) else { fail("bad \(option) \(v) (hex)") }
+        return n
+    }
+
+    // An argument the command doesn't take (or -h).
+    func reject(_ a: String) -> Never {
+        if a == "-h" || a == "--help" { print(usage); exit(0) }
+        fail("\(a.hasPrefix("-") ? "unknown option" : "unexpected argument") \(a) (qmictl --help)")
+    }
 }
 
-func parseOptions() -> Options {
-    var o = Options()
-    var args = Array(CommandLine.arguments.dropFirst())
-    guard !args.isEmpty else { print(usage); exit(2) }
-    o.command = args.removeFirst()
-    while !args.isEmpty {
-        let a = args.removeFirst()
-        func value() -> String {
-            guard !args.isEmpty else { fail("\(a) needs a value") }
-            return args.removeFirst()
-        }
+// Options of every command that opens the modem itself.
+struct DeviceOptions {
+    var iface: Int?
+    var vendors: [UInt16] = []
+    var verbose = false
+
+    // Takes `a` (and its value) if it is a device option.
+    mutating func take(_ a: String, _ args: inout Args) -> Bool {
         switch a {
-        case "--iface": o.iface = Int(value())
+        case "--iface": iface = args.int(a)
         case "--vendor":
-            let v = value()
+            let v = args.value(a)
             guard v.count == 4, let id = UInt16(v, radix: 16) else { fail("bad vendor ID \(v) (4 hex digits)") }
-            o.vendors.append(id)
-        case "-v", "--verbose": o.verbose = true
-        case "--pdn":
-            let spec = value()
-            let pdn = parsePDN(spec)
-            o.pdns.append(pdn)
-            let parts = spec.split(separator: ":", omittingEmptySubsequences: false)
-            if parts.count > 4 {
-                guard let p = QMIDPolicy(rawValue: String(parts[4])) else { fail("bad policy in \(spec)") }
-                o.policies[pdn.name] = p
-            } else {
-                o.policies[pdn.name] = pdn.name == "ims" ? .never : .preferWifi
-            }
-        case "--route": o.routes.append(value())
-        case "--scoped": o.scoped = true
-        case "--dry-run": o.dryRun = true
-        case "--publish": o.publish = true
-        case "--stats": o.statsInterval = Double(value()) ?? 0
-        case "--no-batch": o.noBatch = true
-        case "--fc-test": o.fcTest = Double(value()) ?? 0
-        case "--stall-test": o.stallTest = Double(value()) ?? 0
-        case "--flow-control": o.flowControl = true
-        case "-h", "--help": print(usage); exit(0)
-        default: fail("unknown option \(a)\n\(usage)")
+            vendors.append(id)
+        case "-v", "--verbose": verbose = true
+        default: return false
         }
+        return true
     }
-    return o
+
+    // For commands with no options of their own.
+    static func parse(_ args: inout Args) -> DeviceOptions {
+        var d = DeviceOptions()
+        while let a = args.next() { if !d.take(a, &args) { args.reject(a) } }
+        return d
+    }
 }
 
-func openDevice(_ o: Options) -> QMIDevice {
+func openDevice(_ o: DeviceOptions) -> QMIDevice {
     let dev: QMIDevice
     do { dev = try QMIDevice.open(interface: o.iface, vendorIDs: QMIDevice.vendorIDs(extra: o.vendors)) } catch { fail("\(error)") }
     if o.verbose { dev.trace = { print("  \($0)") } }
@@ -182,9 +174,18 @@ func openDevice(_ o: Options) -> QMIDevice {
     return dev
 }
 
-// MARK: - probe (M1)
+// Get Supported Messages (every service): TLV 0x10, a u16 length then a bitmap, bit N set =
+// message N answered. nil without the TLV.
+func supportedMessages(_ c: QMIClient, timeout: TimeInterval = 2) throws -> [Int]? {
+    guard let v = try c.request(0x001E, timeout: timeout)[tlv: 0x10], v.count >= 2 else { return nil }
+    return Array(v.dropFirst(2)).bitIndexes
+}
 
-func probe(_ o: Options) {
+func hex16(_ ids: [Int]) -> String { ids.map { String(format: "0x%04x", $0) }.joined(separator: " ") }
+
+// MARK: - probe
+
+func probe(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     do {
@@ -202,9 +203,9 @@ func probe(_ o: Options) {
     }
 }
 
-// MARK: - status (M2)
+// MARK: - modem-status
 
-func status(_ o: Options) {
+func modemStatus(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     func section<T>(_ name: String, _ body: () throws -> T) -> T? {
@@ -216,8 +217,7 @@ func status(_ o: Options) {
         dms.release()
     }
     if let uim = section("uim", { try dev.allocateClient(.uim) }) {
-        if let r = section("card status", { try uim.request(UIM.getCardStatus) }),
-           let cards = section("card status", { try UIM.parseCardStatus(r) }) {
+        if let cards = section("card status", { try UIM.parseCardStatus(try uim.request(UIM.getCardStatus)) }) {
             for (i, c) in cards.enumerated() {
                 let apps = c.applications.map { "type \($0.type) state \($0.state)" }.joined(separator: ", ")
                 print("sim \(i):    \(c.stateName), \(c.isReady ? "ready" : "not ready") [\(apps)]")
@@ -226,8 +226,7 @@ func status(_ o: Options) {
         uim.release()
     }
     if let nas = section("nas", { try dev.allocateClient(.nas) }) {
-        if let r = section("serving system", { try nas.request(NAS.getServingSystem) }),
-           let s = section("serving system", { try NAS.parseServingSystem(r) }) {
+        if let s = section("serving system", { try NAS.parseServingSystem(try nas.request(NAS.getServingSystem)) }) {
             let rats = s.radioInterfaces.map(NAS.ServingSystem.radioName).joined(separator: "+")
             let plmn = s.mcc.map { "\($0)-\(String(format: "%02d", s.mnc ?? 0))" } ?? "?"
             print("network:  \(s.registrationName), ps \(s.psAttached ? "attached" : "detached"), rat \(rats.isEmpty ? "none" : rats), plmn \(plmn) \(s.operatorName ?? "")")
@@ -246,7 +245,7 @@ func status(_ o: Options) {
 
 // DMS Set Operating Mode low power, then online: the modem detaches and attaches again with the
 // current LTE attach profile (what qmid's reattachLTE does).
-func reattach(_ o: Options) {
+func reattach(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     do {
@@ -264,7 +263,7 @@ func reattach(_ o: Options) {
 
 // MARK: - plmn-name
 
-func plmnName(_ o: Options) {
+func plmnName(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     do {
@@ -276,8 +275,8 @@ func plmnName(_ o: Options) {
         let d = try nas.request(NAS.getOperatorNameData)
         let r = try nas.request(NAS.getPLMNName, NAS.plmnNameRequest(mcc: mcc, mnc: mnc))
         if o.verbose {
-            for t in d.tlvs where t.type != 0x02 { print(String(format: "  0x0039 0x%02x: ", t.type) + t.value.hex) }
-            for t in r.tlvs where t.type != 0x02 { print(String(format: "  0x0044 0x%02x: ", t.type) + t.value.hex) }
+            d.tlvDump(prefix: String(format: "  0x%04x ", NAS.getOperatorNameData)).forEach { print($0) }
+            r.tlvDump(prefix: String(format: "  0x%04x ", NAS.getPLMNName)).forEach { print($0) }
         }
         let nitz = NAS.parseNITZName(d), table = try NAS.parsePLMNName(r)
         print("network:  long \"\(nitz?.longName ?? "-")\", short \"\(nitz?.shortName ?? "-")\" (NITZ)")
@@ -291,7 +290,7 @@ func plmnName(_ o: Options) {
 
 // Raw TLVs of the NAS messages that carry cell, signal, band and CA information, to check the
 // layout on a given modem before writing parsers. Read only.
-func nasSurvey(_ o: Options) {
+func nasSurvey(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     let messages: [(UInt16, String)] = [
@@ -308,27 +307,16 @@ func nasSurvey(_ o: Options) {
         defer { nas.release() }
         for (id, name) in messages {
             print(String(format: "0x%04x %@:", id, name))
-            do {
-                let r = try nas.request(id, timeout: 2)
-                for t in r.tlvs where t.type != 0x02 {
-                    print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
-                }
-            } catch {
-                print("  \(error)")
-            }
+            do { try nas.request(id, timeout: 2).tlvDump(prefix: "  ").forEach { print($0) } } catch { print("  \(error)") }
         }
-        // Get Supported Messages: TLV 0x10, a length-prefixed bitmap; bit N set = message ID N
-        // answered. Lists the IDs libqmi doesn't define, the ones worth probing.
+        // The IDs libqmi doesn't define: the ones worth probing.
         do {
-            let r = try nas.request(0x001E, timeout: 2)
-            if let v = r[tlv: 0x10], v.count >= 2 {
-                let bits = Array(v.dropFirst(2))
-                let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
+            if let ids = try supportedMessages(nas) {
                 let known: Set<Int> = [0x00, 0x01, 0x02, 0x03, 0x1E, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
                                        0x2A, 0x2B, 0x31, 0x33, 0x34, 0x39, 0x43, 0x44, 0x4D, 0x4F, 0x50, 0x5A,
                                        0x65, 0x67, 0x6C, 0x89, 0xAC]
                 print("0x001e Get Supported Messages: \(ids.count) IDs")
-                print("  not in libqmi: " + ids.filter { !known.contains($0) }.map { String(format: "0x%04x", $0) }.joined(separator: " "))
+                print("  not in libqmi: " + hex16(ids.filter { !known.contains($0) }))
             }
         } catch {
             print("0x001e Get Supported Messages: \(error)")
@@ -341,10 +329,7 @@ func nasSurvey(_ o: Options) {
         let coex = try dev.allocateClient(NAS.coexService)
         defer { coex.release() }
         print("coex 0x0022 Get WWAN State:")
-        let r = try coex.request(NAS.coexGetWWANState, timeout: 2)
-        for t in r.tlvs where t.type != 0x02 {
-            print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
-        }
+        try coex.request(NAS.coexGetWWANState, timeout: 2).tlvDump(prefix: "  ").forEach { print($0) }
     } catch {
         print("  coex: \(error)")
     }
@@ -353,27 +338,27 @@ func nasSurvey(_ o: Options) {
 // MARK: - ambr-survey
 
 // Raw TLVs of the WDS and QoS messages that may carry the APN-AMBR, on a call of our own
-// (qmid stopped), to find where a modem reports it whole. `--find` lists values to look for
-// (e.g. 500000000,500000): any u16/u32/u64 equal to one is flagged, as bps, kbps or Mbps.
-func ambrSurvey(_ o: Options, profile: UInt8, find: [UInt64]) {
+// (qmid stopped), to find where a modem reports it whole. Any u16/u32/u64 in them equal to one
+// of `find` (APN-AMBRs seen on networks, as bps and kbps) is flagged.
+func ambrSurvey(_ o: DeviceOptions) {
+    let profile: UInt8 = 1, muxID: UInt8 = 0x81
+    let find: Set<UInt64> = [500_000_000, 500_000, 256_000_000, 256_000, 244_000_000, 244_000, 508_640, 508_640_000]
     let dev = openDevice(o)
     defer { dev.close() }
-    let muxID: UInt8 = 0x81
-    func dump(_ name: String, _ r: QMIMessage) {
-        print("\(name):")
+    func ask(_ c: QMIClient, _ id: UInt16, _ name: String, _ tlvs: [TLV] = []) {
+        let title = String(format: "0x%04x %@", id, name)
+        let r: QMIMessage
+        do { r = try c.request(id, tlvs, timeout: 5) } catch { return print("\(title): \(error)") }
+        print("\(title):")
         for t in r.tlvs where t.type != 0x02 {
-            print(String(format: "  0x%02x (%d): ", t.type, t.value.count) + t.value.hex)
+            print("  " + t.dump)
             for w in [2, 4, 8] where t.value.count >= w {
                 for off in 0...(t.value.count - w) {
-                    let v = (0..<w).reduce(UInt64(0)) { $0 | UInt64(t.value[off + $1]) << (8 * UInt64($1)) }
-                    if v != 0, find.contains(v) { print("     ^ \(v) at offset \(off) as u\(w * 8)") }
+                    var b = ByteReader(Array(t.value[off..<off + w]) + [UInt8](repeating: 0, count: 8 - w))
+                    if let v = try? b.u64(), v != 0, find.contains(v) { print("     ^ \(v) at offset \(off) as u\(w * 8)") }
                 }
             }
         }
-    }
-    func ask(_ c: QMIClient, _ id: UInt16, _ name: String, _ tlvs: [TLV] = []) {
-        do { dump(String(format: "0x%04x %@", id, name), try c.request(id, tlvs, timeout: 5)) }
-        catch { print(String(format: "0x%04x %@: %@", id, name, "\(error)")) }
     }
     do {
         let wds = try dev.allocateClient(.wds)
@@ -383,20 +368,23 @@ func ambrSurvey(_ o: Options, profile: UInt8, find: [UInt64]) {
         let s = try wds.request(WDS.startNetworkInterface, WDS.startRequest(profile: profile, apn: nil, family: 4),
                                 timeout: 60, accept: [.noEffect, .callFailed])
         print("start: \(s.result.map { "\($0)" } ?? "?")")
+        // Ends our call (runs before the release above).
+        defer {
+            if let h = WDS.parseHandle(s) {
+                _ = try? wds.request(WDS.stopNetworkInterface, [.u32(0x01, h)], timeout: 10,
+                                     accept: [.noEffect, .outOfCall, .invalidHandle])
+                print("stopped")
+            }
+        }
         ask(wds, WDS.getAMBRInfo, "Get AMBR Info")
         ask(wds, WDS.getRuntimeSettings, "Get Runtime Settings", WDS.runtimeSettingsRequest())
-        ask(wds, 0x0085, "Get LTE Attach Params")
+        ask(wds, WDS.getLTEAttachParameters, "Get LTE Attach Params")
         ask(wds, 0x0091, "Get Data Bearer Tech Ex")
         ask(wds, 0x00F3, "Get Data Bearer Type")
         ask(wds, 0x0023, "Get Channel Rates")
         ask(wds, 0x0041, "Get Current Channel Rate")
         ask(wds, 0x0052, "Get Data Bearer Tech")
-        // Get Supported Messages: the WDS IDs this firmware answers.
-        if let r = try? wds.request(0x001E, timeout: 2), let v = r[tlv: 0x10], v.count >= 2 {
-            let bits = Array(v.dropFirst(2))
-            let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
-            print("WDS supported (\(ids.count)): " + ids.map { String(format: "%04x", $0) }.joined(separator: " "))
-        }
+        if let ids = try? supportedMessages(wds) { print("WDS supported (\(ids.count)): " + hex16(ids)) }
         let qos = try dev.allocateClient(.qos)
         defer { qos.release() }
         try qos.request(QoS.bindDataPort, QoS.bindDataPortRequest(interface: UInt32(dev.modem.interfaceNumber), muxID: muxID))
@@ -405,11 +393,7 @@ func ambrSurvey(_ o: Options, profile: UInt8, find: [UInt64]) {
         ask(qos, QoS.getGrantedQoS, "Get Granted QoS (QoS ID 0)", QoS.qosIDRequest(0))
         ask(qos, QoS.getQoSIDs, "Get QoS IDs")
         ask(qos, 0x0031, "Get QoS Network Status / Global Flow")
-        if let r = try? qos.request(0x001E, timeout: 2), let v = r[tlv: 0x10], v.count >= 2 {
-            let bits = Array(v.dropFirst(2))
-            let ids = (0..<bits.count * 8).filter { bits[$0 / 8] & (1 << ($0 % 8)) != 0 }
-            print("QoS supported (\(ids.count)): " + ids.map { String(format: "%04x", $0) }.joined(separator: " "))
-        }
+        if let ids = try? supportedMessages(qos) { print("QoS supported (\(ids.count)): " + hex16(ids)) }
     } catch {
         fail("\(error)")
     }
@@ -417,7 +401,7 @@ func ambrSurvey(_ o: Options, profile: UInt8, find: [UInt64]) {
 
 // MARK: - profiles
 
-func profiles(_ o: Options) {
+func profiles(_ o: DeviceOptions) {
     let dev = openDevice(o)
     defer { dev.close() }
     do {
@@ -428,12 +412,10 @@ func profiles(_ o: Options) {
         for entry in list {
             let r = try wds.request(WDS.getProfileSettings, [WDS.profileIdentifier(entry.index)])
             print("  " + WDS.parseProfile(r, index: entry.index).summary)
-            if o.verbose {
-                for t in r.tlvs where t.type != 0x02 { print(String(format: "      0x%02x: ", t.type) + t.value.hex) }
-            }
+            if o.verbose { r.tlvDump(prefix: "      ").forEach { print($0) } }
         }
         if let r = try? wds.request(WDS.getAutoconnectSettings) {
-            print("autoconnect: \(WDS.parseAutoconnect(r).map { "\($0)" } ?? "?")\(r[tlv: 0x10].map { ", roaming \($0.first ?? 0)" } ?? "")")
+            print("autoconnect: \(WDS.parseAutoconnect(r).map { "\($0)" } ?? "?")\(r.u8(tlv: 0x10).map { ", roaming \($0)" } ?? "")")
         } else {
             print("autoconnect: not supported")
         }
@@ -448,22 +430,26 @@ func profiles(_ o: Options) {
     }
 }
 
-func profileWrite(_ args: [String]) {
-    guard args.count >= 2 else { fail("profile-write INDEX|new KEY=VALUE...") }
-    let isNew = args[0] == "new"
-    guard isNew || UInt8(args[0]) != nil else { fail("bad index \(args[0])") }
-    var p = WDS.Profile(index: UInt8(args[0]) ?? 0)
-    for kv in args.dropFirst() {
-        let parts = kv.split(separator: "=", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { fail("bad \(kv)") }
+func profileWrite(_ args: inout Args) {
+    var o = DeviceOptions()
+    var target: String?
+    var p = WDS.Profile(index: 0)
+    var keys = 0
+    while let a = args.next() {
+        if o.take(a, &args) { continue }
+        guard !a.hasPrefix("-") else { args.reject(a) }
+        guard target != nil else { target = a; continue }
+        let parts = a.split(separator: "=", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { fail("bad \(a)") }
         let (k, v) = (parts[0], parts[1])
+        keys += 1
         func bool() -> Bool { v == "1" || v == "true" || v == "yes" }
         switch k {
         case "apn": p.apn = v
-        case "pdp": p.pdpType = v == "ipv4" ? .ipv4 : v == "ipv6" ? .ipv6 : .ipv4v6
+        case "pdp": guard let t = WDS.PDPType(name: v) else { fail("bad pdp \(v)") }; p.pdpType = t
         case "user": p.username = v
         case "pass": p.password = v
-        case "auth": guard let a = WDS.Authentication(name: v) else { fail("bad auth \(v)") }; p.authentication = a
+        case "auth": guard let auth = WDS.Authentication(name: v) else { fail("bad auth \(v)") }; p.authentication = auth
         case "pcscf-pco": p.pcscfUsingPCO = bool()
         case "pcscf-dhcp": p.pcscfUsingDHCP = bool()
         case "imcn": p.imcn = bool()
@@ -474,33 +460,97 @@ func profileWrite(_ args: [String]) {
         default: fail("unknown key \(k)")
         }
     }
-    var o = Options()
-    o.verbose = CommandLine.arguments.contains("-v")
+    guard let target, keys > 0 else { fail("profile-write INDEX|new KEY=VALUE...") }
+    let isNew = target == "new"
+    if !isNew {
+        guard let i = UInt8(target) else { fail("bad index \(target)") }
+        p.index = i
+    }
     let dev = openDevice(o)
     defer { dev.close() }
     do {
         let wds = try dev.allocateClient(.wds)
         defer { wds.release() }
-        let r: QMIMessage
         if isNew {
-            r = try wds.request(WDS.createProfile, [.u8(0x01, WDS.profileType3GPP)] + p.settingTLVs)
+            let r = try wds.request(WDS.createProfile, [.u8(0x01, WDS.profileType3GPP)] + p.settingTLVs)
             p.index = WDS.parseCreatedProfileIndex(r) ?? 0
             print("created profile \(p.index)")
         } else {
-            r = try wds.request(WDS.modifyProfile, [WDS.profileIdentifier(p.index)] + p.settingTLVs)
+            try wds.request(WDS.modifyProfile, [WDS.profileIdentifier(p.index)] + p.settingTLVs)
             print("modified profile \(p.index)")
         }
         let now = try wds.request(WDS.getProfileSettings, [WDS.profileIdentifier(p.index)])
         print("  " + WDS.parseProfile(now, index: p.index).summary)
-    } catch let e as QMIHostError {
-        if case .protocolError(_, let m) = e, let x = WDS.parseExtendedError(m) { fail("\(e) (extended error \(x))") }
-        fail("\(e)")
     } catch {
+        if case .protocolError(_, let m)? = error as? QMIHostError, let x = WDS.parseExtendedError(m) {
+            fail("\(error) (extended error \(x))")
+        }
         fail("\(error)")
     }
 }
 
-// MARK: - connect (M3/M4)
+// MARK: - run
+
+struct RunOptions {
+    var device = DeviceOptions()
+    var pdns: [PDNConfig] = []
+    var policies: [String: QMIDPolicy] = [:]
+    var routes: [String] = []
+    var scoped = false
+    var statsInterval: Double = 0
+    var dryRun = false
+    var publish = false
+    var noBatch = false
+    var fcTest: Double = 0
+    var stallTest: Double = 0
+    var flowControl = false
+
+    // --pdn NAME:PROFILE:MUX[:FAMILIES[:POLICY]]
+    mutating func addPDN(_ spec: String) {
+        let parts = spec.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3 else { fail("bad --pdn \(spec)") }
+        var profile: UInt8?
+        var apn: String?
+        if parts[1].hasPrefix("apn=") { apn = String(parts[1].dropFirst(4)) }
+        else if let p = UInt8(parts[1]) { profile = p }
+        else { fail("bad profile in \(spec)") }
+        let muxText = parts[2].lowercased()
+        guard let mux = muxText.hasPrefix("0x") ? UInt8(muxText.dropFirst(2), radix: 16) : UInt8(muxText) else {
+            fail("bad mux in \(spec)")
+        }
+        let fam = parts.count > 3 ? parts[3] : "46"
+        let families: [UInt8] = fam == "4" ? [4] : fam == "6" ? [6] : [4, 6]
+        let name = parts[0]
+        pdns.append(PDNConfig(name: name, profile: profile, apn: apn, muxID: mux, families: families))
+        if parts.count > 4 {
+            guard let p = QMIDPolicy(rawValue: parts[4]) else { fail("bad policy in \(spec)") }
+            policies[name] = p
+        } else {
+            policies[name] = name == "ims" ? .never : .preferWifi
+        }
+    }
+
+    static func parse(_ args: inout Args) -> RunOptions {
+        var o = RunOptions()
+        while let a = args.next() {
+            if o.device.take(a, &args) { continue }
+            switch a {
+            case "--pdn": o.addPDN(args.value(a))
+            case "--route": o.routes.append(args.value(a))
+            case "--scoped": o.scoped = true
+            case "--dry-run": o.dryRun = true
+            case "--publish": o.publish = true
+            case "--stats": o.statsInterval = args.number(a)
+            case "--no-batch": o.noBatch = true
+            case "--fc-test": o.fcTest = args.number(a)
+            case "--stall-test": o.stallTest = args.number(a)
+            case "--flow-control": o.flowControl = true
+            default: args.reject(a)
+            }
+        }
+        return o
+    }
+}
 
 func describe(_ s: WDS.RuntimeSettings) -> [String] {
     var out: [String] = []
@@ -521,7 +571,7 @@ final class Connection {
     var wda: QMIClient?
     var publisher: ServicePublisher?
     var tornDown = false
-    var lastStats: [NSNumber: [String: NSNumber]] = [:]
+    var lastStats: [UInt8: QMIDCounters] = [:]
     var lastStatsTime = Date()
 
     init(dev: QMIDevice) { self.dev = dev }
@@ -544,31 +594,39 @@ final class Connection {
         let dt = now.timeIntervalSince(lastStatsTime)
         let stats = dev.modem.statistics()
         for (s, u) in sessions {
-            guard let cur = stats[NSNumber(value: s.config.muxID)] else { continue }
-            let prev = lastStats[NSNumber(value: s.config.muxID)] ?? [:]
-            func d(_ k: String) -> Double { Double(cur[k]?.uint64Value ?? 0) - Double(prev[k]?.uint64Value ?? 0) }
-            let rxMbps = d("rx_bytes") * 8 / dt / 1e6, txMbps = d("tx_bytes") * 8 / dt / 1e6
+            let mux = s.config.muxID
+            guard let d = stats[NSNumber(value: mux)] else { continue }
+            let cur = QMIDCounters(d as NSDictionary), prev = lastStats[mux] ?? QMIDCounters()
+            lastStats[mux] = cur
+            func mbps(_ k: KeyPath<QMIDCounters, UInt64?>) -> Double {
+                (Double(cur[keyPath: k] ?? 0) - Double(prev[keyPath: k] ?? 0)) * 8 / dt / 1e6
+            }
             print(String(format: "%@ %@  rx %.1f Mbit/s (%llu pkts, %llu drops)  tx %.1f Mbit/s (%llu pkts, %llu drops)  flow-off %llu ms",
-                         s.config.name, u.name, rxMbps, cur["rx_packets"]?.uint64Value ?? 0, cur["rx_drops"]?.uint64Value ?? 0,
-                         txMbps, cur["tx_packets"]?.uint64Value ?? 0, cur["tx_drops"]?.uint64Value ?? 0,
-                         cur["flow_disabled_ms"]?.uint64Value ?? 0))
+                         s.config.name, u.name, mbps(\.rxBytes), cur.rxPackets ?? 0, cur.rxDrops ?? 0,
+                         mbps(\.txBytes), cur.txPackets ?? 0, cur.txDrops ?? 0, cur.flowDisabledMs ?? 0))
         }
         if let g = stats[0] {
             print("usb   " + g.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         }
-        lastStats = stats
         lastStatsTime = now
     }
 }
 
-var statsTimer: DispatchSourceTimer?
-var flowTestTimer: DispatchSourceTimer?
-var stallTestTimer: DispatchSourceTimer?
+var timers: [DispatchSourceTimer] = []
 
-func connect(_ o: Options) {
+// Runs `body` on the main queue every `interval` seconds (kept until exit).
+func every(_ interval: Double, _ body: @escaping () -> Void) {
+    let t = DispatchSource.makeTimerSource(queue: .main)
+    t.schedule(deadline: .now() + interval, repeating: interval)
+    t.setEventHandler(handler: body)
+    t.resume()
+    timers.append(t)
+}
+
+func run(_ o: RunOptions) -> Never {
     guard geteuid() == 0 || o.dryRun else { fail("run needs root (utun, ifconfig, route): sudo qmictl run ... (or --dry-run)") }
     guard !o.pdns.isEmpty else { fail("run needs at least one --pdn") }
-    let dev = openDevice(o)
+    let dev = openDevice(o.device)
     let conn = Connection(dev: dev)
 
     dev.modem.terminationHandler = {
@@ -588,21 +646,16 @@ func connect(_ o: Options) {
 
     do {
         // WDA Set Data Format: raw IP + QMAP both ways; use what the modem grants (PLAN.md §4.2).
-        let wda = try dev.allocateClient(.wda)
-        conn.wda = wda
-        var req = WDA.Request(endpointInterface: UInt32(dev.modem.interfaceNumber))
-        if o.flowControl { req.flowControl = true }
-        let g = WDA.parseGranted(try wda.request(WDA.setDataFormat, req.tlvs))
-        print("data format: link \(g.linkLayer.map(String.init) ?? "?") ul-agg \(g.uplinkAggregation.map(String.init) ?? "?") dl-agg \(g.downlinkAggregation.map(String.init) ?? "?") " +
-              "dl \(g.downlinkMaxDatagrams.map(String.init) ?? "?")x\(g.downlinkMaxSize.map(String.init) ?? "?") " +
-              "ul \(g.uplinkMaxDatagrams.map(String.init) ?? "?")x\(g.uplinkMaxSize.map(String.init) ?? "?") pad \(g.downlinkMinPadding.map(String.init) ?? "-") " +
-              "flow-control \(g.flowControl.map { $0 ? "on" : "off" } ?? "-")")
-        if let problem = g.datapathProblem {
-            throw QMIHostError.transport("unusable data format: \(problem) (see data format above)")
+        let (wda, g) = try dev.setDataFormat(flowControl: o.flowControl) { g in
+            print("data format: link \(g.linkLayer.map(String.init) ?? "?") ul-agg \(g.uplinkAggregation.map(String.init) ?? "?") dl-agg \(g.downlinkAggregation.map(String.init) ?? "?") " +
+                  "dl \(g.downlinkMaxDatagrams.map(String.init) ?? "?")x\(g.downlinkMaxSize.map(String.init) ?? "?") " +
+                  "ul \(g.uplinkMaxDatagrams.map(String.init) ?? "?")x\(g.uplinkMaxSize.map(String.init) ?? "?") pad \(g.downlinkMinPadding.map(String.init) ?? "-") " +
+                  "flow-control \(g.flowControl.map { $0 ? "on" : "off" } ?? "-")")
         }
+        conn.wda = wda
         if o.dryRun {
             for cfg in o.pdns {
-                let session = PDNSession(device: dev, config: cfg, dataInterface: dev.modem.interfaceNumber)
+                let session = PDNSession(device: dev, config: cfg)
                 do {
                     try session.connect()
                     print("\(cfg) up (dry run)")
@@ -616,24 +669,21 @@ func connect(_ o: Options) {
             conn.teardown()
             exit(0)
         }
-        dev.modem.batchUtunIO = !o.noBatch
-        dev.modem.batchFallbackHandler = { print("utun batching off: \($0)") }
-        try dev.modem.startDatapath(withDownlinkSize: UInt(g.downlinkMaxSize ?? 16384),
-                                    uplinkSize: UInt(g.uplinkMaxSize ?? 0),
-                                    uplinkDatagrams: UInt(g.uplinkMaxDatagrams ?? 0))
+        try dev.startDatapath(g, batch: !o.noBatch) { print("utun batching off: \($0)") }
 
         if o.publish {
             let pub = try ServicePublisher(name: "qmictl")
             conn.publisher = pub
-            try pub.publish([QMIDStoreKey.modem: [
-                "VendorID": Int(dev.modem.vendorID), "ProductID": Int(dev.modem.productID),
-                "Interface": Int(dev.modem.interfaceNumber), "State": "running",
-            ]])
+            try pub.publish([QMIDStoreKey.modem: QMIDStoreModem(
+                state: "running", vendorID: Int(dev.modem.vendorID), productID: Int(dev.modem.productID),
+                interface: Int(dev.modem.interfaceNumber)).dictionary])
         }
         for (i, cfg) in o.pdns.enumerated() {
-            let session = PDNSession(device: dev, config: cfg, dataInterface: dev.modem.interfaceNumber)
+            let session = PDNSession(device: dev, config: cfg)
             try session.connect()
-            let utun = try Utun()
+            // From here the call is up: teardown() must see it whatever fails next.
+            let utun: Utun
+            do { utun = try Utun() } catch { session.disconnect(); throw error }
             conn.sessions.append((session, utun))
             try utun.configure(session.merged)
             dev.modem.attachMux(cfg.muxID, fd: utun.fd)
@@ -647,14 +697,13 @@ func connect(_ o: Options) {
             if i == 0 { for r in o.routes { try utun.addHostRoute(r); print("  route \(r) -> \(utun.name)") } }
             if let pub = conn.publisher {
                 let policy = o.policies[cfg.name] ?? .preferWifi
-                let id = ServicePublisher.serviceID(for: cfg.name)
                 var entries = ServicePublisher.entities(pdnName: cfg.name, interface: utun.name,
                                                         settings: session.merged, policy: policy)
                 entries[QMIDStoreKey.pdn(cfg.name)] = ServicePublisher.pdnStatus(
                     name: cfg.name, interface: utun.name, config: cfg,
-                    settings: session.merged, policy: policy)
+                    settings: session.merged, policy: policy).dictionary
                 try pub.publish(entries)
-                print("  published service \(id) (\(policy.rawValue))")
+                print("  published service \(ServicePublisher.serviceID(for: cfg.name)) (\(policy.rawValue))")
             }
         }
     } catch {
@@ -676,59 +725,177 @@ func connect(_ o: Options) {
         s.resume()
         sources.append(s)
     }
-    if o.statsInterval > 0 {
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + o.statsInterval, repeating: o.statsInterval)
-        t.setEventHandler { conn.printStats() }
-        t.resume()
-        statsTimer = t
-    }
+    if o.statsInterval > 0 { every(o.statsInterval) { conn.printStats() } }
     if o.fcTest > 0 {
         var disabled = false
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + o.fcTest, repeating: o.fcTest)
-        t.setEventHandler {
+        every(o.fcTest) {
             disabled.toggle()
             for (s, _) in conn.sessions { dev.modem.simulateFlowControl(disabled, mux: s.config.muxID) }
             print("fc-test: flow \(disabled ? "disabled" : "enabled") on every PDN (simulated)")
         }
-        t.resume()
-        flowTestTimer = t
     }
     if o.stallTest > 0 {
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + o.stallTest, repeating: o.stallTest)
-        t.setEventHandler {
+        every(o.stallTest) {
             dev.modem.simulateInStall()
             print("stall-test: bulk IN stall cleared (simulated)")
         }
-        t.resume()
-        stallTestTimer = t
     }
     print("connected; Ctrl-C to disconnect")
     withExtendedLifetime(sources) { dispatchMain() }
 }
 
-// MARK: - Daemon client (XPC)
+// MARK: - Through qmid (XPC)
 
-func withDaemon(_ body: (QMIDControl, @escaping () -> Void) -> Void) {
-    let c = NSXPCConnection(machServiceName: qmidMachService, options: .privileged)
-    c.remoteObjectInterface = NSXPCInterface(with: QMIDControl.self)
-    c.resume()
-    let done = DispatchSemaphore(value: 0)
-    let proxy = c.remoteObjectProxyWithErrorHandler { error in
-        fail(QMIDError(xpc: error).message)
-    } as! QMIDControl
-    body(proxy) { done.signal() }
-    // connect answers when the dial has ended: up to 60 s per family.
-    if done.wait(timeout: .now() + 150) == .timedOut { fail("qmid did not answer") }
-    c.invalidate()
+// For the one-shot commands; its replies come on its own queue, so the main thread can wait.
+let qmid = QMIDClient(queue: DispatchQueue(label: "qmictl.qmid"))
+
+// One call to qmid, waited for; exits with its error. connect answers when the dial has ended
+// (up to 60 s per family), hence the long timeout.
+func ask<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) -> T {
+    switch qmid.sync(timeout: 150, call) {
+    case .success(let v): return v
+    case .failure(let e): fail(e.message)
+    }
 }
 
-func printStatus(_ d: NSDictionary) {
-    let st = QMIDStatus(d)
+// The same, for a call that only succeeds or fails: "ok".
+func perform(_ call: (@escaping (Result<Void, QMIDError>) -> Void) -> Void) {
+    ask(call)
+    print("ok")
+}
+
+// The same, where a failure only means there is nothing to show.
+func tryAsk<T>(_ call: (@escaping (Result<T, QMIDError>) -> Void) -> Void) -> T? {
+    try? qmid.sync(timeout: 150, call).get()
+}
+
+func daemonCommand(_ args: [String]) -> Bool {
+    let persistent = args.contains("--persistent")
+    switch args.first {
+    case "status":
+        // Everything read-only: state, then the cells, then the band preference.
+        printStatus(ask { qmid.status($0) })
+        if let r = tryAsk({ qmid.radio($0) }) { printRadio(r) }
+        if let b = tryAsk({ qmid.bandPreference($0) }) { printBands(b) }
+    case "connect" where args.count == 2:
+        perform { qmid.connect(pdn: args[1], $0) }
+    case "disconnect" where args.count == 2:
+        perform { qmid.disconnect(pdn: args[1], $0) }
+    case "policy" where args.count == 3:
+        perform { qmid.setPolicy(pdn: args[1], policy: args[2], $0) }
+    case "restart":
+        perform { qmid.restart($0) }
+    case "reload":
+        perform { qmid.reload($0) }
+    case "config" where args.count == 2 && args[1] == "get":
+        FileHandle.standardOutput.write(ask { qmid.getConfig($0) })
+        print()
+    case "config" where args.count == 3 && args[1] == "set":
+        guard let data = FileManager.default.contents(atPath: args[2]) else { fail("can't read \(args[2])") }
+        perform { qmid.setConfig(data, $0) }
+    case "events":
+        streamEvents()
+    case "log":
+        var a = Args(Array(args.dropFirst()))
+        streamLog(&a)
+    case "sync":
+        printProfileReport(ask { qmid.profiles($0) })
+    case "prepare-sim" where args.count >= 2:
+        var a = Args(Array(args.dropFirst()))
+        prepareSIM(&a)
+    case "cancel-sim" where args.count == 2:
+        perform { qmid.cancelSIM(iccid: args[1], $0) }
+    case "radio" where args.count >= 2 && args[1] == "watch":
+        radioWatch(verbose: args.contains("-v"))
+    case "radio" where args.count <= 2:
+        printRadio(ask { qmid.radio(raw: args.last == "-v", $0) })
+    case "airplane" where args.count == 2 && ["on", "off"].contains(args[1]):
+        perform { qmid.setAirplaneMode(args[1] == "on", $0) }
+    case "restart-modem":
+        perform { qmid.restartModem($0) }
+    case "bands" where args.count >= 2 && args[1] == "set":
+        var lists: [String: [Int]] = [:]
+        var i = 2
+        while i < args.count {
+            if args[i] == "--persistent" { i += 1; continue }
+            guard ["lte", "nsa", "sa"].contains(args[i]) else { fail("bands set: unknown \(args[i]) (lte, nsa, sa)") }
+            guard i + 1 < args.count else { fail("bands set: \(args[i]) needs a list, e.g. 1,3") }
+            lists[args[i]] = args[i + 1].split(separator: ",").compactMap { Int($0) }
+            i += 2
+        }
+        perform { qmid.setBandPreference(lte: lists["lte"], nrNSA: lists["nsa"], nrSA: lists["sa"], persistent: persistent, $0) }
+    case "bands" where args.count >= 2 && args[1] == "reset":
+        perform { qmid.resetBandPreference(persistent: persistent, $0) }
+    case "bands":
+        printBands(ask { qmid.bandPreference($0) })
+    case "modes" where args.count >= 3 && args[1] == "set":
+        perform { qmid.setModePreference(args[2].split(separator: ",").map(String.init), persistent: persistent, $0) }
+    case "modes" where args.count >= 2 && args[1] == "reset":
+        perform { qmid.resetModePreference(persistent: persistent, $0) }
+    case "sharing" where args.count == 1:
+        if let s = ask({ qmid.status($0) }).sharing { printSharing(s) } else {
+            print("sharing: not configured (qmid.json \"sharing\": { \"pdn\": \"internet\" })")
+        }
+    case "gnss" where args.count >= 2 && args[1] == "watch":
+        var a = Args(Array(args.dropFirst(2)))
+        gnssWatch(&a)
+    case "gnss" where args.count == 1:
+        printGNSS(ask { qmid.gnss($0) })
+        if let x = tryAsk({ qmid.xtra($0) }) { printXTRA(x) }
+    case "xtra" where args.count == 3 && args[1] == "load":
+        guard let data = FileManager.default.contents(atPath: args[2]) else { fail("cannot read \(args[2])") }
+        let x = ask { qmid.loadXTRA(data, $0) }
+        print("loaded \(data.count) bytes")
+        printXTRA(x)
+    case "xtra" where args.count == 1:
+        printXTRA(ask { qmid.xtra($0) })
+    default:
+        return false
+    }
+    return true
+}
+
+// The prepare lasts while this connection does, so qmictl stays until Ctrl-C or --hold runs out.
+func prepareSIM(_ args: inout Args) -> Never {
+    var hold: Double?
+    var rest: [String] = []
+    while let a = args.next() {
+        if a == "--hold" { hold = args.number(a) } else if a.hasPrefix("-") || rest.count == 2 { args.reject(a) } else { rest.append(a) }
+    }
+    guard let iccid = rest.first else { fail("prepare-sim ICCID [MCCMNC] [--hold SECONDS]") }
+    let p = ask { qmid.prepareSIM(iccid: iccid, mccmnc: rest.count == 2 ? rest[1] : nil, $0) }
+    print("prepared: attach apn \"\(p.apn)\"\(p.carrier.map { ", carrier \($0)" } ?? "")\(p.matchedBy.map { " by \($0)" } ?? "")")
+    print(hold.map { "holding \(Int($0)) s" } ?? "switch SIMs now; Ctrl-C ends the prepare")
+    if let hold { DispatchQueue.main.asyncAfter(deadline: .now() + hold) { qmid.invalidate(); exit(0) } }
+    dispatchMain()
+}
+
+func printProfileReport(_ r: QMIDProfileReport) {
+    if let s = r.sim {
+        print("sim: \(s)\(r.carrier.map { ", carrier \($0)" } ?? "")\(r.attachAPN.map { ", default bearer apn \($0)" } ?? "")\(r.pending.map { ", prepared for SIM \($0)" } ?? "")")
+    }
+    for p in r.pdns {
+        print("\(p.pdn): profile \(p.profile.map(String.init) ?? "-")\(p.attach ? " (attach)" : ""): \(p.action)")
+        if let st = p.settings { print("  \(st)") }
+    }
+    if let e = r.error { print("sync error: \(e)") }
+    if !r.learned.isEmpty {
+        print("default bearer apns seen (home mccmnc: apn):")
+        r.learned.forEach { print("  \($0)") }
+    }
+    if let m = r.modemProfiles {
+        print("modem profiles:")
+        m.forEach { print("  \($0)") }
+    }
+    if let a = r.autoconnect { print("modem autoconnect: \(a)") }
+    if let a = r.attachProfile { print("lte attach profile: \(a)") }
+}
+
+// MARK: - Formatting
+
+func printStatus(_ st: QMIDStatus) {
     if let v = st.version { print("qmid: \(v)") }
-    print("modem: \(st.modem)\(st.modemError.map { " (\($0))" } ?? "")\(st.network.map { ", \($0)" } ?? "")\(st.airplaneMode ? ", airplane mode" : "")")
+    print("modem: " + describe(QMIDModem(state: st.modem, network: st.network, error: st.modemError, airplaneMode: st.airplaneMode)))
     if let s = st.sim {
         print("sim: \(describe(s))")
         let ids = [s.iccid.map { "iccid \($0)" }, s.imsi.map { "imsi \($0)" }, s.msisdn.map { "msisdn \($0)" }].compactMap { $0 }
@@ -738,41 +905,48 @@ func printStatus(_ d: NSDictionary) {
     if let p = st.plmn { print("operator: \(describe(p))") }
     if let g = st.gnss, g.running || g.engine == "on" { printGNSS(g) }
     if let s = st.sharing { printSharing(s) }
-    for case let p as NSDictionary in (d[QMIDKey.pdns] as? NSArray) ?? [] {
-        guard let q = QMIDPDN(p) else { continue }
-        var line = "\(q.name): \(q.stateName)"
-        if let i = q.interface { line += " on \(i)" }
-        line += ", \(q.policy ?? "?")"
-        if let u = q.uptime { line += ", up \(u) s" }
-        if let r = q.rat { line += ", on \(r)" }
-        if !q.wanted { line += ", manual" }
-        print(line)
-        if let a = q.ipv4 { print("  ipv4 \(a)") }
-        if let a = q.ipv6 { print("  ipv6 \(a)") }
-        if !q.pcscf.isEmpty { print("  p-cscf \(q.pcscf.joined(separator: " "))") }
-        if q.qci != nil || q.ambr != nil {
-            print("  qci \(q.qci.map(String.init) ?? "?"), ambr \(q.ambr.map(describe) ?? "?")")
-        }
-        for b in q.bearers ?? [] { describe(b).forEach { print("  " + $0) } }
-        if let c = p[QMIDKey.counters] as? NSDictionary {
-            print("  rx \(c["rx_packets"] ?? 0) pkts/\(c["rx_bytes"] ?? 0) B, tx \(c["tx_packets"] ?? 0) pkts/\(c["tx_bytes"] ?? 0) B, drops rx \(c["rx_drops"] ?? 0)/tx \(c["tx_drops"] ?? 0)")
-        }
-        if let e = q.error { print("  last error: \(e)\(q.reason.map { " [\($0.rawValue)]" } ?? "")") }
-        if !q.causes.isEmpty {
-            print("  causes: " + q.causes.map { c in
-                [c.family.map { "ipv\($0)" }, "\(c.type) \(c.code.map(String.init) ?? "?")"].compactMap { $0 }.joined(separator: " ")
-            }.joined(separator: ", "))
-        }
-        if !q.blocked.isEmpty {
-            // "ipv4: X", "ipv6: X" → "X" when every family is blocked for the same reason.
-            let b = q.blocked
-            let reasons = Set(b.map { $0.split(separator: ":", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) } ?? $0 })
-            print("  blocked: \(b.count > 1 && reasons.count == 1 ? reasons.first! : b.joined(separator: "; "))")
-        }
+    for p in st.pdns { describe(p).forEach { print($0) } }
+    if let g = st.datapath {
+        print("datapath: " + g.values.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
     }
-    if let g = d["datapath"] as? NSDictionary {
-        print("datapath: " + (g as! [String: Any]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+}
+
+// "ready (error), registered, ps attached, lte, airplane mode"
+func describe(_ m: QMIDModem) -> String {
+    "\(m.state)\(m.error.map { " (\($0))" } ?? "")\(m.network.map { ", \($0)" } ?? "")\(m.airplaneMode ? ", airplane mode" : "")"
+}
+
+// A PDN as lines (status, and pdn events): state, then addresses, QoS, bearers, counters, errors.
+func describe(_ q: QMIDPDN) -> [String] {
+    var line = "\(q.name): \(q.stateName)"
+    if let i = q.interface { line += " on \(i)" }
+    line += ", \(q.policy ?? "?")"
+    if let u = q.uptime { line += ", up \(u) s" }
+    if let r = q.rat { line += ", on \(r)" }
+    if !q.wanted { line += ", manual" }
+    var out = [line]
+    func add(_ s: String) { out.append("  " + s) }
+    if let a = q.ipv4 { add("ipv4 \(a)") }
+    if let a = q.ipv6 { add("ipv6 \(a)") }
+    if !q.pcscf.isEmpty { add("p-cscf \(q.pcscf.joined(separator: " "))") }
+    if q.qci != nil || q.ambr != nil { add("qci \(q.qci.map(String.init) ?? "?"), ambr \(q.ambr.map(describe) ?? "?")") }
+    for b in q.bearers ?? [] { describe(b).forEach(add) }
+    if let c = q.counters {
+        add("rx \(c.rxPackets ?? 0) pkts/\(c.rxBytes ?? 0) B, tx \(c.txPackets ?? 0) pkts/\(c.txBytes ?? 0) B, drops rx \(c.rxDrops ?? 0)/tx \(c.txDrops ?? 0)")
     }
+    if let e = q.error { add("last error: \(e)\(q.reason.map { " [\($0.rawValue)]" } ?? "")") }
+    if !q.causes.isEmpty {
+        add("causes: " + q.causes.map { c in
+            [c.family.map { "ipv\($0)" }, "\(c.type) \(c.code.map(String.init) ?? "?")"].compactMap { $0 }.joined(separator: " ")
+        }.joined(separator: ", "))
+    }
+    if !q.blocked.isEmpty {
+        // "ipv4: X", "ipv6: X" → "X" when every family is blocked for the same reason.
+        let reasons = Set(q.blocked.map { $0.split(separator: ":", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) } ?? $0 })
+        if q.blocked.count > 1, reasons.count == 1, let r = reasons.first { add("blocked: \(r)") }
+        else { add("blocked: \(q.blocked.joined(separator: "; "))") }
+    }
+    return out
 }
 
 func describe(_ a: QMIDAMBR) -> String {
@@ -821,47 +995,172 @@ func describe(_ p: QMIDPLMN) -> String {
     return s
 }
 
-func describe(_ p: QMIDPDN) -> String {
-    var s = "\(p.name) \(p.stateName)"
-    if let i = p.interface { s += " on \(i)" }
-    if let a = p.ipv4 { s += " \(a)" }
-    if let a = p.ipv6 { s += " \(a)" }
-    if !p.pcscf.isEmpty { s += " p-cscf \(p.pcscf.joined(separator: ","))" }
-    if let r = p.rat { s += " on \(r)" }
-    if let q = p.qci { s += " qci \(q)" }
-    if let a = p.ambr { s += " ambr \(describe(a))" }
-    if let e = p.error, !p.isConnected { s += " (\(e))" }
-    return s
+func printSharing(_ s: QMIDSharing) {
+    let to = s.sharedTo.isEmpty ? "" : " to \(s.sharedTo.joined(separator: ", "))"
+    switch s.stateKind {
+    case .on?:
+        print("sharing: on, \(s.pdn) (\(s.interface ?? "?"))\(to) via \(s.bridge ?? "?"), \(s.clients) client\(s.clients == 1 ? "" : "s")")
+    case .waiting?: print("sharing: waiting for \(s.pdn)\(to)")
+    case .off?: print("sharing: off (Internet Sharing is turned off)")
+    case .notSelected?: print("sharing: Internet Sharing doesn't use \"Cellular (\(s.pdn))\" as its source")
+    case nil: print("sharing: \(s.stateName), \(s.pdn)\(to)")
+    }
 }
 
-// Uses QMIDClient (as any client app would), so it also shows reconnects after qmid restarts.
-func streamEvents() -> Never {
-    let fmt = DateFormatter()
-    fmt.dateFormat = "HH:mm:ss"
-    let client = QMIDClient(queue: .main)
-    client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
-    client.onGNSS = { g in print("\(fmt.string(from: Date())) ", terminator: ""); printGNSS(g) }
-    client.onSharing = { s in print("\(fmt.string(from: Date())) ", terminator: ""); printSharing(s) }
-    client.onEvent = { e in
-        let t = fmt.string(from: Date())
-        switch e {
-        case .modem(let state, let network, let error):
-            print("\(t) modem \(state)\(network.map { ", \($0)" } ?? "")\(error.map { " (\($0))" } ?? "")")
-        case .pdn(let p): print("\(t) pdn \(describe(p))")
-        case .config: print("\(t) config changed")
-        case .unknown(let type) where type == QMIDEventType.sim: break    // onSIM
-        case .unknown(let type) where type == QMIDEventType.plmn: break   // onPLMN
-        case .unknown(let type) where type == QMIDEventType.bearers: break   // onBearers
-        case .unknown(let type) where type == QMIDEventType.gnss: break      // onGNSS
-        case .unknown(let type) where type == QMIDEventType.sharing: break   // onSharing
-        case .unknown(let type): print("\(t) event \(type)")
+// "45 s", "12 min", "3 h 20 min"
+func span(_ t: TimeInterval) -> String {
+    let s = Int(t)
+    return s < 120 ? "\(s) s" : s < 3600 ? "\(s / 60) min" : "\(s / 3600) h \(s % 3600 / 60) min"
+}
+
+func ago(_ d: Date) -> String { span(-d.timeIntervalSinceNow) + " ago" }
+
+func printGNSS(_ g: QMIDGNSS) {
+    var line = "gnss: engine \(g.engine), session \(g.running ? "running (\(g.interval ?? 0) ms)" : "idle")"
+    line += ", \(g.clients) client\(g.clients == 1 ? "" : "s")"
+    if let f = g.lastFix { line += ", last fix \(ago(f))" }
+    print(line)
+    if let a = g.assist {
+        var s = "  start position: \(a.result.rawValue) \(ago(a.time))"
+        if let srv = a.server { s += " from \(a.source.uppercased()) \(srv)" }
+        if let u = a.uncertainty { s += String(format: ", ±%.0f m", u) }
+        if let d = a.duration { s += String(format: ", server %.2f s", d) }
+        if let c = a.cell { s += ", cell \(c)" }
+        print(s)
+        if let after = a.firstFixAfter {
+            print(String(format: "    first fix %.1f s after start%@", after,
+                         a.firstFixDistance.map { String(format: ", %.0f m from the starting position", $0) } ?? ""))
         }
+        if let e = a.error { print("    \(e)") }
     }
-    client.onSIM = { s in print("\(fmt.string(from: Date())) sim \(s.map(describe) ?? "none")") }
-    client.onPLMN = { p in print("\(fmt.string(from: Date())) operator \(p.map(describe) ?? "none")") }
+}
+
+func printXTRA(_ x: QMIDXTRA) {
+    guard x.supported else { return print("xtra: not supported by this modem") }
+    if let from = x.validFrom, let hours = x.validHours, let expires = x.expires {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
+        f.timeZone = TimeZone(identifier: "UTC")
+        let left = expires.timeIntervalSinceNow
+        print("xtra: valid from \(f.string(from: from)) for \(hours) h, " + (left > 0 ? "\(span(left)) left" : "expired"))
+    } else {
+        print("xtra: no data")
+    }
+    if let a = x.age() { print("  age \(span(a))") }
+    var auto = "  updates by qmid: \(x.autoUpdate ? "on" : "off")"
+    if let d = x.lastDownload { auto += ", last \(ago(d))" }
+    if let n = x.nextCheck { auto += ", next check in \(max(0, Int(n.timeIntervalSinceNow / 60))) min" }
+    print(auto)
+    if let e = x.lastError { print("  last error: \(e)") }
+    for s in x.servers { print("  server \(s)") }
+}
+
+func printBands(_ b: QMIDBandPreference) {
+    func list(_ l: [Int], _ p: String) -> String { l.isEmpty ? "-" : l.map { "\(p)\($0)" }.joined(separator: " ") }
+    print("allowed modes: \(b.modes.isEmpty ? "-" : b.modes.joined(separator: " "))")
+    print("allowed lte:    \(list(b.lteBands, "B"))")
+    print("allowed nr nsa: \(list(b.nrNSABands, "n"))")
+    print("allowed nr sa:  \(list(b.nrSABands, "n"))")
+    if !b.supportedModes.isEmpty { print("supported modes: \(b.supportedModes.joined(separator: " "))") }
+    if !b.supportedLTEBands.isEmpty { print("supported lte:  \(list(b.supportedLTEBands, "B"))") }
+    if !b.supportedNRBands.isEmpty { print("supported nr:   \(list(b.supportedNRBands, "n"))") }
+}
+
+// PCell, SCell n (LTE carrier aggregation), PSCell (the NR leg of EN-DC; the PCell on SA),
+// SCell (NR carrier aggregation); a role or technology this version doesn't know by its name.
+func cellRole(_ c: QMIDCell) -> String {
+    switch (c.ratKind, c.roleKind) {
+    case (_, .primary?): return "pcell"
+    case (.lte?, .secondary?): return "scell\(c.scellIndex.map { " \($0)" } ?? "")"
+    case (.nr?, .secondary?): return c.pscell == true ? "pscell" : "scell"
+    case (_, .neighbor?): return "neighbour"
+    default: return c.roleName
+    }
+}
+
+// "B3", "n41"
+func bandName(_ c: QMIDCell) -> String? {
+    c.band.map { (c.ratKind == .lte ? "B" : c.ratKind == .nr ? "n" : "\(c.ratName) ") + "\($0)" }
+}
+
+func printRadio(_ r: QMIDRadio, neighbours: Bool = true) {
+    func f(_ v: Double?, _ unit: String = "") -> String? { v.map { String(format: $0 == $0.rounded() ? "%.0f" : "%.1f", $0) + unit } }
+    func line(_ c: QMIDCell) -> String {
+        let lte = c.ratKind == .lte
+        var parts: [String] = [c.ratName.padding(toLength: 4, withPad: " ", startingAt: 0)
+                               + cellRole(c).padding(toLength: 10, withPad: " ", startingAt: 0)]
+        parts.append(bandName(c) ?? "band ?")
+        if let ch = c.channel { parts.append("\(lte ? "earfcn" : "arfcn") \(ch)") }
+        if let bw = f(c.bandwidth, " MHz") { parts.append(bw) }
+        if let p = c.pci { parts.append("pci \(p)") }
+        if let id = c.cellID {
+            parts.append(lte ? String(format: "cell %llu (eNB %llu/%llu)", id, id >> 8, id & 0xff) : String(format: "cell %llu", id))
+        }
+        if let t = c.tac { parts.append("tac \(t)") }
+        if let a = c.active { parts.append(a ? "active" : "configured") }
+        for (name, v, unit) in [("rsrp", c.rsrp, " dBm"), ("rsrq", c.rsrq, " dB"), ("rssi", c.rssi, " dBm"), ("snr", c.snr, " dB")] {
+            if let s = f(v, unit) { parts.append("\(name) \(s)") }
+        }
+        return parts.joined(separator: "  ")
+    }
+    // Summary: "pcell B3 + scell B1 (configured) + pscell n41 + scell n1, 3 neighbours".
+    func name(_ c: QMIDCell) -> String {
+        "\(cellRole(c).split(separator: " ").first ?? "") \(bandName(c) ?? "?")" + (c.active.map { $0 ? "" : " (configured)" } ?? "")
+    }
+    print("cells: " + (r.serving.isEmpty ? "none" : r.serving.map(name).joined(separator: " + "))
+          + ", \(r.neighbors.count) neighbours"
+          + (r.endcAvailable == true && !r.serving.contains { $0.ratKind == .nr } ? ", en-dc available" : "")
+          + (r.lteRRC == nil && r.nrRRC == nil ? ""
+             : "; rrc " + [r.lteRRC.map { "lte \($0.rawValue)" }, r.nrRRC.map { "nr \($0.rawValue)" }].compactMap { $0 }.joined(separator: ", ")))
+    r.serving.forEach { print(line($0)) }
+    if neighbours, !r.neighbors.isEmpty {
+        print("neighbours:")
+        r.neighbors.forEach { print("  " + line($0)) }
+    }
+    if let raw = r.raw { print("raw:"); raw.forEach { print("  " + $0) } }
+}
+
+// MARK: - Streams (QMIDClient on the main queue, as any client app would; they also show
+// reconnects after qmid restarts)
+
+let hms: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss"
+    return f
+}()
+
+func now() -> String { hms.string(from: Date()) }
+
+func streamClient() -> QMIDClient {
+    let client = QMIDClient(queue: .main)
+    client.onAvailabilityChange = { print("\(now()) qmid \($0 ? "available" : "unavailable")") }
+    return client
+}
+
+func streamEvents() -> Never {
+    let client = streamClient()
+    client.onModem = { print("\(now()) modem \(describe($0))") }
+    client.onGNSS = { g in print("\(now()) ", terminator: ""); printGNSS(g) }
+    client.onSharing = { s in print("\(now()) ", terminator: ""); printSharing(s) }
+    client.onSIM = { s in print("\(now()) sim \(s.map(describe) ?? "none")") }
+    client.onPLMN = { p in print("\(now()) operator \(p.map(describe) ?? "none")") }
     client.onBearers = { pdn, bearers in
-        print("\(fmt.string(from: Date())) bearers \(pdn): \(bearers.isEmpty ? "none" : "\(bearers.count)")")
+        print("\(now()) bearers \(pdn): \(bearers.isEmpty ? "none" : "\(bearers.count)")")
         for b in bearers { describe(b).forEach { print("  " + $0) } }
+    }
+    // Types with a callback of their own (above) are printed there.
+    let handled: Set<String> = [QMIDEventType.sim, QMIDEventType.plmn, QMIDEventType.bearers,
+                                QMIDEventType.gnss, QMIDEventType.sharing]
+    client.onEvent = { e in
+        switch e {
+        case .pdn(let p):
+            let lines = describe(p)
+            print("\(now()) pdn \(lines[0])")
+            lines.dropFirst().forEach { print($0) }
+        case .config: print("\(now()) config changed")
+        case .unknown(let type) where !handled.contains(type): print("\(now()) event \(type)")
+        case .modem, .unknown: break
+        }
     }
     client.subscribe()
     withExtendedLifetime(client) { dispatchMain() }
@@ -869,26 +1168,24 @@ func streamEvents() -> Never {
 
 // qmid's log over XPC: recent history, then live. Falls back to `log stream` (macOS keeps only
 // notice/error on disk) when qmid can't be reached.
-func streamLog(_ args: [String]) -> Never {
+func streamLog(_ args: inout Args) -> Never {
     var level = QMIDLogLevel.info
     var history = true
-    var i = 0
-    while i < args.count {
-        switch args[i] {
-        case "--level" where i + 1 < args.count:
-            guard let l = QMIDLogLevel(name: args[i + 1]) else { fail("bad level \(args[i + 1]) (debug, info, notice, error)") }
+    while let a = args.next() {
+        switch a {
+        case "--level":
+            let v = args.value(a)
+            guard let l = QMIDLogLevel(name: v) else { fail("bad level \(v) (debug, info, notice, error)") }
             level = l
-            i += 1
         case "--no-history": history = false
-        default: fail("usage: qmictl log [--level debug|info|notice|error] [--no-history]")
+        default: args.reject(a)
         }
-        i += 1
     }
-    let fmt = DateFormatter()
-    fmt.dateFormat = "HH:mm:ss.SSS"
+    let ms = DateFormatter()
+    ms.dateFormat = "HH:mm:ss.SSS"
     let client = QMIDClient(queue: .main)
     client.onLog = { e in
-        print("\(fmt.string(from: e.time)) \(e.level.name.prefix(1).uppercased()) \(e.category == "qmid" ? "" : "[\(e.category)] ")\(e.message)")
+        print("\(ms.string(from: e.time)) \(e.level.name.prefix(1).uppercased()) \(e.category == "qmid" ? "" : "[\(e.category)] ")\(e.message)")
     }
     var announced = false
     client.onAvailabilityChange = { up in
@@ -907,235 +1204,30 @@ func streamLog(_ args: [String]) -> Never {
     withExtendedLifetime(client) { dispatchMain() }
 }
 
-func daemonCommand(_ args: [String]) -> Bool {
-    func reportResult(_ err: String?) {
-        if let err { fail(err) }
-        print("ok")
-    }
-    switch args.first {
-    case "status":
-        // Everything read-only: state, then the cells, then the band preference.
-        withDaemon { d, done in
-            d.status { s in
-                printStatus(s)
-                d.radio(false) { r, _ in
-                    if let r { printRadio(QMIDRadio(r)) }
-                    d.bandPreference { b, _ in
-                        if let b { printBands(QMIDBandPreference(b)) }
-                        done()
-                    }
-                }
-            }
-        }
-    case "connect" where args.count == 2:
-        withDaemon { d, done in d.connect(args[1]) { reportResult($0); done() } }
-    case "disconnect" where args.count == 2:
-        withDaemon { d, done in d.disconnect(args[1]) { reportResult($0); done() } }
-    case "policy" where args.count == 3:
-        withDaemon { d, done in d.setPolicy(args[1], policy: args[2]) { reportResult($0); done() } }
-    case "restart":
-        withDaemon { d, done in d.restart { reportResult($0); done() } }
-    case "reload":
-        withDaemon { d, done in d.reload { reportResult($0); done() } }
-    case "config" where args.count == 2 && args[1] == "get":
-        withDaemon { d, done in
-            d.getConfig { data, err in
-                if let data { FileHandle.standardOutput.write(data); print() } else { fail(err ?? "no config") }
-                done()
-            }
-        }
-    case "config" where args.count == 3 && args[1] == "set":
-        guard let data = FileManager.default.contents(atPath: args[2]) else { fail("can't read \(args[2])") }
-        withDaemon { d, done in d.setConfig(data) { reportResult($0); done() } }
-    case "events":
-        streamEvents()
-    case "log":
-        streamLog(Array(args.dropFirst()))
-    case "sync":
-        withDaemon { d, done in
-            d.profiles { list in
-                for case let e as NSDictionary in list {
-                    if let s = e["sim"] {
-                        print("sim: \(s)\(e["carrier"].map { ", carrier \($0)" } ?? "")\(e["attachAPN"].map { ", default bearer apn \($0)" } ?? "")\(e["pending"].map { ", prepared for SIM \($0)" } ?? "")")
-                    } else if let l = e["learned"] as? [String] {
-                        print("default bearer apns seen (home mccmnc: apn):"); l.forEach { print("  \($0)") }
-                    } else if let pdn = e["pdn"] {
-                        print("\(pdn): profile \(e["profile"] ?? "-")\((e["attach"] as? Bool) == true ? " (attach)" : ""): \(e["action"] ?? "")")
-                        if let st = e["settings"] { print("  \(st)") }
-                    } else if let m = e["modem"] as? [String] {
-                        print("modem profiles:"); m.forEach { print("  \($0)") }
-                    } else if let a = e["autoconnect"] { print("modem autoconnect: \(a)") }
-                    else if let a = e["attach"] { print("lte attach profile: \(a)") }
-                    else if let err = e["error"] { print("sync error: \(err)") }
-                }
-                done()
-            }
-        }
-    case "prepare-sim" where args.count >= 2:
-        prepareSIM(Array(args.dropFirst()))
-    case "radio" where args.count >= 2 && args[1] == "watch":
-        radioWatch(verbose: args.contains("-v"))
-    case "radio" where args.count <= 2:
-        withDaemon { d, done in
-            d.radio(args.last == "-v") { dict, err in
-                guard let dict else { fail(err ?? "radio failed") }
-                printRadio(QMIDRadio(dict))
-                done()
-            }
-        }
-    case "airplane" where args.count == 2 && ["on", "off"].contains(args[1]):
-        withDaemon { d, done in d.setAirplaneMode(args[1] == "on") { reportResult($0); done() } }
-    case "restart-modem":
-        withDaemon { d, done in d.restartModem { reportResult($0); done() } }
-    case "bands" where args.count >= 2 && args[1] == "set":
-        var lte: [Int]?, nsa: [Int]?, sa: [Int]?
-        var i = 2
-        while i < args.count {
-            if args[i] == "--persistent" { i += 1; continue }
-            guard i + 1 < args.count else { fail("bands set: \(args[i]) needs a list, e.g. 1,3") }
-            let list = args[i + 1].split(separator: ",").compactMap { Int($0) }
-            switch args[i] {
-            case "lte": lte = list
-            case "nsa": nsa = list
-            case "sa": sa = list
-            default: fail("bands set: unknown \(args[i]) (lte, nsa, sa)")
-            }
-            i += 2
-        }
-        let persistent = args.contains("--persistent")
-        withDaemon { d, done in
-            var b: [String: Any] = [:]
-            b[QMIDKey.lteBands] = lte
-            b[QMIDKey.nrNSABands] = nsa
-            b[QMIDKey.nrSABands] = sa
-            d.setBandPreference(b as NSDictionary, persistent: persistent) { reportResult($0); done() }
-        }
-    case "bands" where args.count >= 2 && args[1] == "reset":
-        withDaemon { d, done in d.resetBandPreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
-    case "bands":
-        withDaemon { d, done in
-            d.bandPreference { dict, err in
-                guard let dict else { fail(err ?? "bandPreference failed") }
-                printBands(QMIDBandPreference(dict))
-                done()
-            }
-        }
-    case "modes" where args.count >= 3 && args[1] == "set":
-        let modes = args[2].split(separator: ",").map(String.init)
-        withDaemon { d, done in d.setModePreference(modes, persistent: args.contains("--persistent")) { reportResult($0); done() } }
-    case "modes" where args.count >= 2 && args[1] == "reset":
-        withDaemon { d, done in d.resetModePreference(persistent: args.contains("--persistent")) { reportResult($0); done() } }
-    case "sharing" where args.count == 1:
-        withDaemon { d, done in
-            d.status { dict in
-                if let s = QMIDStatus(dict).sharing { printSharing(s) } else {
-                    print("sharing: not configured (qmid.json \"sharing\": { \"pdn\": \"internet\" })")
-                }
-                done()
-            }
-        }
-    case "gnss" where args.count >= 2 && args[1] == "watch":
-        gnssWatch(Array(args.dropFirst(2)))
-    case "gnss" where args.count == 1:
-        withDaemon { d, done in
-            d.gnss { dict in
-                printGNSS(QMIDGNSS(dict))
-                d.xtra { x, _ in
-                    if let x { printXTRA(QMIDXTRA(x)) }
-                    done()
-                }
-            }
-        }
-    case "xtra" where args.count == 3 && args[1] == "load":
-        guard let data = FileManager.default.contents(atPath: args[2]) else { fail("cannot read \(args[2])") }
-        withDaemon { d, done in
-            d.loadXTRA(data) { dict, err in
-                guard let dict else { fail(err ?? "loadXTRA failed") }
-                print("loaded \(data.count) bytes")
-                printXTRA(QMIDXTRA(dict))
-                done()
-            }
-        }
-    case "xtra" where args.count == 1:
-        withDaemon { d, done in
-            d.xtra { dict, err in
-                guard let dict else { fail(err ?? "xtra failed") }
-                printXTRA(QMIDXTRA(dict))
-                done()
-            }
-        }
-    case "cancel-sim" where args.count == 2:
-        withDaemon { d, done in d.cancelSIM(args[1]) { reportResult($0); done() } }
-    default:
-        return false
-    }
-    return true
-}
-
-func printSharing(_ s: QMIDSharing) {
-    let to = s.sharedTo.isEmpty ? "" : " to \(s.sharedTo.joined(separator: ", "))"
-    switch s.state {
-    case .on:
-        print("sharing: on, \(s.pdn) (\(s.interface ?? "?"))\(to) via \(s.bridge ?? "?"), \(s.clients) client\(s.clients == 1 ? "" : "s")")
-    case .waiting: print("sharing: waiting for \(s.pdn)\(to)")
-    case .off: print("sharing: off (Internet Sharing is turned off)")
-    case .notSelected: print("sharing: Internet Sharing doesn't use \"Cellular (\(s.pdn))\" as its source")
-    }
-}
-
-func printGNSS(_ g: QMIDGNSS) {
-    var line = "gnss: engine \(g.engine), session \(g.running ? "running (\(g.interval ?? 0) ms)" : "idle")"
-    line += ", \(g.clients) client\(g.clients == 1 ? "" : "s")"
-    if let f = g.lastFix { line += ", last fix \(Int(-f.timeIntervalSinceNow)) s ago" }
-    print(line)
-    if let a = g.assist {
-        var s = "  start position: \(a.result.rawValue) \(ago(a.time))"
-        if let srv = a.server { s += " from \(a.source.uppercased()) \(srv)" }
-        if let u = a.uncertainty { s += String(format: ", ±%.0f m", u) }
-        if let d = a.duration { s += String(format: ", server %.2f s", d) }
-        if let c = a.cell { s += ", cell \(c)" }
-        print(s)
-        if let after = a.firstFixAfter {
-            print(String(format: "    first fix %.1f s after start%@", after,
-                         a.firstFixDistance.map { String(format: ", %.0f m from the starting position", $0) } ?? ""))
-        }
-        if let e = a.error { print("    \(e)") }
-    }
-}
-
-private func ago(_ d: Date) -> String {
-    let s = Int(-d.timeIntervalSinceNow)
-    return s < 120 ? "\(s) s ago" : s < 7200 ? "\(s / 60) min ago" : "\(s / 3600) h ago"
-}
-
 // Starts location through qmid and prints what comes; Ctrl-C (or --for) ends it, and qmid
 // stops the session when this connection closes.
-func gnssWatch(_ args: [String]) -> Never {
+func gnssWatch(_ args: inout Args) -> Never {
     var sats = false, nmea = false, verbose = false
     var interval: TimeInterval = 1, duration: TimeInterval?
-    var a = args[...]
-    while let x = a.popFirst() {
-        switch x {
+    while let a = args.next() {
+        switch a {
         case "--sats": sats = true
         case "--nmea": nmea = true
         case "-v": verbose = true; sats = true
-        case "--interval": interval = a.popFirst().flatMap(Double.init) ?? 1
-        case "--for": duration = a.popFirst().flatMap(Double.init)
-        default: fail("usage: qmictl gnss watch [--sats] [--nmea] [-v] [--interval S] [--for S]")
+        case "--interval": interval = args.number(a)
+        case "--for": duration = args.number(a)
+        default: args.reject(a)
         }
     }
-    let fmt = DateFormatter()
-    fmt.dateFormat = "HH:mm:ss"
     let utc = DateFormatter()
     utc.dateFormat = "HH:mm:ss.SSS"
     utc.timeZone = TimeZone(identifier: "UTC")
     let started = Date()
     var first = true
-    let client = QMIDClient(queue: .main)
-    client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
+    let client = streamClient()
     client.onGNSS = { printGNSS($0) }
     client.onLocation = { l in
-        var s = "\(fmt.string(from: Date())) \(l.fixName)"
+        var s = "\(now()) \(l.fixName)"
         if let la = l.latitude, let lo = l.longitude { s += String(format: " %.6f, %.6f", la, lo) }
         if let h = l.horizontalAccuracy { s += String(format: " ±%.0f m", h) }
         if let alt = l.altitudeMSL ?? l.altitude { s += String(format: ", alt %.0f m", alt) }
@@ -1152,7 +1244,7 @@ func gnssWatch(_ args: [String]) -> Never {
     }
     client.onSatellites = { s in
         let parts = s.summary.map { "\($0.system) \($0.tracking)" + ($0.used > 0 ? "/\($0.used) used" : "") }
-        print("\(fmt.string(from: s.time)) satellites: tracking " + (parts.isEmpty ? "none" : parts.joined(separator: ", "))
+        print("\(hms.string(from: s.time)) satellites: tracking " + (parts.isEmpty ? "none" : parts.joined(separator: ", "))
               + ", searching \(s.satellites.count - s.tracking.count)")
         guard verbose else { return }
         for x in s.tracking.sorted(by: { ($0.system, $0.id) < ($1.system, $1.id) }) {
@@ -1175,12 +1267,9 @@ func gnssWatch(_ args: [String]) -> Never {
 
 // Radio events: one block per change (serving cells, activation, EN-DC, RRC); -v: neighbours too.
 func radioWatch(verbose: Bool) -> Never {
-    let fmt = DateFormatter()
-    fmt.dateFormat = "HH:mm:ss"
-    let client = QMIDClient(queue: .main)
-    client.onAvailabilityChange = { print("\(fmt.string(from: Date())) qmid \($0 ? "available" : "unavailable")") }
+    let client = streamClient()
     client.onRadio = { r in
-        print("--- \(fmt.string(from: Date()))")
+        print("--- \(now())")
         guard let r else { return print("radio: modem not ready") }
         printRadio(r, neighbours: verbose)
     }
@@ -1188,132 +1277,26 @@ func radioWatch(verbose: Bool) -> Never {
     withExtendedLifetime(client) { dispatchMain() }
 }
 
-func printXTRA(_ x: QMIDXTRA) {
-    guard x.supported else { return print("xtra: not supported by this modem") }
-    if let from = x.validFrom, let hours = x.validHours, let expires = x.expires {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
-        f.timeZone = TimeZone(identifier: "UTC")
-        let left = expires.timeIntervalSinceNow
-        print("xtra: valid from \(f.string(from: from)) for \(hours) h, " +
-              (left > 0 ? "\(Int(left / 3600)) h \(Int(left.truncatingRemainder(dividingBy: 3600) / 60)) min left" : "expired"))
-    } else {
-        print("xtra: no data")
-    }
-    func ago(_ d: Date) -> String {
-        let s = Int(-d.timeIntervalSinceNow)
-        return s < 3600 ? "\(s / 60) min ago" : "\(s / 3600) h \(s % 3600 / 60) min ago"
-    }
-    if let a = x.age() { print("  age \(Int(a / 3600)) h \(Int(a.truncatingRemainder(dividingBy: 3600) / 60)) min") }
-    var auto = "  updates by qmid: \(x.autoUpdate ? "on" : "off")"
-    if let d = x.lastDownload { auto += ", last \(ago(d))" }
-    if let n = x.nextCheck { auto += ", next check in \(max(0, Int(n.timeIntervalSinceNow / 60))) min" }
-    print(auto)
-    if let e = x.lastError { print("  last error: \(e)") }
-    for s in x.servers { print("  server \(s)") }
-}
+// MARK: - main
 
-func printBands(_ b: QMIDBandPreference) {
-    func list(_ l: [Int], _ p: String) -> String { l.isEmpty ? "-" : l.map { "\(p)\($0)" }.joined(separator: " ") }
-    print("allowed modes: \(b.modes.isEmpty ? "-" : b.modes.joined(separator: " "))")
-    print("allowed lte:    \(list(b.lteBands, "B"))")
-    print("allowed nr nsa: \(list(b.nrNSABands, "n"))")
-    print("allowed nr sa:  \(list(b.nrSABands, "n"))")
-    if !b.supportedModes.isEmpty { print("supported modes: \(b.supportedModes.joined(separator: " "))") }
-    if !b.supportedLTEBands.isEmpty { print("supported lte:  \(list(b.supportedLTEBands, "B"))") }
-    if !b.supportedNRBands.isEmpty { print("supported nr:   \(list(b.supportedNRBands, "n"))") }
-}
+let argv = Array(CommandLine.arguments.dropFirst())
+guard let command = argv.first else { print(usage); exit(2) }
+if command == "-h" || command == "--help" { print(usage); exit(0) }
+if daemonCommand(argv) { exit(0) }
 
-// PCell, SCell n (LTE carrier aggregation), PSCell (the NR leg of EN-DC; the PCell on SA),
-// SCell (NR carrier aggregation).
-func cellRole(_ c: QMIDCell) -> String {
-    switch (c.rat, c.role) {
-    case (_, .primary): return "pcell"
-    case (.lte, .secondary): return "scell\(c.scellIndex.map { " \($0)" } ?? "")"
-    case (.nr, .secondary): return c.pscell == true ? "pscell" : "scell"
-    case (_, .neighbor): return "neighbour"
-    }
-}
-
-func printRadio(_ r: QMIDRadio, neighbours: Bool = true) {
-    func f(_ v: Double?, _ unit: String = "") -> String? { v.map { String(format: $0 == $0.rounded() ? "%.0f" : "%.1f", $0) + unit } }
-    func line(_ c: QMIDCell) -> String {
-        var parts: [String] = [c.rat.rawValue.padding(toLength: 4, withPad: " ", startingAt: 0)
-                               + cellRole(c).padding(toLength: 10, withPad: " ", startingAt: 0)]
-        parts.append(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "band ?")
-        if let ch = c.channel { parts.append("\(c.rat == .lte ? "earfcn" : "arfcn") \(ch)") }
-        if let bw = f(c.bandwidth, " MHz") { parts.append(bw) }
-        if let p = c.pci { parts.append("pci \(p)") }
-        if let id = c.cellID {
-            parts.append(c.rat == .lte ? String(format: "cell %llu (eNB %llu/%llu)", id, id >> 8, id & 0xff)
-                                       : String(format: "cell %llu", id))
-        }
-        if let t = c.tac { parts.append("tac \(t)") }
-        if let a = c.active { parts.append(a ? "active" : "configured") }
-        for (name, v, unit) in [("rsrp", c.rsrp, " dBm"), ("rsrq", c.rsrq, " dB"), ("rssi", c.rssi, " dBm"), ("snr", c.snr, " dB")] {
-            if let s = f(v, unit) { parts.append("\(name) \(s)") }
-        }
-        return parts.joined(separator: "  ")
-    }
-    // Summary: "pcell B3 + scell B1 (configured) + pscell n41 + scell n1, 3 neighbours".
-    func name(_ c: QMIDCell) -> String {
-        "\(cellRole(c).split(separator: " ").first ?? "") \(c.band.map { (c.rat == .lte ? "B" : "n") + "\($0)" } ?? "?")"
-            + (c.active.map { $0 ? "" : " (configured)" } ?? "")
-    }
-    print("cells: " + (r.serving.isEmpty ? "none" : r.serving.map(name).joined(separator: " + "))
-          + ", \(r.neighbors.count) neighbours"
-          + (r.endcAvailable == true && !r.serving.contains { $0.rat == .nr } ? ", en-dc available" : "")
-          + (r.lteRRC == nil && r.nrRRC == nil ? ""
-             : "; rrc " + [r.lteRRC.map { "lte \($0.rawValue)" }, r.nrRRC.map { "nr \($0.rawValue)" }].compactMap { $0 }.joined(separator: ", ")))
-    r.serving.forEach { print(line($0)) }
-    if neighbours, !r.neighbors.isEmpty {
-        print("neighbours:")
-        r.neighbors.forEach { print("  " + line($0)) }
-    }
-    if let raw = r.raw { print("raw:"); raw.forEach { print("  " + $0) } }
-}
-
-// The prepare lasts while this connection does, so qmictl stays until Ctrl-C or --hold runs out.
-func prepareSIM(_ args: [String]) -> Never {
-    var rest = args
-    var hold: Double?
-    if let i = rest.firstIndex(of: "--hold"), i + 1 < rest.count {
-        hold = Double(rest[i + 1])
-        rest.removeSubrange(i...(i + 1))
-    }
-    guard let iccid = rest.first, rest.count <= 2 else { fail("prepare-sim ICCID [MCCMNC] [--hold SECONDS]") }
-    let c = NSXPCConnection(machServiceName: qmidMachService, options: .privileged)
-    c.remoteObjectInterface = NSXPCInterface(with: QMIDControl.self)
-    c.resume()
-    let proxy = c.remoteObjectProxyWithErrorHandler { fail(QMIDError(xpc: $0).message) } as! QMIDControl
-    proxy.prepareSIM(iccid, mccmnc: rest.count == 2 ? rest[1] : nil) { d, err in
-        guard let d else { fail(err ?? "prepareSIM failed") }
-        let p = QMIDPreparedSIM(d)
-        print("prepared: attach apn \"\(p.apn)\"\(p.carrier.map { ", carrier \($0)" } ?? "")\(p.matchedBy.map { " by \($0)" } ?? "")")
-        print(hold.map { "holding \(Int($0)) s" } ?? "switch SIMs now; Ctrl-C ends the prepare")
-        if let hold { DispatchQueue.main.asyncAfter(deadline: .now() + hold) { c.invalidate(); exit(0) } }
-    }
-    withExtendedLifetime(c) { dispatchMain() }
-}
-
-if daemonCommand(Array(CommandLine.arguments.dropFirst())) { exit(0) }
-if CommandLine.arguments.dropFirst().first == "loc-survey" { locSurvey(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
-if CommandLine.arguments.dropFirst().first == "loc-fix" { locFix(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
-if CommandLine.arguments.dropFirst().first == "loc-inject" { locInject(Array(CommandLine.arguments.dropFirst(2))); exit(0) }
-if CommandLine.arguments.dropFirst().first == "profile-write" {
-    profileWrite(Array(CommandLine.arguments.dropFirst(2)).filter { $0 != "-v" })
-    exit(0)
-}
-
-let options = parseOptions()
-switch options.command {
-case "probe": probe(options)
-case "modem-status": status(options)
-case "profiles": profiles(options)
-case "plmn-name": plmnName(options)
-case "nas-survey": nasSurvey(options)
-case "ambr-survey": ambrSurvey(options, profile: 1, find: [500_000_000, 500_000, 256_000_000, 256_000, 244_000_000, 244_000, 508_640, 508_640_000])
-case "reattach": reattach(options)
-case "run": connect(options)
+var rest = Args(Array(argv.dropFirst()))
+switch command {
+case "probe": probe(.parse(&rest))
+case "modem-status": modemStatus(.parse(&rest))
+case "profiles": profiles(.parse(&rest))
+case "plmn-name": plmnName(.parse(&rest))
+case "nas-survey": nasSurvey(.parse(&rest))
+case "ambr-survey": ambrSurvey(.parse(&rest))
+case "reattach": reattach(.parse(&rest))
+case "profile-write": profileWrite(&rest)
+case "loc-survey": locSurvey(&rest)
+case "loc-inject": locInject(&rest)
+case "loc-fix": locFix(&rest)
+case "run": run(.parse(&rest))
 default: print(usage); exit(2)
 }

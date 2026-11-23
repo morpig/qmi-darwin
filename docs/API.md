@@ -68,6 +68,9 @@ qmid.onEvent = { event in
         break                            // newer qmid; ignore
     }
 }
+qmid.onModem = { modem in                // QMIDModem: state, network, error, airplaneMode
+    // the same "modem" events as .modem above, with airplaneMode
+}
 qmid.onSIM = { sim in                    // QMIDSIM?, see "SIM and default bearer"
     // nil: no SIM known (modem away or not read yet)
 }
@@ -89,6 +92,10 @@ qmid.subscribe()                         // current state arrives immediately as
   arrives each time.
 - Treat events as **full state, not deltas**: each `.pdn` event carries the whole PDN.
 - `status()` returns the same data on demand (plus datapath counters and the modem's `imei`) if you need a pull.
+- Which callbacks get which events: `.modem` also goes to `onModem`; `sim`, `plmn`, `bearers`,
+  `gnss`, `sharing` and `radio` go to their callback and to `onEvent` as `.unknown(type:)`;
+  `log`, `location`, `satellites` and `nmea` go only to `onLog`, `onLocation`,
+  `onSatellites` and `onNMEA`.
 - Every call has a completion-handler form and an `async throws` form:
 
 ```swift
@@ -101,6 +108,18 @@ try await qmid.setPolicy(pdn: "internet", policy: .preferCellular)   // QMIDPoli
 Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 `"modem not ready (absent); will connect when it is"`). Show it as is.
 
+A command-line tool can block on a call with `sync`, on a client whose queue isn't the
+calling thread's. It waits at most `timeout` seconds; then it fails with `timedOut` set and a
+late reply is dropped:
+
+```swift
+let qmid = QMIDClient(queue: DispatchQueue(label: "qmid"))
+switch qmid.sync(timeout: 5, { qmid.status($0) }) {
+case .success(let s): print(s.modem)
+case .failure(let e): print(e.timedOut ? "qmid not answering" : e.message)
+}
+```
+
 ### Calls
 
 | Call | Effect | Persists? |
@@ -110,6 +129,7 @@ Errors are `QMIDError` with a human-readable `message` (e.g. `"no PDN foo"`,
 | `disconnect(pdn:)` | hangs up and stops redialing | until qmid restarts or the PDN's config changes |
 | `setPolicy(pdn:policy:)` | changes routing priority, no reconnect | until qmid restarts or the PDN's config changes |
 | `reload` | re-reads qmid.json; redials only PDNs whose settings changed (see below) | – |
+| `profiles` | what the last sync did with the modem's data profiles (`QMIDProfileReport`, below); empty while the modem isn't open | – |
 | `getConfig` | qmid.json as JSON `Data` | – |
 | `setConfig(_:)` | validates, writes qmid.json, reloads | yes |
 | `prepareSIM(iccid:mccmnc:)` | before a SIM switch: attach profile for that card, no re-attach (see "Switching SIMs") | until the card is in, `cancelSIM`, the connection closes, or 10 s |
@@ -144,6 +164,13 @@ do {
 }
 ```
 
+`QMIDProfileReport` is diagnostics, mostly text (what `qmictl sync` prints): `sim` (the SIM as
+identified, or `simNotRead`), `carrier`, `attachAPN`, `pending` (a prepared card), `pdns`
+(per PDN: `pdn`, `action` such as `"in sync"` or `"created"`, `failed`, `profile`, `attach`:
+it is the LTE attach profile, `settings`), `error`, `learned` (default bearer APNs seen per
+home MCC/MNC), `modemProfiles`, `autoconnect` and `attachProfile` (the LTE attach profile
+index).
+
 Dials of different PDNs run in parallel: a `connect` never waits for another PDN's dial.
 `connect` on a connected PDN completes at once (and restarts its `maxUptime`, see "One-shot
 PDNs").
@@ -163,13 +190,14 @@ APN re-attaches, which drops every PDN briefly.
 | `name` | config name, e.g. `internet`, `ims` |
 | `state` | `idle`, `waiting` (for the modem/network), `dialing`, `connected`, `backoff` (retry scheduled), `blocked` (network rejected with a permanent cause); `stateName` has the raw string if unknown |
 | `policy` | `prefer-wifi`, `prefer-cellular`, `last-resort`, `never` (`QMIDPolicy` raw values; `policyKind` has it typed) |
-| `role` | `internet`, `ims`, `other` |
+| `role` | `internet`, `ims`, `other` (`roleKind` has it typed, `QMIDRole`) |
 | `interface` | `utunN` while connected |
 | `ipv4`, `ipv6` | addresses; `ipv6` is `addr/prefix`, `ipv6Address` strips the prefix |
 | `dns`, `pcscf` | server lists (P-CSCF for IMS) |
 | `mtu`, `profile` (modem cid), `apn`, `mux`, `serviceID` | details |
 | `wanted` | `false` after `disconnect`, and for a one-shot PDN whenever it is down |
 | `uptime` | seconds connected (only in `status`, not in events) |
+| `counters` | datapath counters of its mux (`QMIDCounters`: `rxPackets`, `rxBytes`, `rxDrops`, `txPackets`, `txBytes`, `txDrops`, `flowDisables`, …; only in `status`). `QMIDStatus.datapath` has the datapath-wide ones. Diagnostics: names can change between versions |
 | `error` | last failure as the cause code with its official name: `3GPP #33: Requested service option not subscribed` (TS 24.301), `internal #210: PDN IPv6 call disallowed` / `CM #2001: no service` (the modem's own names), or `call end reason N: …` without a verbose cause; a code without a known name is shown as the number only. Per family (`ipv4: …; ipv6: …`) unless every family failed alike |
 | `reason` | `error` as a word (`QMIDReason`): `notAttached`, `noProfile`, `rejected` (the network or modem ended the call, see `causes`), `failed` (no cause, e.g. a timeout), `dropped` (went down after connecting), `maxUptime`, `modemLost`, `airplaneMode` (waiting while the radio is off); `nil` without an error or for a reason this client doesn't know |
 | `causes` | `error`'s call end causes, one per family (`QMIDCause`: `family` 4/6, `type` `"3GPP"` / `"internal"` / `"CM"` / … / `"call end reason"`, `code`, `name`); `is3GPP` for TS 24.301 ESM causes. `[]` when there are none |
@@ -366,8 +394,8 @@ can stay listed while `nrRRC` isn't `connected`: it is the last one used.
 
 | Field | Meaning |
 |---|---|
-| `rat` | `.lte` or `.nr` |
-| `role` | `.primary`, `.secondary`, `.neighbor` |
+| `ratKind` | `.lte` or `.nr`; `nil` for a technology this version doesn't know (`ratName` has the raw string; the deprecated `rat` reads it as `.lte`) |
+| `roleKind` | `.primary`, `.secondary`, `.neighbor`; `nil` for a role this version doesn't know (`roleName`; such a cell is in neither `serving` nor `neighbors`) |
 | `channel` | downlink EARFCN / NR-ARFCN |
 | `band` | 3GPP band number from the channel. Exact for LTE. NR bands share one raster, so overlapping bands (n77/n78, n7/n41) can't be told apart; the more common one is given |
 | `pci` | physical cell ID |
@@ -427,14 +455,14 @@ user chooses it and turns Internet Sharing on there; qmid doesn't turn it on by 
 
 ```swift
 let s = try await qmid.status()
-if let sh = s.sharing, sh.state == .on { print("\(sh.clients) devices on \(sh.bridge ?? "?")") }
+if let sh = s.sharing, sh.stateKind == .on { print("\(sh.clients) devices on \(sh.bridge ?? "?")") }
 qmid.onSharing = { sh in … }             // after subscribe(); state changes
 ```
 
 | Field | Meaning |
 |---|---|
 | `pdn` | the PDN shared (config `sharing.pdn`) |
-| `state` | `not-selected`: Internet Sharing's source is another service. `off`: Internet Sharing is turned off. `waiting`: on (or to be turned back on, below) once the PDN is up. `on`: sharing runs over the PDN |
+| `stateKind` (`stateName` raw; `nil` for a newer state) | `not-selected`: Internet Sharing's source is another service. `off`: Internet Sharing is turned off. `waiting`: on (or to be turned back on, below) once the PDN is up. `on`: sharing runs over the PDN |
 | `interface` | the PDN's utun, while `on` |
 | `bridge` | the shared network's interface (`bridge100`), while `on` |
 | `sharedTo` | the interfaces Internet Sharing shares to (`en0` for Wi-Fi) |
@@ -558,7 +586,7 @@ qmid.stopLocation()
 `QMIDSatellites.satellites` lists each **signal** the engine searches or tracks: a
 dual-frequency modem lists a satellite once per signal (`signal` `"L1"`, `"L5"`, `"B1I"`,
 `"B2a"`, …). Each has `system` (`"gps"`, `"beidou"`, `"galileo"`, `"glonass"`, `"qzss"`, …),
-`id`, `tracking`, `elevation`, `azimuth`, `cn0` (dB-Hz) and `used` (in the last fix);
+`id`, `tracking` (`stateName` has the raw state), `elevation`, `azimuth`, `cn0` (dB-Hz) and `used` (in the last fix);
 `summary` counts per system.
 
 - **Privacy:** `location`, `satellites` and `nmea` events go only to the connection that called
@@ -791,7 +819,13 @@ session starts. See "Location".
 ```
 
 Top level, optional; these are the defaults. `enabled: false` stops qmid asking. `server`:
-any SUPL 2.0 server that answers LTE cells with LPP (TLS). See "Location".
+any SUPL 2.0 server that answers LTE cells with LPP (TLS), as `host:port`; an IPv6 address
+in brackets, `[2001:db8::1]:7275`. See "Location".
+
+qmid asks when a location session starts (or once the modem registers, if it hasn't yet).
+While the session has no fix, it looks at the serving cell every 10 minutes and asks again
+when the cell is in another PLMN or tracking area than the last injected position's, or when
+no position was injected yet (the Mac may have moved while asleep). A fix ends this.
 
 ### Per-SIM default bearer (`carriers`)
 
@@ -861,7 +895,8 @@ qmid validates before writing and rejects bad configs with a message, e.g.
 `config: x needs profile or apn`, `config: only one PDN can be the attach PDN`,
 `config: internet bad policy fast`, `config: two PDNs pin the same profile`,
 `config: carrier Example: mccmnc 0010 is not 5 or 6 digits`,
-`config: vendorID 2c7 is not 4 hex digits`. At most 8 PDNs.
+`config: vendorID 2c7 is not 4 hex digits`, `config: corp bad role intenet`,
+`config: corp bad family ipv5`, `config: pdns[0].name is missing`. At most 8 PDNs.
 
 Changing the attach APN makes the modem re-attach to LTE: all PDNs drop for a few seconds.
 qmid skips the re-attach when the default bearer already uses the new APN, and re-attaches at
@@ -881,7 +916,8 @@ quick check with `scutil`):
   `Policy`, `Profile`, `APN`, `MTU`, `IPv4Address`, `IPv6Address`, `PCSCFv4`, `PCSCFv6`,
   `RAT` while connected, `LastError`, `QCI`, `AMBR`)
 
-The key names are in `QMIDStoreKey`. XPC events are the preferred source; this is a fallback.
+The key names are in `QMIDStoreKey`, the field names in `QMIDStoreField`; `QMIDStoreModem(_:)` and
+`QMIDStorePDN(_:)` decode the values. XPC events are the preferred source; this is a fallback.
 
 ## Logs
 
@@ -948,6 +984,23 @@ without `pscell`.
 
 Added in qmid 0.26 (API still 1): `onRadio` (event type `radio`), `QMIDRadio.lteRRC` /
 `nrRRC` (`QMIDRRCState`). An older qmid sends no radio events: poll `radio()`.
+
+Added in qmid 0.27 (API still 1): `onModem` (`QMIDModem`, with `airplaneMode`), `profiles`
+(`QMIDProfileReport`; the entries gained `failed`), `QMIDStatus.datapath` and
+`QMIDPDN.counters` (`QMIDCounters`), memberwise `QMIDStatus` and `dictionary`,
+`QMIDPDN.roleKind` (`QMIDRole`), `QMIDClient.sync`, `QMIDError.timedOut`, `QMIDVersion`,
+`QMIDStoreField` / `QMIDStoreModem` / `QMIDStorePDN`, `QMIDEventDictionary`. Cells, sharing
+states and satellite states this version doesn't know are kept (`ratKind` / `roleKind` /
+`stateKind` nil, raw `ratName` / `roleName` / `stateName`) instead of dropping the object;
+`QMIDCell.rat` / `role` and `QMIDSharing.state` are deprecated for that reason: for an
+unknown value they return a fallback (`.lte`, `.neighbor`, `.waiting`), so switch to the
+`*Kind` accessors. The datapath counters are all numbers now: `flow_disabled` and
+`utun_batch_dl` / `utun_batch_ul` arrive as 0/1 rather than booleans (`as? Bool` still works).
+The client also starts nothing again after `invalidate()` (location included).
+
+Config in qmid 0.27: `role` and `family` must be one of the listed values (an unknown one used
+to fall back to `other` / `ipv4v6`; it now fails the load naming the PDN), and a SUPL server
+with an IPv6 address needs brackets (`[2001:db8::1]:7275`).
 
 ## Testing from the command line
 

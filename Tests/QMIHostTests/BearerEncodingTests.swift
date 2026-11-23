@@ -3,7 +3,7 @@ import QMIDAPI
 import QMIKit
 import XCTest
 
-// qmid's bearer dictionaries (Manager.bearerInfo) decoded by the client library (QMIDBearer).
+// qmid's bearer dictionaries (QMIDBearer(QoS.Bearer)) decoded by the client library (QMIDBearer).
 final class BearerEncodingTests: XCTestCase {
     private func filter(_ id: UInt8, _ precedence: UInt16, v: UInt8, src: String? = nil, dst: String? = nil,
                         len: Int, proto: UInt8? = nil, sport: ClosedRange<UInt16>? = nil,
@@ -32,7 +32,7 @@ final class BearerEncodingTests: XCTestCase {
         b.networkInitiated = true
         b.bearerID = 0x37
 
-        let d = Manager.bearerInfo(b).dictionary
+        let d = QMIDBearer(b).dictionary
         XCTAssertNil(d["bearerID"])                         // not exposed
         let c = try XCTUnwrap(QMIDBearer(d))
         XCTAssertEqual(c.id, 0xc3d)
@@ -58,7 +58,7 @@ final class BearerEncodingTests: XCTestCase {
     func testSparseBearer() throws {
         var b = QoS.Bearer(qosID: 7)
         b.uplink = QoS.Flow(qci: 8)
-        let c = try XCTUnwrap(QMIDBearer(Manager.bearerInfo(b).dictionary))
+        let c = try XCTUnwrap(QMIDBearer(QMIDBearer(b).dictionary))
         XCTAssertEqual(c.qci, 8)
         XCTAssertNil(c.networkInitiated)
         XCTAssertFalse(c.isGBR)
@@ -79,9 +79,9 @@ final class BearerEncodingTests: XCTestCase {
     }
 
     func testMCCMNCString() {
-        XCTAssertEqual(Manager.mccmncString((mcc: 999, mnc: 99)), "99999")
-        XCTAssertEqual(Manager.mccmncString((mcc: 1, mnc: 1)), "00101")
-        XCTAssertEqual(Manager.mccmncString((mcc: 1, mnc: 101)), "001101")
+        XCTAssertEqual(PLMNID(mcc: 999, mnc: 99).mccmnc, "99999")
+        XCTAssertEqual(PLMNID(mcc: 1, mnc: 1).mccmnc, "00101")
+        XCTAssertEqual(PLMNID(mcc: 1, mnc: 101).mccmnc, "001101")
     }
 
     func testAMBRDescription() {

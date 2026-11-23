@@ -121,9 +121,12 @@ final class ProfileTests: XCTestCase {
         XCTAssertEqual(WDS.Authentication(name: "PAP"), .pap)
         XCTAssertEqual(WDS.Authentication(name: "pap-chap"), .papOrChap)
         XCTAssertNil(WDS.Authentication(name: "md5"))
-        XCTAssertEqual(WDS.PDPType(families: [4]), .ipv4)
-        XCTAssertEqual(WDS.PDPType(families: [6]), .ipv6)
-        XCTAssertEqual(WDS.PDPType(families: [4, 6]), .ipv4v6)
+        XCTAssertEqual(WDS.PDPType(name: "ipv4"), .ipv4)
+        XCTAssertEqual(WDS.PDPType(name: "IPv6"), .ipv6)
+        XCTAssertEqual(WDS.PDPType(name: "ipv4v6"), .ipv4v6)
+        XCTAssertEqual(WDS.PDPType(name: "non-ip"), .nonIP)
+        XCTAssertNil(WDS.PDPType(name: "ip"))
+        for t in [WDS.PDPType.ipv4, .ppp, .ipv6, .ipv4v6, .nonIP] { XCTAssertEqual(WDS.PDPType(name: t.description), t) }
     }
 }
 

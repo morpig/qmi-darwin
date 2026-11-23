@@ -22,7 +22,7 @@ public final class ServicePublisher {
 
     public init(name: String = "qmi-darwin") throws {
         guard let s = SCDynamicStoreCreate(nil, name as CFString, nil, nil) else {
-            throw QMIHostError.transport("SCDynamicStoreCreate: \(String(cString: SCErrorString(SCError())))")
+            throw QMIHostError.systemConfiguration("SCDynamicStoreCreate")
         }
         store = s
     }
@@ -109,7 +109,7 @@ public final class ServicePublisher {
                         && SCDynamicStoreAddTemporaryValue(store, key as CFString, value))
             }
             guard ok else {
-                throw QMIHostError.transport("SCDynamicStore write \(key): \(String(cString: SCErrorString(SCError())))")
+                throw QMIHostError.systemConfiguration("SCDynamicStore write \(key)")
             }
             published.insert(key)
         }
@@ -130,23 +130,22 @@ public final class ServicePublisher {
 
     // MARK: Status keys for other apps (PLAN.md §5.4; QMIDStoreKey)
 
+    // A connected PDN's status value (QMIDStoreKey.pdn); the caller adds what it knows beyond
+    // the call (lastError, rat, qci, ambr) and publishes `.dictionary`.
     public static func pdnStatus(name: String, interface: String, config: PDNConfig,
-                                 settings s: WDS.RuntimeSettings, policy: QMIDPolicy) -> [String: Any] {
-        var d: [String: Any] = [
-            "ServiceID": serviceID(for: name),
-            "InterfaceName": interface,
-            "MuxID": Int(config.muxID),
-            "State": "connected",
-            "Policy": policy.rawValue,
-        ]
-        if let p = config.profile { d["Profile"] = Int(p) }
-        if let apn = s.apn ?? config.apn { d["APN"] = apn }
-        if let mtu = s.mtu { d["MTU"] = Int(mtu) }
-        if let a = s.ipv4Address { d["IPv4Address"] = a.description }
-        if let p = s.ipv6Address { d["IPv6Address"] = p.description }
-        if !s.pcscfIPv4.isEmpty { d["PCSCFv4"] = s.pcscfIPv4.map(\.description) }
-        if !s.pcscfIPv6.isEmpty { d["PCSCFv6"] = s.pcscfIPv6.map(\.description) }
-        return d
+                                 settings s: WDS.RuntimeSettings, policy: QMIDPolicy) -> QMIDStorePDN {
+        QMIDStorePDN(state: QMIDPDN.State.connected.rawValue, serviceID: serviceID(for: name), muxID: Int(config.muxID),
+                     policy: policy.rawValue, interfaceName: interface, profile: config.profile.map(Int.init),
+                     apn: s.apn ?? config.apn, mtu: s.mtu.map(Int.init), ipv4Address: s.ipv4Address?.description,
+                     ipv6Address: s.ipv6Address?.description, pcscfv4: s.pcscfIPv4.map(\.description),
+                     pcscfv6: s.pcscfIPv6.map(\.description))
+    }
+}
+
+extension QMIHostError {
+    // A SystemConfiguration call failed: what was done, and SCError's text.
+    static func systemConfiguration(_ what: String) -> QMIHostError {
+        .failed("\(what): \(String(cString: SCErrorString(SCError())))")
     }
 }
 
